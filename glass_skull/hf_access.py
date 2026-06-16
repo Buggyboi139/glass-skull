@@ -59,6 +59,8 @@ def _get_json(url: str, token: str | None = None, timeout: float = 20.0) -> tupl
         except Exception:
             data = {"error": body[:500]}
         return int(exc.code), data
+    except urllib.error.URLError as exc:
+        return 0, {"error": str(exc)}
 
 
 def validate_token(token: str | None) -> HFTokenStatus:
@@ -75,7 +77,8 @@ def validate_token(token: str | None) -> HFTokenStatus:
 
 
 def check_model_access(repo_id: str, token: str | None = None) -> HFModelAccess:
-    quoted = urllib.parse.quote(repo_id, safe="")
+    # Keep the org/model slash in the path. Encoding it as %2F can fail behind some routers.
+    quoted = urllib.parse.quote(repo_id.strip(), safe="/")
     status, data = _get_json(f"{HF_API}/models/{quoted}", token=(token or "").strip() or None, timeout=20.0)
 
     if status == 200:
@@ -84,6 +87,9 @@ def check_model_access(repo_id: str, token: str | None = None) -> HFModelAccess:
         private = bool(data.get("private")) if data.get("private") is not None else False
         return HFModelAccess(repo_id=repo_id, status="ok", ok=True, gated=gated, private=private, card_data=card_data)
 
+    detail = data.get("error") or data.get("message") or f"HTTP {status}"
+    if status == 0:
+        return HFModelAccess(repo_id=repo_id, status="network_error", ok=False, error=str(detail))
     if status == 401:
         return HFModelAccess(repo_id=repo_id, status="unauthorized", ok=False, error="Unauthorized. Token missing, invalid, or insufficient.")
     if status == 403:
@@ -91,8 +97,7 @@ def check_model_access(repo_id: str, token: str | None = None) -> HFModelAccess:
     if status == 404:
         return HFModelAccess(repo_id=repo_id, status="missing", ok=False, error="Model repo not found, private, or not visible to this token.")
 
-    err = data.get("error") or data.get("message") or f"HTTP {status}"
-    return HFModelAccess(repo_id=repo_id, status="error", ok=False, error=str(err))
+    return HFModelAccess(repo_id=repo_id, status="error", ok=False, error=str(detail))
 
 
 def access_badge_text(access: HFModelAccess | None) -> str:
