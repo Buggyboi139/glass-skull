@@ -20,10 +20,10 @@ def insert_after(text: str, anchor: str, insertion: str) -> str:
     return text.replace(anchor, anchor + insertion, 1)
 
 
-def replace_if_present(text: str, old: str, new: str) -> str:
-    if old in text:
-        return text.replace(old, new, 1)
-    return text
+def ensure_import_after(text: str, anchor: str, import_line: str) -> str:
+    if import_line in text:
+        return text
+    return insert_after(text, anchor, import_line)
 
 
 def main() -> None:
@@ -32,7 +32,7 @@ def main() -> None:
 
     text = MAIN.read_text(encoding="utf-8")
 
-    # Modern Streamlit width API, because deprecation warnings are confetti from hell.
+    # Streamlit API cleanup.
     text = text.replace("use_container_width=True", 'width="stretch"')
     text = text.replace("use_container_width=False", 'width="content"')
 
@@ -68,14 +68,10 @@ def main() -> None:
         if old in text:
             text = replace_once(text, old, new)
 
-    # Imports.
     import_anchor = "from glass_skull.feature_store import compatible_features, list_features, load_feature, save_feature\n"
-    import_add = (
-        "from glass_skull.hf_access import access_badge_text, check_model_access, validate_token\n"
-        "from glass_skull.hf_loader import build_hf_load_plan\n"
-        "from glass_skull.hf_registry import capabilities_for_backend, families, model_state, registry_as_dicts, visible_models\n"
-    )
-    text = insert_after(text, import_anchor, import_add)
+    text = ensure_import_after(text, import_anchor, "from glass_skull.hf_access import access_badge_text, check_model_access, validate_token\n")
+    text = ensure_import_after(text, import_anchor, "from glass_skull.hf_loader import build_hf_load_plan\n")
+    text = ensure_import_after(text, import_anchor, "from glass_skull.hf_registry import capabilities_for_backend, families, model_state, registry_as_dicts, visible_models\n")
 
     # Help entries.
     if '"hf_token"' not in text:
@@ -88,8 +84,7 @@ def main() -> None:
             '}',
         )
 
-    # Session defaults.
-    defaults_slice = text[text.find("defaults = {"):text.find("defaults = {") + 1500]
+    defaults_slice = text[text.find("defaults = {"):text.find("defaults = {") + 1600]
     if '"dashboard_trace"' not in defaults_slice:
         text = replace_once(
             text,
@@ -97,9 +92,9 @@ def main() -> None:
             '        "last_comparison": None,\n'
             '        "dashboard_trace": None,\n'
             '        "dashboard_trace_meta": {},\n'
-            '        "dashboard_trace_counter": 0,\n'
+            '        "dashboard_trace_counter": 0,\n',
         )
-    defaults_slice = text[text.find("defaults = {"):text.find("defaults = {") + 1500]
+    defaults_slice = text[text.find("defaults = {"):text.find("defaults = {") + 1600]
     if '"hf_token"' not in defaults_slice:
         text = replace_once(
             text,
@@ -111,10 +106,10 @@ def main() -> None:
             '        "hf_selected_family": "All",\n'
             '        "hf_recommended_only": False,\n'
             '        "hf_selected_repo": "",\n'
-            '        "hf_last_load_plan": None,\n'
+            '        "hf_last_load_plan": None,\n',
         )
 
-    # Clear dashboard snapshot on model reload / clear trace.
+    # Clear dashboard snapshot when trace/model is cleared.
     text = text.replace(
         '            st.session_state.last_comparison = None\n            load_hooked_model.clear()\n',
         '            st.session_state.last_comparison = None\n            st.session_state.dashboard_trace = None\n            st.session_state.dashboard_trace_meta = {}\n            load_hooked_model.clear()\n',
@@ -124,12 +119,16 @@ def main() -> None:
         '        if st.button("Clear trace", width="stretch", help="Clears the currently cached activations."):\n            st.session_state.trace = None\n            st.session_state.dashboard_trace = None\n            st.session_state.dashboard_trace_meta = {}\n',
     )
 
-    # Helper functions.
     helper_anchor = '''def feature_names_from_rows(rows: list[dict]) -> list[str]:
     return [str(f["name"]) for f in rows if f.get("name")]
 
 '''
-    helper_add = r'''
+
+    if "def set_dashboard_trace(" not in text:
+        text = insert_after(
+            text,
+            helper_anchor,
+            '''
 
 def set_dashboard_trace(trace, prompt: str, backend: str, trace_model: str) -> None:
     st.session_state.dashboard_trace = trace
@@ -143,6 +142,20 @@ def set_dashboard_trace(trace, prompt: str, backend: str, trace_model: str) -> N
         "run": st.session_state.dashboard_trace_counter,
     }
 
+''',
+        )
+
+    if "def render_capability_warning(" not in text:
+        text = insert_after(
+            text,
+            "def set_dashboard_trace(trace, prompt: str, backend: str, trace_model: str) -> None:\n",
+            '''
+''',
+        )
+        text = insert_after(
+            text,
+            '    }\n\n',
+            '''
 
 def render_capability_warning(chat_backend: str) -> dict[str, bool]:
     caps = capabilities_for_backend(chat_backend)
@@ -152,6 +165,22 @@ def render_capability_warning(chat_backend: str) -> dict[str, bool]:
         )
     return caps
 
+''',
+        )
+
+    if "def render_hf_catalog_panel(" not in text:
+        text = insert_after(
+            text,
+            '''def render_capability_warning(chat_backend: str) -> dict[str, bool]:
+    caps = capabilities_for_backend(chat_backend)
+    if "llama.cpp" in chat_backend.lower():
+        st.warning(
+            "llama.cpp backend is chat/output-only right now. Activation Trace, Logit Lens, Attention, Map, Steer, and activation Compare are disabled until llama.cpp-glass exposes real hooks."
+        )
+    return caps
+
+''',
+            r'''
 
 def render_hf_catalog_panel() -> None:
     st.markdown("### Hugging Face Access")
@@ -239,15 +268,10 @@ def render_hf_catalog_panel() -> None:
     if st.session_state.get("hf_last_load_plan"):
         st.json(st.session_state.hf_last_load_plan)
 
-    st.dataframe(
-        pd.DataFrame(registry_as_dicts()),
-        width="stretch",
-        height=220,
-        hide_index=True,
-    )
+    st.dataframe(pd.DataFrame(registry_as_dicts()), width="stretch", height=220, hide_index=True)
 
-'''
-    text = insert_after(text, helper_anchor, helper_add)
+''',
+        )
 
     # Sidebar HF section after Servers, before Session.
     sidebar_anchor = '''        elif glass_status is not None:
@@ -262,7 +286,6 @@ def render_hf_catalog_panel() -> None:
 '''
     text = insert_after(text, sidebar_anchor, sidebar_add)
 
-    # Add HF pill to HUD after features are computed.
     if 'ui.pill("HF token"' not in text:
         text = replace_once(
             text,
@@ -271,7 +294,7 @@ def render_hf_catalog_panel() -> None:
             '    ui.pill("HF token", ui.GREEN if (st.session_state.get("hf_token_status") and st.session_state.hf_token_status.valid) else ui.SLATE),\n',
         )
 
-    # Dashboard should read from an explicit live snapshot that updates on every traced chat.
+    # Dashboard should read from a live trace snapshot updated by chat.
     text = text.replace(
         '    trace = st.session_state.trace\n    if trace is None:\n        ui.empty_state("No trace captured yet", "Send a message in the Chat tab with tracing enabled to populate these graphs.")\n    else:\n        st.code(trace.prompt)\n',
         '    trace = st.session_state.get("dashboard_trace") or st.session_state.get("trace")\n    dash_meta = st.session_state.get("dashboard_trace_meta", {}) or {}\n    if trace is None:\n        ui.empty_state("No trace captured yet", "Send a message in the Chat tab with tracing enabled to populate these graphs.")\n    else:\n        ui.property_list([\n            ("updated", str(dash_meta.get("updated_at", "current run"))),\n            ("backend", str(dash_meta.get("backend", "unknown"))),\n            ("trace_model", str(dash_meta.get("trace_model", summary["model_name"]))),\n            ("tokens", str(dash_meta.get("token_count", len(trace.tokens)))),\n            ("run", str(dash_meta.get("run", "-"))),\n        ])\n        st.code(trace.prompt)\n',
@@ -289,19 +312,17 @@ def render_hf_catalog_panel() -> None:
 '''
     text = insert_after(text, chat_anchor, chat_add)
 
-    # Disable steering toggle when llama.cpp is selected.
     text = text.replace(
         '        use_steering = st.toggle("Use steering", value=False, help="Only applies when the chat backend is TransformerLens. Stock llama.cpp cannot be activation-steered yet.")',
         '        use_steering = st.toggle("Use steering", value=False, disabled=not caps["activation_steering"], help="Only applies when the chat backend is TransformerLens. Stock llama.cpp cannot be activation-steered yet.")',
     )
 
-    # Make trace storage update dashboard every chat run.
+    # Trace writes also refresh Dashboard.
     text = text.replace(
         '                trace = trace_prompt(model, prompt)\n                st.session_state.trace = trace\n                run_id = log_run(model_name=model_name, mode="chat_trace", prompt=prompt, metadata={"tokens": trace.tokens, "summary": summary})\n',
         '                trace = trace_prompt(model, prompt)\n                st.session_state.trace = trace\n                set_dashboard_trace(trace, prompt, chat_backend, str(summary["model_name"]))\n                run_id = log_run(model_name=model_name, mode="chat_trace", prompt=prompt, metadata={"tokens": trace.tokens, "summary": summary, "chat_backend": chat_backend})\n',
     )
 
-    # Add capability note at start of Trace and Poke tabs.
     trace_anchor = '''with tab_trace:
     ui.section_header("Trace / Lens", "Visualize model internals captured from the latest traced prompt.")
 '''
@@ -320,7 +341,6 @@ def render_hf_catalog_panel() -> None:
 '''
     text = insert_after(text, poke_anchor, poke_add)
 
-    # Add HF catalog tab to Anatomy tabs if possible.
     text = text.replace(
         '["Anatomy", "Hooks", "Parameters", "Experiments", "Features", "Logs"]',
         '["Anatomy", "Hooks", "Parameters", "Experiments", "Features", "HF Catalog", "Logs"]',
