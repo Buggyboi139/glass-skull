@@ -85,7 +85,14 @@ def edge_constellation(edges: pd.DataFrame):
 def attention_heatmap(attn: pd.DataFrame):
     if attn.empty:
         return None
+    required = {"dest_index", "src_index", "dest_token", "src_token", "attention"}
+    if not required.issubset(attn.columns):
+        return None
+
+    row_labels = attn.sort_values("dest_index").drop_duplicates("dest_index")["dest_token"].tolist()
+    col_labels = attn.sort_values("src_index").drop_duplicates("src_index")["src_token"].tolist()
     pivot = attn.pivot_table(index="dest_token", columns="src_token", values="attention", aggfunc="mean")
+    pivot = pivot.reindex(index=row_labels, columns=col_labels)
     fig = px.imshow(
         pivot,
         aspect="auto",
@@ -98,9 +105,11 @@ def attention_heatmap(attn: pd.DataFrame):
 
 
 def logit_lens_probability_fig(df: pd.DataFrame):
-    if df.empty:
+    if df.empty or "rank" not in df.columns:
         return None
     top = df[df["rank"] == 1].copy()
+    if top.empty:
+        return None
     fig = px.bar(
         top,
         x="layer",
@@ -129,7 +138,7 @@ def logit_lens_token_heatmap(df: pd.DataFrame):
 
 
 def comparison_delta_heatmap(df: pd.DataFrame):
-    if df.empty:
+    if df.empty or "delta" not in df.columns:
         return None
     table = df.copy()
     table["layer_stream"] = table["layer"].astype(str) + ":" + table["stream"]
