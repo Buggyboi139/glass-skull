@@ -19,26 +19,43 @@ class LlamaServerStatus:
     error: str | None = None
 
 
+def normalize_base_url(base_url: str) -> str:
+    base_url = base_url.strip().rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+    return base_url
+
+
 def _join_url(base_url: str, path: str) -> str:
-    return base_url.rstrip("/") + "/" + path.lstrip("/")
+    return normalize_base_url(base_url) + "/" + path.lstrip("/")
 
 
 def _request_json(method: str, url: str, payload: dict[str, Any] | None = None, timeout: float = 20.0) -> dict[str, Any]:
     data = None
-    headers = {"Accept": "application/json"}
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "glass-skull/0.6",
+    }
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
 
     req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8")
-        if not body.strip():
-            return {}
-        return json.loads(body)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            if not body.strip():
+                return {}
+            return json.loads(body)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {body[:500]}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON from {url}: {exc}") from exc
 
 
 def check_server(base_url: str, timeout: float = 3.0) -> LlamaServerStatus:
+    base_url = normalize_base_url(base_url)
     start = time.perf_counter()
     models: list[str] = []
     glass_available = False
@@ -97,6 +114,7 @@ def chat_completion(
         "messages": messages,
         "max_tokens": int(max_new_tokens),
         "temperature": float(temperature),
+        "stream": False,
     }
     result = _request_json("POST", _join_url(base_url, "/v1/chat/completions"), payload=payload, timeout=timeout)
     choices = result.get("choices", [])
