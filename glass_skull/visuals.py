@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import math
-from typing import Any
-
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -37,6 +34,7 @@ def activation_pulse(layer_norms: pd.DataFrame):
     df["y"] = df["stream"].map(stream_y).fillna(0).astype(float)
 
     fig = go.Figure()
+    max_norm = max(float(df["norm"].max()), 1e-6)
     for stream in streams:
         sub = df[df["stream"] == stream]
         if sub.empty:
@@ -46,7 +44,7 @@ def activation_pulse(layer_norms: pd.DataFrame):
             y=sub["y"],
             mode="lines+markers",
             name=stream,
-            marker=dict(size=10 + 18 * (sub["norm"] / max(df["norm"].max(), 1e-6))),
+            marker=dict(size=10 + 18 * (sub["norm"] / max_norm)),
             line=dict(width=2),
             text=[f"layer {r.layer}<br>{r.stream}<br>norm {r.norm:.3f}" for r in sub.itertuples()],
             hoverinfo="text",
