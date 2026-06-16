@@ -4,7 +4,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from glass_skull.config import DEFAULT_MODEL, ensure_dirs
+from glass_skull.config import DEFAULT_MODEL, MODEL_PRESETS, ensure_dirs, normalize_model_name
 from glass_skull.model_loader import load_hooked_model, model_summary
 from glass_skull.tracer import trace_prompt, top_active_dimensions, next_token_table
 from glass_skull.contribution import top_contribution_edges
@@ -26,7 +26,14 @@ if "model_name" not in st.session_state:
 
 with st.sidebar:
     st.header("Model")
-    model_name = st.text_input("TransformerLens model", value=st.session_state.model_name)
+    preset_options = ["custom"] + MODEL_PRESETS
+    preset = st.selectbox("Preset", preset_options, index=1 if st.session_state.model_name in MODEL_PRESETS else 0)
+    if preset != "custom":
+        model_name = preset
+    else:
+        model_name = st.text_input("TransformerLens model", value=st.session_state.model_name)
+    model_name = normalize_model_name(model_name)
+
     device_choice = st.selectbox("Device", ["auto", "cpu", "cuda"], index=0)
     if st.button("Load model", type="primary"):
         st.session_state.model_name = model_name
@@ -38,6 +45,7 @@ summary = model_summary(model)
 
 with st.sidebar:
     st.subheader("Loaded")
+    st.write(f"Model: `{summary['model_name']}`")
     st.write(f"Device: `{summary['device']}`")
     st.write(f"Dtype: `{summary['dtype']}`")
     st.write(f"Layers: `{summary['layers']}`")
@@ -75,15 +83,18 @@ if page == "Trace":
 
         st.subheader("Layer/token activation norm heatmap")
         heat = trace.layer_norms.copy()
-        heat["layer_stream"] = heat["layer"].astype(str) + ":" + heat["stream"]
-        pivot = heat.pivot_table(index="layer_stream", columns="token_index", values="norm", aggfunc="mean")
-        fig = px.imshow(
-            pivot,
-            aspect="auto",
-            color_continuous_scale="Viridis",
-            labels={"x": "token index", "y": "layer:stream", "color": "norm"},
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        if heat.empty:
+            st.warning("No activation rows were captured. Try a different model or hook stream.")
+        else:
+            heat["layer_stream"] = heat["layer"].astype(str) + ":" + heat["stream"]
+            pivot = heat.pivot_table(index="layer_stream", columns="token_index", values="norm", aggfunc="mean")
+            fig = px.imshow(
+                pivot,
+                aspect="auto",
+                color_continuous_scale="Viridis",
+                labels={"x": "token index", "y": "layer:stream", "color": "norm"},
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
         st.subheader("Inspect one layer/token")
         c1, c2, c3 = st.columns(3)
@@ -134,7 +145,7 @@ elif page == "Active Edges":
                 y="to_dim",
                 size="abs_contribution",
                 color="contribution",
-                hover_data=["rank", "input_activation", "weight", "contribution"],
+                hover_data=["rank", "source_hook", "input_activation", "weight", "contribution"],
                 title="Top active contribution edges",
             )
             st.plotly_chart(fig, use_container_width=True)
@@ -222,7 +233,7 @@ elif page == "Steer":
 
         prompt = st.text_area("Prompt", value="Explain what a mammal is.", height=120, key="steer_prompt")
         max_new_tokens = st.slider("Max new tokens", min_value=10, max_value=200, value=60, step=10)
-        temperature = st.slider("Temperature", min_value=0.0, max_value=1.5, value=0.8, step=0.05)
+        temperature = st.slider("Temperature", min_value=0.01, max_value=1.5, value=0.8, step=0.05)
 
         st.subheader("Feature vector top dimensions")
         st.dataframe(pd.DataFrame(vector_summary(vector, top_k=40)), use_container_width=True)
@@ -263,7 +274,7 @@ elif page == "Steer":
                 st.subheader("Steered")
                 if steered_error:
                     st.error(steered_error)
-                    st.info("If this fails on your TransformerLens version, tracing and feature mapping still work. The generation hook path will need a compatibility patch.")
+                    st.info("If this fails on your TransformerLens version, tracing and feature mapping still work. The generation wrapper will need a local compatibility patch.")
                 else:
                     st.write(steered)
 
