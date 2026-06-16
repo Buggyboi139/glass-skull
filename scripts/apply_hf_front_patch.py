@@ -24,6 +24,16 @@ def insert_after(text: str, anchor: str, insertion: str, required: bool = True) 
     return text.replace(anchor, anchor + insertion, 1)
 
 
+def insert_before(text: str, anchor: str, insertion: str, required: bool = True) -> str:
+    if insertion.strip() and insertion.strip() in text:
+        return text
+    if anchor not in text:
+        if required:
+            raise SystemExit(f"Patch anchor not found:\n{anchor[:300]}")
+        return text
+    return text.replace(anchor, insertion + anchor, 1)
+
+
 def ensure_import_after(text: str, anchor: str, import_line: str) -> str:
     if import_line in text:
         return text
@@ -36,7 +46,7 @@ HELPER_ANCHOR = '''def feature_names_from_rows(rows: list[dict]) -> list[str]:
 '''
 
 
-SET_DASHBOARD_TRACE = '''
+HELPER_BLOCK = '''
 
 def set_dashboard_trace(trace, prompt: str, backend: str, trace_model: str) -> None:
     st.session_state.dashboard_trace = trace
@@ -50,10 +60,6 @@ def set_dashboard_trace(trace, prompt: str, backend: str, trace_model: str) -> N
         "run": st.session_state.dashboard_trace_counter,
     }
 
-'''
-
-
-CAPABILITY_HELPER = '''
 
 def render_capability_warning(chat_backend: str) -> dict[str, bool]:
     caps = capabilities_for_backend(chat_backend)
@@ -63,10 +69,6 @@ def render_capability_warning(chat_backend: str) -> dict[str, bool]:
         )
     return caps
 
-'''
-
-
-HF_PANEL_HELPER = '''
 
 def render_hf_catalog_panel() -> None:
     st.markdown("### Hugging Face Access")
@@ -170,6 +172,18 @@ def main() -> None:
             "Detected broken escaped-quote output from an older HF patcher. Run `git restore main.py`, then rerun this script."
         )
 
+    # Repair the exact broken sidebar ordering from the bad patcher.
+    broken_sidebar = '''    with st.expander("Session", expanded=False):
+
+    with st.expander("Hugging Face", expanded=False):
+        render_hf_catalog_panel()
+
+'''
+    if broken_sidebar in text:
+        raise SystemExit(
+            "Detected broken sidebar indentation from an older HF patcher. Run `git restore main.py`, then rerun this script."
+        )
+
     text = text.replace("use_container_width=True", 'width="stretch"')
     text = text.replace("use_container_width=False", 'width="content"')
 
@@ -252,24 +266,15 @@ def main() -> None:
         '        if st.button("Clear trace", width="stretch", help="Clears the currently cached activations."):\n            st.session_state.trace = None\n            st.session_state.dashboard_trace = None\n            st.session_state.dashboard_trace_meta = {}\n',
     )
 
-    if "def set_dashboard_trace(" not in text:
-        text = insert_after(text, HELPER_ANCHOR, SET_DASHBOARD_TRACE)
-    if "def render_capability_warning(" not in text:
-        text = insert_after(text, HELPER_ANCHOR, CAPABILITY_HELPER)
     if "def render_hf_catalog_panel(" not in text:
-        text = insert_after(text, HELPER_ANCHOR, HF_PANEL_HELPER)
+        text = insert_after(text, HELPER_ANCHOR, HELPER_BLOCK)
 
-    sidebar_anchor = '''        elif glass_status is not None:
-            st.caption(f"Glass error: {glass_status.error or 'no details'}")
-
-    with st.expander("Session", expanded=False):
-'''
-    sidebar_add = '''
-    with st.expander("Hugging Face", expanded=False):
+    hf_sidebar_block = '''    with st.expander("Hugging Face", expanded=False):
         render_hf_catalog_panel()
 
 '''
-    text = insert_after(text, sidebar_anchor, sidebar_add)
+    session_anchor = '    with st.expander("Session", expanded=False):\n'
+    text = insert_before(text, session_anchor, hf_sidebar_block)
 
     if 'ui.pill("HF token"' not in text:
         text = replace_once(
