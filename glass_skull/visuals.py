@@ -82,6 +82,69 @@ def edge_constellation(edges: pd.DataFrame):
     return fig
 
 
+def attention_heatmap(attn: pd.DataFrame):
+    if attn.empty:
+        return None
+    pivot = attn.pivot_table(index="dest_token", columns="src_token", values="attention", aggfunc="mean")
+    fig = px.imshow(
+        pivot,
+        aspect="auto",
+        color_continuous_scale="Turbo",
+        labels={"x": "source token", "y": "destination token", "color": "attention"},
+        title="Attention head token map",
+    )
+    fig.update_layout(height=360, margin=dict(l=10, r=10, t=45, b=10))
+    return fig
+
+
+def logit_lens_probability_fig(df: pd.DataFrame):
+    if df.empty:
+        return None
+    top = df[df["rank"] == 1].copy()
+    fig = px.bar(
+        top,
+        x="layer",
+        y="probability",
+        hover_data=["token", "token_id", "logit"],
+        title="Logit Lens top prediction confidence by layer",
+        labels={"probability": "top-token probability"},
+    )
+    fig.update_layout(height=300, margin=dict(l=10, r=10, t=45, b=10))
+    return fig
+
+
+def logit_lens_token_heatmap(df: pd.DataFrame):
+    if df.empty:
+        return None
+    pivot = df.pivot_table(index="layer", columns="token_index", values="probability", aggfunc="max")
+    fig = px.imshow(
+        pivot,
+        aspect="auto",
+        color_continuous_scale="Turbo",
+        labels={"x": "input token", "y": "layer", "color": "top-token probability"},
+        title="Logit Lens certainty by layer and token",
+    )
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=45, b=10))
+    return fig
+
+
+def comparison_delta_heatmap(df: pd.DataFrame):
+    if df.empty:
+        return None
+    table = df.copy()
+    table["layer_stream"] = table["layer"].astype(str) + ":" + table["stream"]
+    pivot = table.pivot_table(index="layer_stream", columns="token_index", values="delta", aggfunc="mean")
+    fig = px.imshow(
+        pivot,
+        aspect="auto",
+        color_continuous_scale="RdBu",
+        labels={"x": "token", "y": "layer:stream", "color": "steered - normal"},
+        title="Normal vs steered activation delta",
+    )
+    fig.update_layout(height=340, margin=dict(l=10, r=10, t=45, b=10))
+    return fig
+
+
 def fuzz_prompt_layer_fig(df: pd.DataFrame):
     if df.empty:
         return None
