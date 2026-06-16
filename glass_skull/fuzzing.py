@@ -9,7 +9,7 @@ from .experiment_store import append_jsonl, create_experiment_dir, write_datafra
 from .llama_client import chat_completion
 from .prompt_loader import PromptItem, prompt_items_to_records
 from .tracer import top_active_dimensions, trace_prompt
-from .aggregation import label_layer_heatmap, prompt_layer_heatmap, top_recurring_dimensions
+from .aggregation import label_layer_heatmap, label_separation_table, prompt_layer_heatmap, top_recurring_dimensions
 
 
 def trace_layers_for_prompt(
@@ -135,6 +135,7 @@ def run_fuzz_experiment(
     prompt_df = prompt_layer_heatmap(records)
     label_df = label_layer_heatmap(records)
     top_dims_df = top_recurring_dimensions(records)
+    separation_df = label_separation_table(records)
 
     if not prompt_df.empty:
         write_dataframe(exp_dir / "prompt_layer_heatmap.csv", prompt_df)
@@ -142,6 +143,8 @@ def run_fuzz_experiment(
         write_dataframe(exp_dir / "label_layer_heatmap.csv", label_df)
     if not top_dims_df.empty:
         write_dataframe(exp_dir / "top_recurring_dimensions.csv", top_dims_df)
+    if not separation_df.empty:
+        write_dataframe(exp_dir / "label_separation.csv", separation_df)
 
     summary = {
         "experiment_path": str(exp_dir),
@@ -157,4 +160,5 @@ def run_fuzz_experiment(
         "prompt_layer_df": prompt_df,
         "label_layer_df": label_df,
         "top_dims_df": top_dims_df,
+        "separation_df": separation_df,
     }
