@@ -5,7 +5,7 @@ from typing import Callable
 import torch
 from transformer_lens import HookedTransformer
 
-from .tracer import hook_point
+from .tracer import cache_get, hook_point
 
 
 def build_contrast_vector(
@@ -17,7 +17,6 @@ def build_contrast_vector(
     token_position: int = -1,
     normalize: bool = True,
 ) -> torch.Tensor:
-    """Build a feature/steering direction from positive minus negative prompt activations."""
     if not positive_prompts:
         raise ValueError("positive_prompts cannot be empty")
     if not negative_prompts:
@@ -29,7 +28,7 @@ def build_contrast_vector(
         acts = []
         for prompt in prompts:
             _, cache = model.run_with_cache(prompt, remove_batch_dim=False)
-            act = cache[hp][0, token_position].detach().float().cpu()
+            act = cache_get(cache, hp)[0, token_position].detach().float().cpu()
             acts.append(act)
         return torch.stack(acts, dim=0).mean(dim=0)
 
@@ -43,9 +42,10 @@ def build_contrast_vector(
 
 
 def make_steering_hook(vector: torch.Tensor, strength: float, token_position: int = -1) -> Callable:
-    """Return a TransformerLens hook that adds a vector to one token position."""
     def hook_fn(activation: torch.Tensor, hook):
         steer = vector.to(device=activation.device, dtype=activation.dtype)
+        if activation.ndim != 3:
+            raise ValueError(f"Expected activation shape [batch, pos, d_model], got {tuple(activation.shape)}")
         activation[:, token_position, :] = activation[:, token_position, :] + strength * steer
         return activation
 
@@ -62,7 +62,6 @@ def generate_normal(
         prompt,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
-        do_sample=temperature > 0,
         verbose=False,
     )
 
@@ -80,13 +79,14 @@ def generate_steered(
 ) -> str:
     hp = hook_point(layer, stream)
     hook = make_steering_hook(vector, strength=strength, token_position=token_position)
-    return model.run_with_hooks(
-        prompt,
-        return_type="text",
-        fwd_hooks=[(hp, hook)],
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-    )
+
+    with model.hooks(fwd_hooks=[(hp, hook)]):
+        return model.generate(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            verbose=False,
+        )
 
 
 def vector_summary(vector: torch.Tensor, top_k: int = 30) -> list[dict]:
@@ -94,9 +94,10 @@ def vector_summary(vector: torch.Tensor, top_k: int = 30) -> list[dict]:
     vals, idxs = torch.topk(v.abs(), k=min(top_k, v.numel()))
     rows = []
     for rank, (abs_value, idx) in enumerate(zip(vals.tolist(), idxs.tolist()), start=1):
+        idx = int(idx)
         rows.append({
             "rank": rank,
-            "dimension": int(idx),
+            "dimension": idx,
             "value": float(v[idx]),
             "abs_value": float(abs_value),
         })
