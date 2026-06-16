@@ -7,6 +7,9 @@ from glass_skull.attention_view import indexed_tokens
 from glass_skull.config import DEFAULT_MODEL, MODEL_PRESETS, ensure_dirs
 from glass_skull.experiment_store import safe_slug
 from glass_skull.feature_store import compatible_features
+from glass_skull.hf_access import HFTokenStatus
+from glass_skull.hf_loader import build_hf_load_plan
+from glass_skull.hf_registry import capabilities_for_backend, families, get_model, registry_as_dicts, visible_models
 from glass_skull.lens import logit_lens_table
 from glass_skull.llama_client import normalize_base_url
 from glass_skull.prompt_loader import load_jsonl, load_txt
@@ -40,6 +43,17 @@ def main() -> None:
     ]
     sep = label_separation_table(records)
     assert not sep.empty
+
+    registry = registry_as_dicts()
+    assert registry, "HF registry should not be empty"
+    assert "Gemma" in families()
+    assert get_model("google/gemma-4-12B-it") is not None
+    assert visible_models("Qwen"), "Qwen family should be present"
+    assert capabilities_for_backend("llama.cpp glass")["activation_steering"] is False
+    assert capabilities_for_backend("TransformerLens")["activation_steering"] is True
+    assert HFTokenStatus(configured=False, valid=False).label() == "No token configured"
+    plan = build_hf_load_plan("Qwen/Qwen3-4B", token=None)
+    assert plan.repo_id == "Qwen/Qwen3-4B"
 
     # Import-only checks so new cockpit modules fail fast without loading a model.
     assert callable(logit_lens_table)
