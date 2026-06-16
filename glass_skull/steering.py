@@ -41,11 +41,33 @@ def build_contrast_vector(
     return vec
 
 
+def validate_steering_vector(vector: torch.Tensor, expected_d_model: int, context: str = "steering") -> torch.Tensor:
+    v = vector.detach()
+    if v.ndim != 1:
+        v = v.flatten()
+    actual = int(v.numel())
+    expected = int(expected_d_model)
+    if actual != expected:
+        raise ValueError(
+            f"Incompatible {context} vector: vector width is {actual}, "
+            f"but the loaded trace model d_model is {expected}. "
+            "Rebuild this feature with the currently loaded trace model, or load the model that originally created the feature."
+        )
+    return v
+
+
 def make_steering_hook(vector: torch.Tensor, strength: float, token_position: int = -1) -> Callable:
+    prepared_vector = vector.detach().flatten()
+
     def hook_fn(activation: torch.Tensor, hook):
-        steer = vector.to(device=activation.device, dtype=activation.dtype)
         if activation.ndim != 3:
             raise ValueError(f"Expected activation shape [batch, pos, d_model], got {tuple(activation.shape)}")
+
+        expected_d_model = int(activation.shape[-1])
+        steer = validate_steering_vector(prepared_vector, expected_d_model).to(
+            device=activation.device,
+            dtype=activation.dtype,
+        )
         activation[:, token_position, :] = activation[:, token_position, :] + strength * steer
         return activation
 
@@ -77,6 +99,7 @@ def generate_steered(
     temperature: float = 0.8,
     token_position: int = -1,
 ) -> str:
+    validate_steering_vector(vector, int(model.cfg.d_model), context="feature")
     hp = hook_point(layer, stream)
     hook = make_steering_hook(vector, strength=strength, token_position=token_position)
 
@@ -90,7 +113,7 @@ def generate_steered(
 
 
 def vector_summary(vector: torch.Tensor, top_k: int = 30) -> list[dict]:
-    v = vector.detach().float().cpu()
+    v = vector.detach().float().cpu().flatten()
     vals, idxs = torch.topk(v.abs(), k=min(top_k, v.numel()))
     rows = []
     for rank, (abs_value, idx) in enumerate(zip(vals.tolist(), idxs.tolist()), start=1):
