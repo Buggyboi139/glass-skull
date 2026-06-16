@@ -12,8 +12,23 @@ PROMPT_SET_DIR = DATA_DIR / "prompt_sets"
 DB_PATH = LOG_DIR / "glass_skull.db"
 
 
-DEFAULT_MODEL = "EleutherAI/pythia-70m-deduped"
+# TransformerLens generally prefers short canonical model names for supported models.
+DEFAULT_MODEL = "pythia-70m-deduped"
 DEFAULT_DEVICE = "auto"
+
+MODEL_PRESETS = [
+    "pythia-70m-deduped",
+    "pythia-160m-deduped",
+    "pythia-410m-deduped",
+    "pythia-1b-deduped",
+]
+
+MODEL_ALIASES = {
+    "EleutherAI/pythia-70m-deduped": "pythia-70m-deduped",
+    "EleutherAI/pythia-160m-deduped": "pythia-160m-deduped",
+    "EleutherAI/pythia-410m-deduped": "pythia-410m-deduped",
+    "EleutherAI/pythia-1b-deduped": "pythia-1b-deduped",
+}
 
 
 @dataclass(frozen=True)
@@ -25,6 +40,11 @@ class TraceConfig:
     top_k: int = 30
     layer: int = 0
     hook_name: str = "resid_post"
+
+
+def normalize_model_name(model_name: str) -> str:
+    model_name = model_name.strip()
+    return MODEL_ALIASES.get(model_name, model_name)
 
 
 def ensure_dirs() -> None:
