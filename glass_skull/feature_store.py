@@ -28,13 +28,26 @@ def feature_paths(name: str | None) -> tuple[Path, Path]:
     return FEATURE_DIR / f"{safe}.pt", FEATURE_DIR / f"{safe}.json"
 
 
+def tensor_vector_dim(tensor_path: Path) -> int | None:
+    if not tensor_path.exists():
+        return None
+    try:
+        tensor = torch.load(tensor_path, map_location="cpu")
+        return int(tensor.detach().flatten().numel())
+    except Exception:
+        return None
+
+
 def save_feature(name: str, vector: torch.Tensor, metadata: dict[str, Any]) -> tuple[Path, Path]:
     FEATURE_DIR.mkdir(parents=True, exist_ok=True)
+    vector = vector.detach().cpu().flatten()
     tensor_path, meta_path = feature_paths(name)
-    torch.save(vector.detach().cpu(), tensor_path)
+    torch.save(vector, tensor_path)
     meta = dict(metadata)
     meta["name"] = name
     meta["tensor_file"] = tensor_path.name
+    meta["vector_dim"] = int(vector.numel())
+    meta["vector_shape"] = list(vector.shape)
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return tensor_path, meta_path
 
@@ -56,12 +69,14 @@ def load_feature(name: str | None) -> tuple[torch.Tensor, dict[str, Any]]:
     tensor_path, meta_path = feature_paths(name)
     if not tensor_path.exists():
         raise FileNotFoundError(tensor_path)
-    vector = torch.load(tensor_path, map_location="cpu")
+    vector = torch.load(tensor_path, map_location="cpu").detach().flatten()
     metadata = {}
     if meta_path.exists():
         metadata = json.loads(meta_path.read_text(encoding="utf-8"))
     if "name" not in metadata:
         metadata["name"] = name
+    metadata["vector_dim"] = int(vector.numel())
+    metadata["vector_shape"] = list(vector.shape)
     return vector, metadata
 
 
@@ -85,8 +100,19 @@ def list_features(include_missing: bool = False) -> list[dict[str, Any]]:
 
         tensor_name = meta.get("tensor_file") or f"{safe}.pt"
         tensor_path = FEATURE_DIR / str(tensor_name)
+        exists = tensor_path.exists()
         meta["name"] = str(name)
-        meta["exists"] = tensor_path.exists()
-        if include_missing or meta["exists"]:
+        meta["exists"] = exists
+        if exists:
+            meta["vector_dim"] = meta.get("vector_dim") or tensor_vector_dim(tensor_path)
+        if include_missing or exists:
             rows.append(meta)
+    return rows
+
+
+def compatible_features(expected_dim: int) -> list[dict[str, Any]]:
+    rows = []
+    for item in list_features(include_missing=False):
+        if item.get("vector_dim") == int(expected_dim):
+            rows.append(item)
     return rows
