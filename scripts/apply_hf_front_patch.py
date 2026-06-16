@@ -6,17 +6,21 @@ from pathlib import Path
 MAIN = Path("main.py")
 
 
-def replace_once(text: str, old: str, new: str) -> str:
+def replace_once(text: str, old: str, new: str, required: bool = True) -> str:
     if old not in text:
-        raise SystemExit(f"Patch anchor not found:\n{old[:300]}")
+        if required:
+            raise SystemExit(f"Patch anchor not found:\n{old[:300]}")
+        return text
     return text.replace(old, new, 1)
 
 
-def insert_after(text: str, anchor: str, insertion: str) -> str:
-    if insertion.strip() in text:
+def insert_after(text: str, anchor: str, insertion: str, required: bool = True) -> str:
+    if insertion.strip() and insertion.strip() in text:
         return text
     if anchor not in text:
-        raise SystemExit(f"Patch anchor not found:\n{anchor[:300]}")
+        if required:
+            raise SystemExit(f"Patch anchor not found:\n{anchor[:300]}")
+        return text
     return text.replace(anchor, anchor + insertion, 1)
 
 
@@ -26,109 +30,13 @@ def ensure_import_after(text: str, anchor: str, import_line: str) -> str:
     return insert_after(text, anchor, import_line)
 
 
-def main() -> None:
-    if not MAIN.exists():
-        raise SystemExit("Run this from the glass-skull repo root")
-
-    text = MAIN.read_text(encoding="utf-8")
-
-    # Streamlit API cleanup.
-    text = text.replace("use_container_width=True", 'width="stretch"')
-    text = text.replace("use_container_width=False", 'width="content"')
-
-    # Ensure keyed Plotly rendering.
-    if "PLOT_COUNTER = 0" not in text:
-        text = replace_once(text, "ui.inject_theme()\n\nHELP =", "ui.inject_theme()\n\nPLOT_COUNTER = 0\n\nHELP =")
-
-    if "def plot_if_present(fig, key_hint: str = \"plot\")" not in text:
-        old = '''def plot_if_present(fig) -> None:
-    if fig is not None:
-        fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color=ui.TEXT, family="Inter, sans-serif"),
-            title_font=dict(color=ui.TEXT, size=15),
-        )
-        st.plotly_chart(fig, width="stretch")
-'''
-        new = '''def plot_if_present(fig, key_hint: str = "plot") -> None:
-    global PLOT_COUNTER
-    if fig is not None:
-        fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color=ui.TEXT, family="Inter, sans-serif"),
-            title_font=dict(color=ui.TEXT, size=15),
-        )
-        PLOT_COUNTER += 1
-        st.plotly_chart(fig, width="stretch", key=f"{key_hint}_{PLOT_COUNTER}")
-'''
-        if old in text:
-            text = replace_once(text, old, new)
-
-    import_anchor = "from glass_skull.feature_store import compatible_features, list_features, load_feature, save_feature\n"
-    text = ensure_import_after(text, import_anchor, "from glass_skull.hf_access import access_badge_text, check_model_access, validate_token\n")
-    text = ensure_import_after(text, import_anchor, "from glass_skull.hf_loader import build_hf_load_plan\n")
-    text = ensure_import_after(text, import_anchor, "from glass_skull.hf_registry import capabilities_for_backend, families, model_state, registry_as_dicts, visible_models\n")
-
-    # Help entries.
-    if '"hf_token"' not in text:
-        text = replace_once(
-            text,
-            '    "compare": "Runs the same prompt normally and with steering, then shows text and activation differences.",\n}',
-            '    "compare": "Runs the same prompt normally and with steering, then shows text and activation differences.",\n'
-            '    "hf_token": "Optional Hugging Face read token. Required for gated models after you accept the model license/access terms on Hugging Face.",\n'
-            '    "hf_catalog": "Official HF model catalog. Visible does not mean loadable; loadability depends on token, access, hardware, and adapter support.",\n'
-            '}',
-        )
-
-    defaults_slice = text[text.find("defaults = {"):text.find("defaults = {") + 1600]
-    if '"dashboard_trace"' not in defaults_slice:
-        text = replace_once(
-            text,
-            '        "last_comparison": None,\n',
-            '        "last_comparison": None,\n'
-            '        "dashboard_trace": None,\n'
-            '        "dashboard_trace_meta": {},\n'
-            '        "dashboard_trace_counter": 0,\n',
-        )
-    defaults_slice = text[text.find("defaults = {"):text.find("defaults = {") + 1600]
-    if '"hf_token"' not in defaults_slice:
-        text = replace_once(
-            text,
-            '        "poke_strength": 1.5,\n',
-            '        "poke_strength": 1.5,\n'
-            '        "hf_token": "",\n'
-            '        "hf_token_status": None,\n'
-            '        "hf_model_access_cache": {},\n'
-            '        "hf_selected_family": "All",\n'
-            '        "hf_recommended_only": False,\n'
-            '        "hf_selected_repo": "",\n'
-            '        "hf_last_load_plan": None,\n',
-        )
-
-    # Clear dashboard snapshot when trace/model is cleared.
-    text = text.replace(
-        '            st.session_state.last_comparison = None\n            load_hooked_model.clear()\n',
-        '            st.session_state.last_comparison = None\n            st.session_state.dashboard_trace = None\n            st.session_state.dashboard_trace_meta = {}\n            load_hooked_model.clear()\n',
-    )
-    text = text.replace(
-        '        if st.button("Clear trace", width="stretch", help="Clears the currently cached activations."):\n            st.session_state.trace = None\n',
-        '        if st.button("Clear trace", width="stretch", help="Clears the currently cached activations."):\n            st.session_state.trace = None\n            st.session_state.dashboard_trace = None\n            st.session_state.dashboard_trace_meta = {}\n',
-    )
-
-    helper_anchor = '''def feature_names_from_rows(rows: list[dict]) -> list[str]:
+HELPER_ANCHOR = '''def feature_names_from_rows(rows: list[dict]) -> list[str]:
     return [str(f["name"]) for f in rows if f.get("name")]
 
 '''
 
-    if "def set_dashboard_trace(" not in text:
-        text = insert_after(
-            text,
-            helper_anchor,
-            '''
+
+SET_DASHBOARD_TRACE = '''
 
 def set_dashboard_trace(trace, prompt: str, backend: str, trace_model: str) -> None:
     st.session_state.dashboard_trace = trace
@@ -142,20 +50,10 @@ def set_dashboard_trace(trace, prompt: str, backend: str, trace_model: str) -> N
         "run": st.session_state.dashboard_trace_counter,
     }
 
-''',
-        )
+'''
 
-    if "def render_capability_warning(" not in text:
-        text = insert_after(
-            text,
-            "def set_dashboard_trace(trace, prompt: str, backend: str, trace_model: str) -> None:\n",
-            '''
-''',
-        )
-        text = insert_after(
-            text,
-            '    }\n\n',
-            '''
+
+CAPABILITY_HELPER = '''
 
 def render_capability_warning(chat_backend: str) -> dict[str, bool]:
     caps = capabilities_for_backend(chat_backend)
@@ -165,22 +63,10 @@ def render_capability_warning(chat_backend: str) -> dict[str, bool]:
         )
     return caps
 
-''',
-        )
+'''
 
-    if "def render_hf_catalog_panel(" not in text:
-        text = insert_after(
-            text,
-            '''def render_capability_warning(chat_backend: str) -> dict[str, bool]:
-    caps = capabilities_for_backend(chat_backend)
-    if "llama.cpp" in chat_backend.lower():
-        st.warning(
-            "llama.cpp backend is chat/output-only right now. Activation Trace, Logit Lens, Attention, Map, Steer, and activation Compare are disabled until llama.cpp-glass exposes real hooks."
-        )
-    return caps
 
-''',
-            r'''
+HF_PANEL_HELPER = '''
 
 def render_hf_catalog_panel() -> None:
     st.markdown("### Hugging Face Access")
@@ -264,16 +150,110 @@ def render_hf_catalog_panel() -> None:
             st.session_state.hf_last_load_plan = plan.__dict__
 
     if access:
-        st.info(f"Hub access: {access_badge_text(type('A', (), access)())}")
+        st.info(f"Hub access: {access_badge_text(type('HFModelAccessView', (), access)())}")
     if st.session_state.get("hf_last_load_plan"):
         st.json(st.session_state.hf_last_load_plan)
 
     st.dataframe(pd.DataFrame(registry_as_dicts()), width="stretch", height=220, hide_index=True)
 
-''',
+'''
+
+
+def main() -> None:
+    if not MAIN.exists():
+        raise SystemExit("Run this from the glass-skull repo root")
+
+    text = MAIN.read_text(encoding="utf-8")
+
+    text = text.replace("use_container_width=True", 'width="stretch"')
+    text = text.replace("use_container_width=False", 'width="content"')
+
+    if "PLOT_COUNTER = 0" not in text:
+        text = replace_once(text, "ui.inject_theme()\n\nHELP =", "ui.inject_theme()\n\nPLOT_COUNTER = 0\n\nHELP =")
+
+    if "def plot_if_present(fig, key_hint: str = \"plot\")" not in text:
+        old = '''def plot_if_present(fig) -> None:
+    if fig is not None:
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color=ui.TEXT, family="Inter, sans-serif"),
+            title_font=dict(color=ui.TEXT, size=15),
+        )
+        st.plotly_chart(fig, width="stretch")
+'''
+        new = '''def plot_if_present(fig, key_hint: str = "plot") -> None:
+    global PLOT_COUNTER
+    if fig is not None:
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color=ui.TEXT, family="Inter, sans-serif"),
+            title_font=dict(color=ui.TEXT, size=15),
+        )
+        PLOT_COUNTER += 1
+        st.plotly_chart(fig, width="stretch", key=f"{key_hint}_{PLOT_COUNTER}")
+'''
+        text = replace_once(text, old, new, required=False)
+
+    import_anchor = "from glass_skull.feature_store import compatible_features, list_features, load_feature, save_feature\n"
+    text = ensure_import_after(text, import_anchor, "from glass_skull.hf_access import access_badge_text, check_model_access, validate_token\n")
+    text = ensure_import_after(text, import_anchor, "from glass_skull.hf_loader import build_hf_load_plan\n")
+    text = ensure_import_after(text, import_anchor, "from glass_skull.hf_registry import capabilities_for_backend, families, model_state, registry_as_dicts, visible_models\n")
+
+    if '"hf_token"' not in text:
+        text = replace_once(
+            text,
+            '    "compare": "Runs the same prompt normally and with steering, then shows text and activation differences.",\n}',
+            '    "compare": "Runs the same prompt normally and with steering, then shows text and activation differences.",\n'
+            '    "hf_token": "Optional Hugging Face read token. Required for gated models after you accept the model license/access terms on Hugging Face.",\n'
+            '    "hf_catalog": "Official HF model catalog. Visible does not mean loadable; loadability depends on token, access, hardware, and adapter support.",\n'
+            '}',
         )
 
-    # Sidebar HF section after Servers, before Session.
+    defaults_slice = text[text.find("defaults = {"):text.find("defaults = {") + 1600]
+    if '"dashboard_trace"' not in defaults_slice:
+        text = replace_once(
+            text,
+            '        "last_comparison": None,\n',
+            '        "last_comparison": None,\n'
+            '        "dashboard_trace": None,\n'
+            '        "dashboard_trace_meta": {},\n'
+            '        "dashboard_trace_counter": 0,\n',
+        )
+    defaults_slice = text[text.find("defaults = {"):text.find("defaults = {") + 1600]
+    if '"hf_token"' not in defaults_slice:
+        text = replace_once(
+            text,
+            '        "poke_strength": 1.5,\n',
+            '        "poke_strength": 1.5,\n'
+            '        "hf_token": "",\n'
+            '        "hf_token_status": None,\n'
+            '        "hf_model_access_cache": {},\n'
+            '        "hf_selected_family": "All",\n'
+            '        "hf_recommended_only": False,\n'
+            '        "hf_selected_repo": "",\n'
+            '        "hf_last_load_plan": None,\n',
+        )
+
+    text = text.replace(
+        '            st.session_state.last_comparison = None\n            load_hooked_model.clear()\n',
+        '            st.session_state.last_comparison = None\n            st.session_state.dashboard_trace = None\n            st.session_state.dashboard_trace_meta = {}\n            load_hooked_model.clear()\n',
+    )
+    text = text.replace(
+        '        if st.button("Clear trace", width="stretch", help="Clears the currently cached activations."):\n            st.session_state.trace = None\n',
+        '        if st.button("Clear trace", width="stretch", help="Clears the currently cached activations."):\n            st.session_state.trace = None\n            st.session_state.dashboard_trace = None\n            st.session_state.dashboard_trace_meta = {}\n',
+    )
+
+    if "def set_dashboard_trace(" not in text:
+        text = insert_after(text, HELPER_ANCHOR, SET_DASHBOARD_TRACE)
+    if "def render_capability_warning(" not in text:
+        text = insert_after(text, HELPER_ANCHOR, CAPABILITY_HELPER)
+    if "def render_hf_catalog_panel(" not in text:
+        text = insert_after(text, HELPER_ANCHOR, HF_PANEL_HELPER)
+
     sidebar_anchor = '''        elif glass_status is not None:
             st.caption(f"Glass error: {glass_status.error or 'no details'}")
 
@@ -294,13 +274,11 @@ def render_hf_catalog_panel() -> None:
             '    ui.pill("HF token", ui.GREEN if (st.session_state.get("hf_token_status") and st.session_state.hf_token_status.valid) else ui.SLATE),\n',
         )
 
-    # Dashboard should read from a live trace snapshot updated by chat.
     text = text.replace(
         '    trace = st.session_state.trace\n    if trace is None:\n        ui.empty_state("No trace captured yet", "Send a message in the Chat tab with tracing enabled to populate these graphs.")\n    else:\n        st.code(trace.prompt)\n',
         '    trace = st.session_state.get("dashboard_trace") or st.session_state.get("trace")\n    dash_meta = st.session_state.get("dashboard_trace_meta", {}) or {}\n    if trace is None:\n        ui.empty_state("No trace captured yet", "Send a message in the Chat tab with tracing enabled to populate these graphs.")\n    else:\n        ui.property_list([\n            ("updated", str(dash_meta.get("updated_at", "current run"))),\n            ("backend", str(dash_meta.get("backend", "unknown"))),\n            ("trace_model", str(dash_meta.get("trace_model", summary["model_name"]))),\n            ("tokens", str(dash_meta.get("token_count", len(trace.tokens)))),\n            ("run", str(dash_meta.get("run", "-"))),\n        ])\n        st.code(trace.prompt)\n',
     )
 
-    # Chat capability warning after backend select.
     chat_anchor = '''    with cfg3:
         temperature = st.slider("Temperature", 0.01, 1.5, 0.8, 0.05, help=HELP["temperature"], key="chat_temp")
 
@@ -317,7 +295,6 @@ def render_hf_catalog_panel() -> None:
         '        use_steering = st.toggle("Use steering", value=False, disabled=not caps["activation_steering"], help="Only applies when the chat backend is TransformerLens. Stock llama.cpp cannot be activation-steered yet.")',
     )
 
-    # Trace writes also refresh Dashboard.
     text = text.replace(
         '                trace = trace_prompt(model, prompt)\n                st.session_state.trace = trace\n                run_id = log_run(model_name=model_name, mode="chat_trace", prompt=prompt, metadata={"tokens": trace.tokens, "summary": summary})\n',
         '                trace = trace_prompt(model, prompt)\n                st.session_state.trace = trace\n                set_dashboard_trace(trace, prompt, chat_backend, str(summary["model_name"]))\n                run_id = log_run(model_name=model_name, mode="chat_trace", prompt=prompt, metadata={"tokens": trace.tokens, "summary": summary, "chat_backend": chat_backend})\n',
