@@ -203,7 +203,7 @@ def main() -> None:
     text = ensure_import_after(text, import_anchor, "from glass_skull.hf_loader import build_hf_load_plan\n")
     text = ensure_import_after(text, import_anchor, "from glass_skull.hf_registry import capabilities_for_backend, families, model_state, registry_as_dicts, visible_models\n")
 
-    if '"hf_token"' not in text:
+    if '"hf_token": "Optional Hugging Face read token' not in text:
         text = replace_once(
             text,
             '    "compare": "Runs the same prompt normally and with steering, then shows text and activation differences.",\n}',
