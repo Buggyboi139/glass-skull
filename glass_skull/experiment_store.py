@@ -25,7 +25,12 @@ def safe_slug(name: str) -> str:
 def create_experiment_dir(name: str) -> Path:
     EXPERIMENT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    path = EXPERIMENT_DIR / f"{stamp}_{safe_slug(name)}"
+    base = EXPERIMENT_DIR / f"{stamp}_{safe_slug(name)}"
+    path = base
+    suffix = 1
+    while path.exists():
+        suffix += 1
+        path = Path(f"{base}_{suffix}")
     path.mkdir(parents=True, exist_ok=False)
     return path
 
