@@ -59,6 +59,15 @@ def top_recurring_dimensions(records: list[dict[str, Any]], limit: int = 50) -> 
     return df.sort_values(["count", "mean_abs_activation"], ascending=[False, False]).head(limit)
 
 
+def _finite_or_zero(value: Any) -> float:
+    try:
+        if pd.isna(value):
+            return 0.0
+        return float(value)
+    except Exception:
+        return 0.0
+
+
 def label_separation_table(records: list[dict[str, Any]]) -> pd.DataFrame:
     """Rank label pairs by activation-norm separation for each layer/stream.
 
@@ -85,16 +94,20 @@ def label_separation_table(records: list[dict[str, Any]]) -> pd.DataFrame:
                 continue
             row_a = chunk[chunk["label"] == a].iloc[0]
             row_b = chunk[chunk["label"] == b].iloc[0]
-            diff = float(row_a["mean_norm"] - row_b["mean_norm"])
-            pooled = float(((row_a["std_norm"] or 0.0) + (row_b["std_norm"] or 0.0)) / 2.0)
+            mean_a = _finite_or_zero(row_a["mean_norm"])
+            mean_b = _finite_or_zero(row_b["mean_norm"])
+            diff = mean_a - mean_b
+            std_a = _finite_or_zero(row_a["std_norm"])
+            std_b = _finite_or_zero(row_b["std_norm"])
+            pooled = (std_a + std_b) / 2.0
             score = abs(diff) / (pooled + 1e-6)
             rows.append({
                 "label_a": a,
                 "label_b": b,
                 "layer": int(layer),
                 "stream": stream,
-                "mean_a": float(row_a["mean_norm"]),
-                "mean_b": float(row_b["mean_norm"]),
+                "mean_a": mean_a,
+                "mean_b": mean_b,
                 "difference": diff,
                 "abs_difference": abs(diff),
                 "separation_score": score,
