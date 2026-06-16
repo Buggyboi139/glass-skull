@@ -77,6 +77,7 @@ def parse_layer_list(raw: str, max_layer: int) -> list[int]:
     raw = raw.strip().lower()
     if not raw or raw == "all":
         return list(range(max_layer + 1))
+
     layers: set[int] = set()
     for part in raw.split(","):
         part = part.strip()
@@ -84,8 +85,10 @@ def parse_layer_list(raw: str, max_layer: int) -> list[int]:
             continue
         if "-" in part:
             start_s, end_s = part.split("-", 1)
-            start = int(start_s)
-            end = int(end_s)
+            start = int(start_s.strip())
+            end = int(end_s.strip())
+            if end < start:
+                start, end = end, start
             for layer in range(start, end + 1):
                 if 0 <= layer <= max_layer:
                     layers.add(layer)
@@ -103,11 +106,17 @@ def render_status(label: str, status) -> None:
     if status.online:
         glass = "yes" if status.glass_available else "no"
         model_text = ", ".join(status.models) if status.models else "unknown"
-        st.success(f"{label}: online, {status.latency_ms:.0f} ms, glass: {glass}")
+        latency = f"{status.latency_ms:.0f} ms" if status.latency_ms is not None else "unknown latency"
+        st.success(f"{label}: online, {latency}, glass: {glass}")
         st.caption(f"Model: {model_text}")
     else:
         st.error(f"{label}: offline")
         st.caption(status.error or "no details")
+
+
+def plot_if_present(fig) -> None:
+    if fig is not None:
+        st.plotly_chart(fig, use_container_width=True)
 
 
 init_state()
@@ -245,7 +254,7 @@ with trace_col:
         if fig is None:
             st.warning("No activation rows were captured for this trace.")
         else:
-            st.plotly_chart(fig, use_container_width=True)
+            plot_if_present(fig)
 
         st.markdown("**Inspect a point**")
         layer = st.number_input("Layer", 0, summary["layers"] - 1, 0, help=HELP["layer"], key="trace_layer")
@@ -318,9 +327,7 @@ with poke_col:
             edge_k = st.slider("Top edges", 5, 200, 50, 5, help="How many strongest contribution paths to show.", key="edge_k")
             try:
                 edges = top_contribution_edges(model, trace.cache, int(edge_layer), module, int(edge_token), top_k=edge_k)
-                fig = edge_constellation(edges)
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                plot_if_present(edge_constellation(edges))
                 st.dataframe(edges, use_container_width=True, height=220)
                 if st.button("Log edges", help="Save the displayed edge rows to SQLite."):
                     run_id = st.session_state.get("last_run_id") or log_run(model_name, "active_edges", trace.prompt)
@@ -352,49 +359,49 @@ with poke_col:
             prompt_items = []
 
         if st.button("Run fuzz", type="primary", use_container_width=True, disabled=not prompt_items):
-            layers = parse_layer_list(layer_raw, summary["layers"] - 1)
-            backend_key = "transformerlens" if fuzz_backend == "TransformerLens" else "llama.cpp"
-            llama_url = st.session_state.llama_url if fuzz_backend == "llama.cpp normal" else st.session_state.llama_glass_url
-            progress = st.progress(0)
-            status = st.empty()
-
-            def cb(i: int, total: int, current_prompt: str) -> None:
-                progress.progress(i / max(total, 1))
-                status.caption(f"{i}/{total}: {current_prompt[:120]}")
-
             try:
-                with st.spinner("Running fuzz experiment..."):
-                    result = run_fuzz_experiment(
-                        name=fuzz_name,
-                        prompts=prompt_items,
-                        chat_backend=backend_key,
-                        trace_enabled=trace_fuzz,
-                        model=model,
-                        llama_url=llama_url,
-                        max_new_tokens=max_new_tokens,
-                        temperature=temperature,
-                        layers=layers,
-                        streams=streams or ["resid_post"],
-                        top_k=fuzz_top_k,
-                        progress_callback=cb,
-                    )
-                    st.session_state.last_fuzz_result = result
-                st.success(f"Saved experiment: {result['summary']['experiment_path']}")
+                layers = parse_layer_list(layer_raw, summary["layers"] - 1)
+                if not layers:
+                    raise ValueError("No valid layers selected. Use 'all', a comma list like 0,4,8, or a range like 0-8.")
             except Exception as exc:
-                st.error(str(exc))
+                st.error(f"Invalid layer list: {exc}")
+            else:
+                backend_key = "transformerlens" if fuzz_backend == "TransformerLens" else "llama.cpp"
+                llama_url = st.session_state.llama_url if fuzz_backend == "llama.cpp normal" else st.session_state.llama_glass_url
+                progress = st.progress(0)
+                status = st.empty()
+
+                def cb(i: int, total: int, current_prompt: str) -> None:
+                    progress.progress(i / max(total, 1))
+                    status.caption(f"{i}/{total}: {current_prompt[:120]}")
+
+                try:
+                    with st.spinner("Running fuzz experiment..."):
+                        result = run_fuzz_experiment(
+                            name=fuzz_name,
+                            prompts=prompt_items,
+                            chat_backend=backend_key,
+                            trace_enabled=trace_fuzz,
+                            model=model,
+                            llama_url=llama_url,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            layers=layers,
+                            streams=streams or ["resid_post"],
+                            top_k=fuzz_top_k,
+                            progress_callback=cb,
+                        )
+                        st.session_state.last_fuzz_result = result
+                    st.success(f"Saved experiment: {result['summary']['experiment_path']}")
+                except Exception as exc:
+                    st.error(str(exc))
 
         result = st.session_state.last_fuzz_result
         if result:
             st.markdown("**Last fuzz visuals**")
-            f1 = fuzz_prompt_layer_fig(result.get("prompt_layer_df", pd.DataFrame()))
-            if f1:
-                st.plotly_chart(f1, use_container_width=True)
-            f2 = fuzz_label_layer_fig(result.get("label_layer_df", pd.DataFrame()))
-            if f2:
-                st.plotly_chart(f2, use_container_width=True)
-            f3 = dim_frequency_fig(result.get("top_dims_df", pd.DataFrame()))
-            if f3:
-                st.plotly_chart(f3, use_container_width=True)
+            plot_if_present(fuzz_prompt_layer_fig(result.get("prompt_layer_df", pd.DataFrame())))
+            plot_if_present(fuzz_label_layer_fig(result.get("label_layer_df", pd.DataFrame())))
+            plot_if_present(dim_frequency_fig(result.get("top_dims_df", pd.DataFrame())))
 
 with anatomy_col:
     st.subheader("Anatomy / Logs")
