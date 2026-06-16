@@ -45,6 +45,8 @@ st.set_page_config(page_title="Operation Glass Skull", layout="wide", initial_si
 ensure_dirs()
 ui.inject_theme()
 
+PLOT_COUNTER = 0
+
 HELP = {
     "preset": "Pick the local TransformerLens model used for tracing, feature mapping, and optional steering.",
     "device": "CPU always works. CUDA only works if PyTorch can see an NVIDIA GPU. AMD Vulkan belongs to llama.cpp, not PyTorch.",
@@ -116,7 +118,8 @@ def parse_layer_list(raw: str, max_layer: int) -> list[int]:
     return sorted(layers)
 
 
-def plot_if_present(fig) -> None:
+def plot_if_present(fig, key_hint: str = "plot") -> None:
+    global PLOT_COUNTER
     if fig is not None:
         fig.update_layout(
             template="plotly_dark",
@@ -125,7 +128,8 @@ def plot_if_present(fig) -> None:
             font=dict(color=ui.TEXT, family="Inter, sans-serif"),
             title_font=dict(color=ui.TEXT, size=15),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        PLOT_COUNTER += 1
+        st.plotly_chart(fig, width="stretch", key=f"{key_hint}_{PLOT_COUNTER}")
 
 
 def active_chat_model_label(chat_backend: str, summary: dict) -> str:
@@ -172,7 +176,7 @@ with st.sidebar:
         load_clicked = st.button(
             "Load trace model",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             help="Reloads the selected TransformerLens model and clears the current trace.",
         )
         if load_clicked:
@@ -203,10 +207,10 @@ with st.sidebar:
         st.session_state.llama_glass_url = st.text_input("Glass server URL", value=st.session_state.llama_glass_url, help="Future patched llama.cpp lab server. Use a nonstandard port like 8088.")
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Check normal", use_container_width=True, help="Checks /v1/models and optional /glass-skull/info."):
+            if st.button("Check normal", width="stretch", help="Checks /v1/models and optional /glass-skull/info."):
                 st.session_state.llama_status = check_server(st.session_state.llama_url)
         with c2:
-            if st.button("Check glass", use_container_width=True, help="Checks the lab llama.cpp server on its separate port."):
+            if st.button("Check glass", width="stretch", help="Checks the lab llama.cpp server on its separate port."):
                 st.session_state.llama_glass_status = check_server(st.session_state.llama_glass_url)
 
         st.markdown(
@@ -230,12 +234,12 @@ with st.sidebar:
             st.caption(f"Glass error: {glass_status.error or 'no details'}")
 
     with st.expander("Session", expanded=False):
-        if st.button("Clear chat", use_container_width=True, help="Clears only visible chat history. Logs stay saved."):
+        if st.button("Clear chat", width="stretch", help="Clears only visible chat history. Logs stay saved."):
             st.session_state.chat_messages = []
             st.session_state.last_output = ""
-        if st.button("Clear trace", use_container_width=True, help="Clears the currently cached activations."):
+        if st.button("Clear trace", width="stretch", help="Clears the currently cached activations."):
             st.session_state.trace = None
-        if st.button("Clear comparison", use_container_width=True, help="Clears the last normal-vs-steered comparison."):
+        if st.button("Clear comparison", width="stretch", help="Clears the last normal-vs-steered comparison."):
             st.session_state.last_comparison = None
 
 all_features = list_features(include_missing=False)
@@ -393,7 +397,7 @@ with tab_chat:
 
     with st.form("chat_form", clear_on_submit=False, border=False):
         prompt = st.text_area("Message", value="The cat sat on the", height=110, help="The text sent to the selected chat backend. Press Ctrl+Enter to send.", key="chat_prompt")
-        send = st.form_submit_button("Send message", type="primary", use_container_width=True)
+        send = st.form_submit_button("Send message", type="primary", width="stretch")
 
     if send and prompt.strip():
         prompt = prompt.strip()
@@ -460,11 +464,11 @@ with tab_trace:
             try:
                 lens_df = logit_lens_table(model, trace.cache, token_index=int(lens_token), stream=lens_stream, top_k=lens_k)
                 plot_if_present(logit_lens_probability_fig(lens_df))
-                st.dataframe(lens_df, use_container_width=True, height=220)
+                st.dataframe(lens_df, width="stretch", height=220)
                 with st.expander("Layer/token certainty heatmap", expanded=False):
                     token_df = logit_lens_top_token_heatmap(model, trace.cache, trace.tokens, stream=lens_stream)
                     plot_if_present(logit_lens_token_heatmap(token_df))
-                    st.dataframe(token_df, use_container_width=True, height=220)
+                    st.dataframe(token_df, width="stretch", height=220)
             except Exception as exc:
                 st.error(str(exc))
         elif trace_mode == "Attention":
@@ -474,7 +478,7 @@ with tab_trace:
             try:
                 attn_df = attention_pattern_table(trace.cache, int(attn_layer), int(attn_head), trace.tokens)
                 plot_if_present(attention_heatmap(attn_df))
-                st.dataframe(top_attention_links(trace.cache, int(attn_layer), int(attn_head), trace.tokens, top_k=30), use_container_width=True, height=220)
+                st.dataframe(top_attention_links(trace.cache, int(attn_layer), int(attn_head), trace.tokens, top_k=30), width="stretch", height=220)
             except Exception as exc:
                 st.error(str(exc))
 
@@ -491,7 +495,7 @@ with tab_trace:
             top_k = st.slider("Top dims", 5, 100, 30, 5, help=HELP["top_dims"], key="trace_top_dims")
         try:
             dims = top_active_dimensions(trace.cache, int(layer), stream, int(token_index), top_k=top_k)
-            st.dataframe(dims, use_container_width=True, height=200)
+            st.dataframe(dims, width="stretch", height=200)
             if st.button("Log dims", help="Save the displayed activation dimensions to SQLite."):
                 run_id = st.session_state.get("last_run_id") or log_run(model_name, "trace_dims", trace.prompt)
                 rows = dims.assign(layer=int(layer), stream=stream, token_index=int(token_index), token=trace.tokens[int(token_index)]).to_dict("records")
@@ -501,7 +505,7 @@ with tab_trace:
             st.error(str(exc))
 
         with st.expander("Final next-token probabilities", expanded=False):
-            st.dataframe(next_token_table(model, trace.logits, top_k=20), use_container_width=True)
+            st.dataframe(next_token_table(model, trace.logits, top_k=20), width="stretch")
 
 # ------------------------------------------------ Poke / Compare / Fuzz ----
 with tab_poke:
@@ -514,7 +518,7 @@ with tab_poke:
         ui.purpose("Apply a saved activation direction to TransformerLens replies. Pick a feature, layer, stream, and strength.")
         if all_feature_names and not compatible_feature_names:
             st.warning(f"Saved features exist, but none match current d_model {expected_dim}. Rebuild one with this trace model.")
-            st.dataframe(pd.DataFrame(all_features), use_container_width=True, height=160)
+            st.dataframe(pd.DataFrame(all_features), width="stretch", height=160)
         elif not compatible_feature_names:
             st.info("No compatible saved features yet. Use the Map tab to make one.")
         else:
@@ -531,7 +535,7 @@ with tab_poke:
             with sc3:
                 st.session_state.poke_strength = st.slider("Strength", -5.0, 5.0, 1.5, 0.25, help=HELP["strength"], key="poke_strength_widget")
             st.caption(f"Feature vector dim: `{meta.get('vector_dim')}` | model d_model: `{expected_dim}`")
-            st.dataframe(pd.DataFrame(vector_summary(vector, top_k=25)), use_container_width=True, height=240)
+            st.dataframe(pd.DataFrame(vector_summary(vector, top_k=25)), width="stretch", height=240)
             st.info("Turn on 'Use steering' in Chat to apply this feature to TransformerLens replies.")
 
     with tab_map:
@@ -544,7 +548,7 @@ with tab_poke:
         with mc2:
             map_stream = st.selectbox("Map stream", ["resid_pre", "attn_out", "mlp_out", "resid_post"], index=3, help=HELP["stream"], key="map_stream")
         feature_name = st.text_input("Feature name", value="sarcasm-ish", help="Name for the saved activation direction.")
-        if st.button("Build feature", type="primary", use_container_width=True, help="Average positive examples, subtract negative examples, and save the result."):
+        if st.button("Build feature", type="primary", width="stretch", help="Average positive examples, subtract negative examples, and save the result."):
             positive = [p.strip() for p in positive_text.splitlines() if p.strip()]
             negative = [p.strip() for p in negative_text.splitlines() if p.strip()]
             try:
@@ -572,7 +576,7 @@ with tab_poke:
                 cmp_stream = st.selectbox("Compare stream", ["resid_pre", "attn_out", "mlp_out", "resid_post"], index=3, key="cmp_stream")
             with cc3:
                 cmp_strength = st.slider("Compare strength", -5.0, 5.0, 1.5, 0.25, key="cmp_strength")
-            if st.button("Run comparison", type="primary", use_container_width=True):
+            if st.button("Run comparison", type="primary", width="stretch"):
                 try:
                     with st.spinner("Running normal vs steered comparison..."):
                         st.session_state.last_comparison = compare_normal_vs_steered(
@@ -597,7 +601,7 @@ with tab_poke:
                     st.markdown(ui.badge("STEERED", ui.PURPLE), unsafe_allow_html=True)
                     st.write(cmp_result.steered_output)
                 plot_if_present(comparison_delta_heatmap(cmp_result.norm_diff))
-                st.dataframe(cmp_result.norm_diff.sort_values("abs_delta", ascending=False).head(50), use_container_width=True, height=220)
+                st.dataframe(cmp_result.norm_diff.sort_values("abs_delta", ascending=False).head(50), width="stretch", height=220)
 
     with tab_edges:
         ui.purpose(HELP["edges"])
@@ -617,7 +621,7 @@ with tab_poke:
             try:
                 edges = top_contribution_edges(model, trace.cache, int(edge_layer), module, int(edge_token), top_k=edge_k)
                 plot_if_present(edge_constellation(edges))
-                st.dataframe(edges, use_container_width=True, height=220)
+                st.dataframe(edges, width="stretch", height=220)
                 if st.button("Log edges", help="Save the displayed edge rows to SQLite."):
                     run_id = st.session_state.get("last_run_id") or log_run(model_name, "active_edges", trace.prompt)
                     log_edges(run_id, edges.to_dict("records"))
@@ -649,14 +653,14 @@ with tab_poke:
             try:
                 prompt_items = load_prompt_file_bytes(uploaded.name, uploaded.getvalue())[:fuzz_limit]
                 st.write(f"Loaded `{len(prompt_items)}` prompts")
-                st.dataframe(pd.DataFrame([{"id": p.prompt_id, "label": p.label, "prompt": p.prompt} for p in prompt_items[:20]]), use_container_width=True, height=140)
+                st.dataframe(pd.DataFrame([{"id": p.prompt_id, "label": p.label, "prompt": p.prompt} for p in prompt_items[:20]]), width="stretch", height=140)
             except Exception as exc:
                 prompt_items = []
                 st.error(str(exc))
         else:
             prompt_items = []
 
-        if st.button("Run fuzz", type="primary", use_container_width=True, disabled=not prompt_items):
+        if st.button("Run fuzz", type="primary", width="stretch", disabled=not prompt_items):
             try:
                 layers = parse_layer_list(layer_raw, summary["layers"] - 1)
                 if not layers:
@@ -703,7 +707,7 @@ with tab_poke:
             sep_df = result.get("separation_df", pd.DataFrame())
             if not sep_df.empty:
                 st.markdown("**Suggested map locations**")
-                st.dataframe(sep_df.head(30), use_container_width=True, height=180)
+                st.dataframe(sep_df.head(30), width="stretch", height=180)
                 labels = sorted(set([r.get("label", "unlabeled") for r in result.get("records", []) if r.get("label") != "unlabeled"]))
                 if len(labels) >= 2:
                     a = st.selectbox("Positive label", labels, key="fuzz_pos_label")
@@ -712,7 +716,7 @@ with tab_poke:
                     f_layer = st.number_input("Feature layer from fuzz", 0, summary["layers"] - 1, int(best["layer"]), key="fuzz_feature_layer")
                     f_stream = st.selectbox("Feature stream from fuzz", ["resid_pre", "attn_out", "mlp_out", "resid_post"], index=["resid_pre", "attn_out", "mlp_out", "resid_post"].index(str(best["stream"])) if str(best["stream"]) in ["resid_pre", "attn_out", "mlp_out", "resid_post"] else 3, key="fuzz_feature_stream")
                     f_name = st.text_input("Fuzz feature name", value=f"{a}_minus_{b}_L{int(f_layer)}", key="fuzz_feature_name")
-                    if st.button("Save feature from fuzz labels", use_container_width=True):
+                    if st.button("Save feature from fuzz labels", width="stretch"):
                         pos = [r["prompt"] for r in result["records"] if r.get("label") == a]
                         neg = [r["prompt"] for r in result["records"] if r.get("label") == b]
                         if not pos or not neg:
@@ -744,7 +748,7 @@ with tab_anatomy:
         block_df = expected_block_table(model)
         st.dataframe(
             block_df,
-            use_container_width=True,
+            width="stretch",
             height=420,
             hide_index=True,
             column_config={
@@ -756,9 +760,9 @@ with tab_anatomy:
         )
     elif panel == "Hooks":
         ui.sec_label("Global hooks")
-        st.dataframe(global_hook_table(model), use_container_width=True, height=180, hide_index=True)
+        st.dataframe(global_hook_table(model), width="stretch", height=180, hide_index=True)
         ui.sec_label("All hook points")
-        st.dataframe(hook_table(model), use_container_width=True, height=430, hide_index=True)
+        st.dataframe(hook_table(model), width="stretch", height=430, hide_index=True)
     elif panel == "Parameters":
         params = params_df
         m1, m2 = st.columns(2)
@@ -767,12 +771,12 @@ with tab_anatomy:
         with m2:
             if not params.empty:
                 st.metric("Total parameters", f"{int(params['parameters'].sum()):,}")
-        st.dataframe(params, use_container_width=True, height=520, hide_index=True)
+        st.dataframe(params, width="stretch", height=520, hide_index=True)
     elif panel == "Experiments":
-        st.dataframe(pd.DataFrame(list_experiments()), use_container_width=True, height=590, hide_index=True)
+        st.dataframe(pd.DataFrame(list_experiments()), width="stretch", height=590, hide_index=True)
     elif panel == "Features":
         st.caption(f"Compatible with current d_model {expected_dim}: {len(compatible_feature_names)} / {len(all_feature_names)}")
-        st.dataframe(pd.DataFrame(all_features), use_container_width=True, height=590, hide_index=True)
+        st.dataframe(pd.DataFrame(all_features), width="stretch", height=590, hide_index=True)
     elif panel == "Logs":
         runs = recent_runs(limit=100)
         log_lines = []
