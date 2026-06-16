@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import pandas as pd
 import torch
@@ -9,6 +8,18 @@ from transformer_lens import HookedTransformer
 
 from .steering import generate_normal, generate_steered, make_steering_hook, validate_steering_vector
 from .tracer import TraceResult, activation_norm_table, hook_point, trace_prompt
+
+
+DIFF_COLUMNS = [
+    "layer",
+    "stream",
+    "token_index",
+    "token",
+    "normal_norm",
+    "steered_norm",
+    "delta",
+    "abs_delta",
+]
 
 
 @dataclass
@@ -19,6 +30,10 @@ class ComparisonResult:
     normal_trace: TraceResult
     steered_trace: TraceResult
     norm_diff: pd.DataFrame
+
+
+def empty_diff() -> pd.DataFrame:
+    return pd.DataFrame(columns=DIFF_COLUMNS)
 
 
 def trace_prompt_steered(
@@ -76,7 +91,11 @@ def compare_normal_vs_steered(
 
 def activation_norm_diff(normal: pd.DataFrame, steered: pd.DataFrame) -> pd.DataFrame:
     if normal.empty or steered.empty:
-        return pd.DataFrame()
+        return empty_diff()
+    required = {"layer", "stream", "token_index", "norm"}
+    if not required.issubset(normal.columns) or not required.issubset(steered.columns):
+        return empty_diff()
+
     n = normal.rename(columns={"norm": "normal_norm"})
     s = steered.rename(columns={"norm": "steered_norm"})
     merged = n.merge(
@@ -84,6 +103,11 @@ def activation_norm_diff(normal: pd.DataFrame, steered: pd.DataFrame) -> pd.Data
         on=["layer", "stream", "token_index"],
         how="inner",
     )
+    if merged.empty:
+        return empty_diff()
     merged["delta"] = merged["steered_norm"] - merged["normal_norm"]
     merged["abs_delta"] = merged["delta"].abs()
-    return merged
+    for col in DIFF_COLUMNS:
+        if col not in merged.columns:
+            merged[col] = None
+    return merged[DIFF_COLUMNS]
