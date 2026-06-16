@@ -19,6 +19,15 @@ def _apply_final_norm(model: HookedTransformer, resid: torch.Tensor) -> torch.Te
     return resid
 
 
+def _normalize_token_index(token_index: int, seq_len: int) -> int:
+    token_index = int(token_index)
+    if token_index < 0:
+        token_index = seq_len + token_index
+    if token_index < 0 or token_index >= seq_len:
+        raise IndexError(f"token_index {token_index} out of range for sequence length {seq_len}")
+    return token_index
+
+
 def logits_from_resid(model: HookedTransformer, resid: torch.Tensor) -> torch.Tensor:
     resid = resid.to(next(model.parameters()).device)
     resid = _apply_final_norm(model, resid)
@@ -33,12 +42,13 @@ def logit_lens_table(
     top_k: int = 5,
 ) -> pd.DataFrame:
     rows = []
-    token_index = int(token_index)
 
     for layer in range(model.cfg.n_layers):
         hp = hook_point(layer, stream)
         try:
-            resid = cache_get(cache, hp)[:, token_index:token_index + 1, :]
+            layer_resid = cache_get(cache, hp)
+            pos = _normalize_token_index(token_index, int(layer_resid.shape[1]))
+            resid = layer_resid[:, pos:pos + 1, :]
             logits = logits_from_resid(model, resid)[0, 0].detach().float().cpu()
         except Exception:
             continue
