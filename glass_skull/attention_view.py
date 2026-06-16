@@ -7,6 +7,10 @@ import pandas as pd
 from .tracer import cache_get
 
 
+def indexed_tokens(tokens: list[str]) -> list[str]:
+    return [f"{i}:{tok}" for i, tok in enumerate(tokens)]
+
+
 def attention_pattern_table(cache: Any, layer: int, head: int, tokens: list[str]) -> pd.DataFrame:
     hp = f"blocks.{int(layer)}.attn.hook_pattern"
     pattern = cache_get(cache, hp).detach().float().cpu()
@@ -17,6 +21,7 @@ def attention_pattern_table(cache: Any, layer: int, head: int, tokens: list[str]
     if head < 0 or head >= n_heads:
         raise ValueError(f"Head {head} out of range. Model/cache has {n_heads} heads.")
 
+    labels = indexed_tokens(tokens)
     mat = pattern[0, int(head)]
     rows = []
     for dest in range(mat.shape[0]):
@@ -24,8 +29,8 @@ def attention_pattern_table(cache: Any, layer: int, head: int, tokens: list[str]
             rows.append({
                 "dest_index": dest,
                 "src_index": src,
-                "dest_token": tokens[dest] if dest < len(tokens) else str(dest),
-                "src_token": tokens[src] if src < len(tokens) else str(src),
+                "dest_token": labels[dest] if dest < len(labels) else str(dest),
+                "src_token": labels[src] if src < len(labels) else str(src),
                 "attention": float(mat[dest, src].item()),
             })
     return pd.DataFrame(rows)
