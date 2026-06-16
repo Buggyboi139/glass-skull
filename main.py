@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
 import streamlit as st
 
+from glass_skull import ui_theme as ui
 from glass_skull.anatomy import config_table, expected_block_table, global_hook_table, hook_table, parameter_table
 from glass_skull.attention_view import attention_pattern_table, top_attention_links
 from glass_skull.comparison import compare_normal_vs_steered
@@ -29,14 +32,18 @@ from glass_skull.visuals import (
     fuzz_prompt_layer_fig,
     logit_lens_probability_fig,
     logit_lens_token_heatmap,
+    mean_norm_by_layer_fig,
+    next_token_bar_fig,
+    norm_growth_fig,
+    parameter_shape_scatter_fig,
+    parameters_by_component_fig,
+    parameters_per_layer_fig,
 )
 
 
-st.set_page_config(page_title="Operation Glass Skull", layout="wide")
+st.set_page_config(page_title="Operation Glass Skull", layout="wide", initial_sidebar_state="expanded")
 ensure_dirs()
-
-st.title("Operation Glass Skull v0.7")
-st.caption("Chat, trace, lens, compare, and fuzz transformer behavior without pretending tensors are magic crystals.")
+ui.inject_theme()
 
 HELP = {
     "preset": "Pick the local TransformerLens model used for tracing, feature mapping, and optional steering.",
@@ -109,23 +116,15 @@ def parse_layer_list(raw: str, max_layer: int) -> list[int]:
     return sorted(layers)
 
 
-def render_status(label: str, status) -> None:
-    if status is None:
-        st.caption(f"{label}: unchecked")
-        return
-    if status.online:
-        glass = "yes" if status.glass_available else "no"
-        model_text = ", ".join(status.models) if status.models else "unknown"
-        latency = f"{status.latency_ms:.0f} ms" if status.latency_ms is not None else "unknown latency"
-        st.success(f"{label}: online, {latency}, glass: {glass}")
-        st.caption(f"Model: {model_text}")
-    else:
-        st.error(f"{label}: offline")
-        st.caption(status.error or "no details")
-
-
 def plot_if_present(fig) -> None:
     if fig is not None:
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color=ui.TEXT, family="Inter, sans-serif"),
+            title_font=dict(color=ui.TEXT, size=15),
+        )
         st.plotly_chart(fig, use_container_width=True)
 
 
@@ -147,102 +146,259 @@ def feature_names_from_rows(rows: list[dict]) -> list[str]:
 
 init_state()
 
+# ===========================================================================
+# SIDEBAR — collapsible control panel: Model / Servers / Session
+# ===========================================================================
 with st.sidebar:
-    st.header("Trace model")
-    preset_options = ["custom"] + MODEL_PRESETS
-    preset_index = preset_options.index(st.session_state.model_name) if st.session_state.model_name in preset_options else 0
-    preset = st.selectbox("Preset", preset_options, index=preset_index, help=HELP["preset"])
-    if preset != "custom":
-        model_name = preset
-    else:
-        model_name = st.text_input("TransformerLens model", value=st.session_state.model_name, help="Use a TransformerLens-supported model name.")
-    model_name = normalize_model_name(model_name)
+    st.markdown(
+        '<div class="gs-sidebar-head">'
+        '<div class="gs-sidebar-mark"><span style="font-weight:800;font-size:14px;color:#04121c;">GS</span></div>'
+        '<div><div class="gs-sidebar-name">Glass Skull</div>'
+        '<div class="gs-sidebar-ver">control deck · v0.7</div></div></div>',
+        unsafe_allow_html=True,
+    )
 
-    device_choice = st.selectbox("Device", ["auto", "cpu", "cuda"], index=0, help=HELP["device"])
-    if st.button("Load trace model", type="primary", help="Reloads the selected TransformerLens model and clears the current trace."):
-        st.session_state.model_name = model_name
-        st.session_state.trace = None
-        st.session_state.last_output = ""
-        st.session_state.last_comparison = None
-        load_hooked_model.clear()
+    with st.expander("Model", expanded=True):
+        preset_options = ["custom"] + MODEL_PRESETS
+        preset_index = preset_options.index(st.session_state.model_name) if st.session_state.model_name in preset_options else 0
+        preset = st.selectbox("Preset", preset_options, index=preset_index, help=HELP["preset"])
+        if preset != "custom":
+            model_name = preset
+        else:
+            model_name = st.text_input("TransformerLens model", value=st.session_state.model_name, help="Use a TransformerLens-supported model name.")
+        model_name = normalize_model_name(model_name)
+
+        device_choice = st.selectbox("Device", ["auto", "cpu", "cuda"], index=0, help=HELP["device"])
+        load_clicked = st.button(
+            "Load trace model",
+            type="primary",
+            use_container_width=True,
+            help="Reloads the selected TransformerLens model and clears the current trace.",
+        )
+        if load_clicked:
+            st.session_state.model_name = model_name
+            st.session_state.trace = None
+            st.session_state.last_output = ""
+            st.session_state.last_comparison = None
+            load_hooked_model.clear()
 
 model = load_hooked_model(model_name, device_choice=device_choice)
 summary = model_summary(model)
 expected_dim = int(summary["d_model"])
 
 with st.sidebar:
-    st.subheader("Loaded trace model")
-    st.write(f"Model: `{summary['model_name']}`")
-    st.write(f"Device: `{summary['device']}`")
-    st.write(f"Layers: `{summary['layers']}`")
-    st.write(f"d_model: `{summary['d_model']}`")
-    st.write(f"Params: `{summary['parameters']:,}`")
+    ui.sec_label("Loaded trace model")
+    ui.property_list(
+        [
+            ("model", str(summary["model_name"])),
+            ("device", str(summary["device"])),
+            ("layers", str(summary["layers"])),
+            ("d_model", str(summary["d_model"])),
+            ("params", f"{summary['parameters']:,}"),
+        ]
+    )
 
-    st.divider()
-    st.header("llama.cpp")
-    st.session_state.llama_url = st.text_input("Normal server URL", value=st.session_state.llama_url, help=HELP["llama_url"])
-    st.session_state.llama_glass_url = st.text_input("Glass server URL", value=st.session_state.llama_glass_url, help="Future patched llama.cpp lab server. Use a nonstandard port like 8088.")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Check normal", help="Checks /v1/models and optional /glass-skull/info."):
-            st.session_state.llama_status = check_server(st.session_state.llama_url)
-    with c2:
-        if st.button("Check glass", help="Checks the lab llama.cpp server on its separate port."):
-            st.session_state.llama_glass_status = check_server(st.session_state.llama_glass_url)
-    render_status("Normal", st.session_state.llama_status)
-    render_status("Glass", st.session_state.llama_glass_status)
+    with st.expander("Servers", expanded=True):
+        st.session_state.llama_url = st.text_input("Normal server URL", value=st.session_state.llama_url, help=HELP["llama_url"])
+        st.session_state.llama_glass_url = st.text_input("Glass server URL", value=st.session_state.llama_glass_url, help="Future patched llama.cpp lab server. Use a nonstandard port like 8088.")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Check normal", use_container_width=True, help="Checks /v1/models and optional /glass-skull/info."):
+                st.session_state.llama_status = check_server(st.session_state.llama_url)
+        with c2:
+            if st.button("Check glass", use_container_width=True, help="Checks the lab llama.cpp server on its separate port."):
+                st.session_state.llama_glass_status = check_server(st.session_state.llama_glass_url)
 
-    st.divider()
-    if st.button("Clear chat", help="Clears only visible chat history. Logs stay saved."):
-        st.session_state.chat_messages = []
-        st.session_state.last_output = ""
-    if st.button("Clear trace", help="Clears the currently cached activations."):
-        st.session_state.trace = None
-    if st.button("Clear comparison", help="Clears the last normal-vs-steered comparison."):
-        st.session_state.last_comparison = None
+        st.markdown(
+            ui.server_health_inline("Normal", st.session_state.llama_url, st.session_state.llama_status)
+            + ui.server_health_inline("Glass", st.session_state.llama_glass_url, st.session_state.llama_glass_status),
+            unsafe_allow_html=True,
+        )
+        normal_status = st.session_state.llama_status
+        if normal_status is not None and normal_status.online:
+            glass = "yes" if normal_status.glass_available else "no"
+            models_text = ", ".join(normal_status.models) if normal_status.models else "unknown"
+            st.caption(f"Normal models: {models_text} · glass endpoint: {glass}")
+        elif normal_status is not None:
+            st.caption(f"Normal error: {normal_status.error or 'no details'}")
+        glass_status = st.session_state.llama_glass_status
+        if glass_status is not None and glass_status.online:
+            glass = "yes" if glass_status.glass_available else "no"
+            models_text = ", ".join(glass_status.models) if glass_status.models else "unknown"
+            st.caption(f"Glass models: {models_text} · glass endpoint: {glass}")
+        elif glass_status is not None:
+            st.caption(f"Glass error: {glass_status.error or 'no details'}")
+
+    with st.expander("Session", expanded=False):
+        if st.button("Clear chat", use_container_width=True, help="Clears only visible chat history. Logs stay saved."):
+            st.session_state.chat_messages = []
+            st.session_state.last_output = ""
+        if st.button("Clear trace", use_container_width=True, help="Clears the currently cached activations."):
+            st.session_state.trace = None
+        if st.button("Clear comparison", use_container_width=True, help="Clears the last normal-vs-steered comparison."):
+            st.session_state.last_comparison = None
 
 all_features = list_features(include_missing=False)
 compatible_feature_rows = compatible_features(expected_dim)
 all_feature_names = feature_names_from_rows(all_features)
 compatible_feature_names = feature_names_from_rows(compatible_feature_rows)
+params_df = parameter_table(model)
 
-chat_col, trace_col, poke_col, anatomy_col = st.columns([1, 1, 1, 1], gap="large")
+# ===========================================================================
+# TOP HUD — prominent system state at a glance
+# ===========================================================================
+trace_active = st.session_state.trace is not None
+pills = [
+    ui.pill(f"Model: {summary['model_name']}", ui.GREEN),
+    ui.pill("Tracing active" if trace_active else "Trace idle", ui.AMBER if trace_active else ui.SLATE, pulse=trace_active),
+    ui.pill("Normal server", ui.server_status_color(st.session_state.llama_status)),
+    ui.pill("Glass server", ui.server_status_color(st.session_state.llama_glass_status)),
+]
+ui.hud(
+    title="Operation Glass Skull",
+    subtitle="Probe, trace, and compare transformer behavior — no magic crystals.",
+    stats=[
+        ("Layers", str(summary["layers"])),
+        ("d_model", str(summary["d_model"])),
+        ("Heads", str(summary["heads"])),
+        ("Params", f"{summary['parameters'] / 1e6:.0f}M"),
+        ("Device", str(summary["device"])),
+    ],
+    pills_html="".join(pills),
+)
 
-with chat_col:
-    st.subheader("Chat")
-    chat_backend = st.selectbox(
-        "Chat backend",
-        ["TransformerLens", "llama.cpp normal", "llama.cpp glass"],
-        help=HELP["backend"],
+# ===========================================================================
+# MAIN PANELS
+# ===========================================================================
+tab_dash, tab_chat, tab_trace, tab_poke, tab_anatomy = st.tabs(
+    ["Dashboard", "Chat", "Trace / Lens", "Poke / Compare / Fuzz", "Anatomy / Logs"]
+)
+
+# ------------------------------------------------------------- Dashboard ----
+with tab_dash:
+    ui.section_header("Model architecture", "Structure and parameter distribution read directly from the loaded model.")
+    ui.render_network(summary)
+
+    ui.property_list(
+        [
+            ("model_name", str(summary["model_name"])),
+            ("device", str(summary["device"])),
+            ("dtype", str(summary.get("dtype", ""))),
+            ("n_layers", str(summary["layers"])),
+            ("d_model", str(summary["d_model"])),
+            ("n_heads", str(summary["heads"])),
+            ("d_head", str(summary["d_head"])),
+            ("d_mlp", str(summary["d_mlp"])),
+            ("vocab_size", f"{int(summary['vocab_size']):,}"),
+            ("total_parameters", f"{int(summary['parameters']):,}"),
+        ]
     )
-    st.markdown(f"**Active chat model:** `{active_chat_model_label(chat_backend, summary)}`")
-    st.caption(f"Trace model: `{summary['model_name']}` with d_model `{expected_dim}`")
 
-    max_new_tokens = st.slider("Max new tokens", 10, 300, 80, 10, help=HELP["max_new_tokens"], key="chat_max_new")
-    temperature = st.slider("Temperature", 0.01, 1.5, 0.8, 0.05, help=HELP["temperature"], key="chat_temp")
-    auto_trace = st.toggle("Trace every message", value=True, help="When enabled, every message also captures activations with the trace model.")
-    use_steering = st.toggle("Use steering", value=False, help="Only applies when the chat backend is TransformerLens. Stock llama.cpp cannot be activation-steered yet.")
+    g1, g2 = st.columns(2)
+    with g1:
+        plot_if_present(parameters_per_layer_fig(params_df))
+    with g2:
+        plot_if_present(parameters_by_component_fig(params_df))
+    plot_if_present(parameter_shape_scatter_fig(params_df))
+
+    st.markdown("---")
+    ui.section_header("Live activations", "Derived from the most recent traced prompt. Scroll for the full picture.")
+    trace = st.session_state.trace
+    if trace is None:
+        ui.empty_state("No trace captured yet", "Send a message in the Chat tab with tracing enabled to populate these graphs.")
+    else:
+        st.code(trace.prompt)
+        ui.timeline([f"{i}·{tok}" for i, tok in enumerate(trace.tokens)], current=len(trace.tokens) - 1)
+
+        d1, d2 = st.columns(2)
+        with d1:
+            plot_if_present(mean_norm_by_layer_fig(trace.layer_norms))
+        with d2:
+            plot_if_present(norm_growth_fig(trace.layer_norms))
+
+        plot_if_present(activation_pulse(trace.layer_norms))
+        plot_if_present(activation_heatmap(trace.layer_norms))
+
+        last_token = max(len(trace.tokens) - 1, 0)
+        try:
+            lens_df = logit_lens_table(model, trace.cache, token_index=last_token, stream="resid_post", top_k=5)
+            plot_if_present(logit_lens_probability_fig(lens_df))
+        except Exception as exc:
+            st.caption(f"Logit lens unavailable: {exc}")
+
+        try:
+            plot_if_present(next_token_bar_fig(next_token_table(model, trace.logits, top_k=15)))
+        except Exception as exc:
+            st.caption(f"Next-token graph unavailable: {exc}")
+
+        try:
+            attn_df = attention_pattern_table(trace.cache, 0, 0, trace.tokens)
+            plot_if_present(attention_heatmap(attn_df))
+            st.caption("Attention shown for layer 0, head 0. Use the Trace / Lens tab to explore other heads.")
+        except Exception as exc:
+            st.caption(f"Attention graph unavailable: {exc}")
+
+# ------------------------------------------------------------------ Chat ----
+with tab_chat:
+    ui.section_header("Chat", "Talk to the model and capture activations as you go.")
+
+    cfg1, cfg2, cfg3 = st.columns([2, 1, 1])
+    with cfg1:
+        chat_backend = st.selectbox(
+            "Chat backend",
+            ["TransformerLens", "llama.cpp normal", "llama.cpp glass"],
+            help=HELP["backend"],
+        )
+    with cfg2:
+        max_new_tokens = st.slider("Max new tokens", 10, 300, 80, 10, help=HELP["max_new_tokens"], key="chat_max_new")
+    with cfg3:
+        temperature = st.slider("Temperature", 0.01, 1.5, 0.8, 0.05, help=HELP["temperature"], key="chat_temp")
+
+    tog1, tog2 = st.columns(2)
+    with tog1:
+        auto_trace = st.toggle("Trace every message", value=True, help="When enabled, every message also captures activations with the trace model.")
+    with tog2:
+        use_steering = st.toggle("Use steering", value=False, help="Only applies when the chat backend is TransformerLens. Stock llama.cpp cannot be activation-steered yet.")
+
+    # Persistent HUD line above the conversation
+    config_badges = "".join(
+        [
+            ui.badge(active_chat_model_label(chat_backend, summary), ui.ACCENT),
+            ui.badge(f"temp {temperature:.2f}", ui.TEAL),
+            ui.badge(f"{max_new_tokens} tokens", ui.TEAL),
+            ui.badge("tracing", ui.AMBER, active=auto_trace),
+            ui.badge("steering", ui.PURPLE, active=use_steering),
+        ]
+    )
+    st.markdown(
+        f'<div class="gs-card" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">{config_badges}</div>',
+        unsafe_allow_html=True,
+    )
 
     if use_steering and chat_backend != "TransformerLens":
         st.warning("Steering only applies to TransformerLens chat right now. llama.cpp steering waits for the future C++ cave expedition.")
     if use_steering and not compatible_feature_names:
         st.warning(f"No compatible features for d_model {expected_dim}. Rebuild a feature with the currently loaded trace model.")
 
-    chat_box = st.container(height=420, border=True)
+    chat_box = st.container(height=430, border=True)
     with chat_box:
-        st.markdown(f"**Talking to:** `{active_chat_model_label(chat_backend, summary)}`")
         if not st.session_state.chat_messages:
-            st.info("Send a message to start. The model title is up here now, so we can stop playing backend roulette.")
+            ui.empty_state("No messages yet", "Send a prompt below to start the conversation and tracing.")
         for msg in st.session_state.chat_messages[-12:]:
             with st.chat_message(msg["role"]):
                 st.write(msg["content"])
+                ts = msg.get("ts")
+                if ts:
+                    st.caption(ts)
 
-    prompt = st.text_area("Message", value="The cat sat on the", height=110, help="The text sent to the selected chat backend.", key="chat_prompt")
-    send = st.button("Send", type="primary", use_container_width=True, help="Generate a reply and optionally trace the prompt.")
+    with st.form("chat_form", clear_on_submit=False, border=False):
+        prompt = st.text_area("Message", value="The cat sat on the", height=110, help="The text sent to the selected chat backend. Press Ctrl+Enter to send.", key="chat_prompt")
+        send = st.form_submit_button("Send message", type="primary", use_container_width=True)
 
     if send and prompt.strip():
         prompt = prompt.strip()
-        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        now = datetime.now().strftime("%H:%M:%S")
+        st.session_state.chat_messages.append({"role": "user", "content": prompt, "ts": now})
 
         if auto_trace:
             with st.spinner("Tracing prompt locally..."):
@@ -277,16 +433,18 @@ with chat_col:
                 output = f"Generation error: {error}"
 
         st.session_state.last_output = output
-        st.session_state.chat_messages.append({"role": "assistant", "content": output})
+        st.session_state.chat_messages.append({"role": "assistant", "content": output, "ts": datetime.now().strftime("%H:%M:%S")})
         log_run(model_name=model_name, mode="chat_generate", prompt=prompt, output=output, metadata={"backend": chat_backend, "used_steering": bool(use_steering), "error": error})
         st.rerun()
 
-with trace_col:
-    st.subheader("Trace / Lens")
+# ----------------------------------------------------------- Trace / Lens ----
+with tab_trace:
+    ui.section_header("Trace / Lens", "Visualize model internals captured from the latest traced prompt.")
     trace = st.session_state.trace
     if trace is None:
-        st.info("No trace yet. Send a chat message with tracing enabled.")
+        ui.empty_state("No trace active", "Start a chat with tracing enabled to begin tracing.")
     else:
+        ui.timeline([f"{i}·{tok}" for i, tok in enumerate(trace.tokens)], current=len(trace.tokens) - 1)
         st.code(" | ".join([f"{i}:{tok}" for i, tok in enumerate(trace.tokens)]))
         trace_mode = st.radio("View", ["Pulse", "Heatmap", "Logit Lens", "Attention"], horizontal=True)
 
@@ -295,7 +453,7 @@ with trace_col:
         elif trace_mode == "Heatmap":
             plot_if_present(activation_heatmap(trace.layer_norms))
         elif trace_mode == "Logit Lens":
-            st.caption(HELP["lens"])
+            ui.purpose(HELP["lens"])
             lens_stream = st.selectbox("Lens stream", ["resid_pre", "resid_mid", "resid_post"], index=2, key="lens_stream")
             lens_token = st.number_input("Lens token", 0, max(len(trace.tokens) - 1, 0), max(len(trace.tokens) - 1, 0), key="lens_token")
             lens_k = st.slider("Top predictions", 1, 20, 5, 1, key="lens_k")
@@ -310,7 +468,7 @@ with trace_col:
             except Exception as exc:
                 st.error(str(exc))
         elif trace_mode == "Attention":
-            st.caption(HELP["attention"])
+            ui.purpose(HELP["attention"])
             attn_layer = st.number_input("Attention layer", 0, summary["layers"] - 1, 0, key="attn_layer")
             attn_head = st.number_input("Head", 0, max(summary["heads"] - 1, 0), 0, key="attn_head")
             try:
@@ -320,14 +478,20 @@ with trace_col:
             except Exception as exc:
                 st.error(str(exc))
 
-        st.markdown("**Inspect a point**")
-        layer = st.number_input("Layer", 0, summary["layers"] - 1, 0, help=HELP["layer"], key="trace_layer")
-        stream = st.selectbox("Stream", ["resid_pre", "attn_out", "mlp_out", "resid_post"], index=3, help=HELP["stream"], key="trace_stream")
-        token_index = st.number_input("Token", 0, max(len(trace.tokens) - 1, 0), max(len(trace.tokens) - 1, 0), help=HELP["token"], key="trace_token")
-        top_k = st.slider("Top dims", 5, 100, 30, 5, help=HELP["top_dims"], key="trace_top_dims")
+        st.markdown("---")
+        ui.section_header("Inspect a point", "Drill into a specific layer, stream, and token.")
+        ip1, ip2, ip3, ip4 = st.columns(4)
+        with ip1:
+            layer = st.number_input("Layer", 0, summary["layers"] - 1, 0, help=HELP["layer"], key="trace_layer")
+        with ip2:
+            stream = st.selectbox("Stream", ["resid_pre", "attn_out", "mlp_out", "resid_post"], index=3, help=HELP["stream"], key="trace_stream")
+        with ip3:
+            token_index = st.number_input("Token", 0, max(len(trace.tokens) - 1, 0), max(len(trace.tokens) - 1, 0), help=HELP["token"], key="trace_token")
+        with ip4:
+            top_k = st.slider("Top dims", 5, 100, 30, 5, help=HELP["top_dims"], key="trace_top_dims")
         try:
             dims = top_active_dimensions(trace.cache, int(layer), stream, int(token_index), top_k=top_k)
-            st.dataframe(dims, use_container_width=True, height=180)
+            st.dataframe(dims, use_container_width=True, height=200)
             if st.button("Log dims", help="Save the displayed activation dimensions to SQLite."):
                 run_id = st.session_state.get("last_run_id") or log_run(model_name, "trace_dims", trace.prompt)
                 rows = dims.assign(layer=int(layer), stream=stream, token_index=int(token_index), token=trace.tokens[int(token_index)]).to_dict("records")
@@ -339,11 +503,15 @@ with trace_col:
         with st.expander("Final next-token probabilities", expanded=False):
             st.dataframe(next_token_table(model, trace.logits, top_k=20), use_container_width=True)
 
-with poke_col:
-    st.subheader("Poke / Compare / Fuzz")
-    tab_steer, tab_map, tab_compare, tab_edges, tab_fuzz = st.tabs(["Steer", "Map", "Compare", "Edges", "Fuzz"])
+# ------------------------------------------------ Poke / Compare / Fuzz ----
+with tab_poke:
+    ui.section_header("Poke / Compare / Fuzz", "Probe and stress-test model behavior.")
+    tab_steer, tab_map, tab_compare, tab_edges, tab_fuzz = st.tabs(
+        ["Steer", "Map", "Compare", "Edges", "Fuzz"]
+    )
 
     with tab_steer:
+        ui.purpose("Apply a saved activation direction to TransformerLens replies. Pick a feature, layer, stream, and strength.")
         if all_feature_names and not compatible_feature_names:
             st.warning(f"Saved features exist, but none match current d_model {expected_dim}. Rebuild one with this trace model.")
             st.dataframe(pd.DataFrame(all_features), use_container_width=True, height=160)
@@ -355,20 +523,28 @@ with poke_col:
             default_layer = int(meta.get("layer", 0))
             default_stream = meta.get("stream", "resid_post")
             stream_options = ["resid_pre", "attn_out", "mlp_out", "resid_post"]
-            st.session_state.poke_layer = st.number_input("Layer", 0, summary["layers"] - 1, min(default_layer, summary["layers"] - 1), help=HELP["layer"], key="poke_layer_widget")
-            st.session_state.poke_stream = st.selectbox("Stream", stream_options, index=stream_options.index(default_stream) if default_stream in stream_options else 3, help=HELP["stream"], key="poke_stream_widget")
-            st.session_state.poke_strength = st.slider("Strength", -5.0, 5.0, 1.5, 0.25, help=HELP["strength"], key="poke_strength_widget")
+            sc1, sc2, sc3 = st.columns(3)
+            with sc1:
+                st.session_state.poke_layer = st.number_input("Layer", 0, summary["layers"] - 1, min(default_layer, summary["layers"] - 1), help=HELP["layer"], key="poke_layer_widget")
+            with sc2:
+                st.session_state.poke_stream = st.selectbox("Stream", stream_options, index=stream_options.index(default_stream) if default_stream in stream_options else 3, help=HELP["stream"], key="poke_stream_widget")
+            with sc3:
+                st.session_state.poke_strength = st.slider("Strength", -5.0, 5.0, 1.5, 0.25, help=HELP["strength"], key="poke_strength_widget")
             st.caption(f"Feature vector dim: `{meta.get('vector_dim')}` | model d_model: `{expected_dim}`")
             st.dataframe(pd.DataFrame(vector_summary(vector, top_k=25)), use_container_width=True, height=240)
-            st.caption("Turn on 'Use steering' in Chat to apply this feature to TransformerLens replies.")
+            st.info("Turn on 'Use steering' in Chat to apply this feature to TransformerLens replies.")
 
     with tab_map:
+        ui.purpose("Build a feature: average positive examples, subtract negative examples, and save the resulting direction.")
         positive_text = st.text_area("Positive examples", value="Oh great, another meeting.\nFantastic, the server broke again.\nWonderful, I get to debug this all night.", height=110, help=HELP["positive"], key="map_positive")
         negative_text = st.text_area("Negative examples", value="The meeting started.\nThe server stopped responding.\nI need to debug this program.", height=110, help=HELP["negative"], key="map_negative")
-        map_layer = st.number_input("Map layer", 0, summary["layers"] - 1, min(3, summary["layers"] - 1), help=HELP["layer"], key="map_layer")
-        map_stream = st.selectbox("Map stream", ["resid_pre", "attn_out", "mlp_out", "resid_post"], index=3, help=HELP["stream"], key="map_stream")
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            map_layer = st.number_input("Map layer", 0, summary["layers"] - 1, min(3, summary["layers"] - 1), help=HELP["layer"], key="map_layer")
+        with mc2:
+            map_stream = st.selectbox("Map stream", ["resid_pre", "attn_out", "mlp_out", "resid_post"], index=3, help=HELP["stream"], key="map_stream")
         feature_name = st.text_input("Feature name", value="sarcasm-ish", help="Name for the saved activation direction.")
-        if st.button("Build feature", use_container_width=True, help="Average positive examples, subtract negative examples, and save the result."):
+        if st.button("Build feature", type="primary", use_container_width=True, help="Average positive examples, subtract negative examples, and save the result."):
             positive = [p.strip() for p in positive_text.splitlines() if p.strip()]
             negative = [p.strip() for p in negative_text.splitlines() if p.strip()]
             try:
@@ -382,16 +558,20 @@ with poke_col:
                 st.error(str(exc))
 
     with tab_compare:
-        st.caption(HELP["compare"])
+        ui.purpose(HELP["compare"])
         if not compatible_feature_names:
             st.info("Build a compatible feature before comparing normal vs steered runs.")
         else:
             cmp_feature = st.selectbox("Compare feature", compatible_feature_names, key="cmp_feature")
             cmp_prompt = st.text_area("Compare prompt", value=st.session_state.get("chat_prompt", "Explain what a mammal is."), height=90, key="cmp_prompt")
             vector, meta = load_feature(cmp_feature)
-            cmp_layer = st.number_input("Compare layer", 0, summary["layers"] - 1, min(int(meta.get("layer", 0)), summary["layers"] - 1), key="cmp_layer")
-            cmp_stream = st.selectbox("Compare stream", ["resid_pre", "attn_out", "mlp_out", "resid_post"], index=3, key="cmp_stream")
-            cmp_strength = st.slider("Compare strength", -5.0, 5.0, 1.5, 0.25, key="cmp_strength")
+            cc1, cc2, cc3 = st.columns(3)
+            with cc1:
+                cmp_layer = st.number_input("Compare layer", 0, summary["layers"] - 1, min(int(meta.get("layer", 0)), summary["layers"] - 1), key="cmp_layer")
+            with cc2:
+                cmp_stream = st.selectbox("Compare stream", ["resid_pre", "attn_out", "mlp_out", "resid_post"], index=3, key="cmp_stream")
+            with cc3:
+                cmp_strength = st.slider("Compare strength", -5.0, 5.0, 1.5, 0.25, key="cmp_strength")
             if st.button("Run comparison", type="primary", use_container_width=True):
                 try:
                     with st.spinner("Running normal vs steered comparison..."):
@@ -411,23 +591,29 @@ with poke_col:
             if cmp_result:
                 left, right = st.columns(2)
                 with left:
-                    st.markdown("**Normal**")
+                    st.markdown(ui.badge("NORMAL", ui.SLATE), unsafe_allow_html=True)
                     st.write(cmp_result.normal_output)
                 with right:
-                    st.markdown("**Steered**")
+                    st.markdown(ui.badge("STEERED", ui.PURPLE), unsafe_allow_html=True)
                     st.write(cmp_result.steered_output)
                 plot_if_present(comparison_delta_heatmap(cmp_result.norm_diff))
                 st.dataframe(cmp_result.norm_diff.sort_values("abs_delta", ascending=False).head(50), use_container_width=True, height=220)
 
     with tab_edges:
+        ui.purpose(HELP["edges"])
         trace = st.session_state.trace
         if trace is None:
-            st.info("Trace a message first, then active edges can be computed from that trace.")
+            ui.empty_state("No trace to walk", "Trace a message first, then active edges can be computed from that trace.")
         else:
-            edge_layer = st.number_input("Edge layer", 0, summary["layers"] - 1, 0, help=HELP["layer"], key="edge_layer")
-            module = st.selectbox("Matrix", ["mlp.W_in", "mlp.W_out"], help=HELP["edges"], key="edge_module")
-            edge_token = st.number_input("Edge token", 0, max(len(trace.tokens) - 1, 0), max(len(trace.tokens) - 1, 0), help=HELP["token"], key="edge_token")
-            edge_k = st.slider("Top edges", 5, 200, 50, 5, help="How many strongest contribution paths to show.", key="edge_k")
+            ec1, ec2, ec3, ec4 = st.columns(4)
+            with ec1:
+                edge_layer = st.number_input("Edge layer", 0, summary["layers"] - 1, 0, help=HELP["layer"], key="edge_layer")
+            with ec2:
+                module = st.selectbox("Matrix", ["mlp.W_in", "mlp.W_out"], help=HELP["edges"], key="edge_module")
+            with ec3:
+                edge_token = st.number_input("Edge token", 0, max(len(trace.tokens) - 1, 0), max(len(trace.tokens) - 1, 0), help=HELP["token"], key="edge_token")
+            with ec4:
+                edge_k = st.slider("Top edges", 5, 200, 50, 5, help="How many strongest contribution paths to show.", key="edge_k")
             try:
                 edges = top_contribution_edges(model, trace.cache, int(edge_layer), module, int(edge_token), top_k=edge_k)
                 plot_if_present(edge_constellation(edges))
@@ -440,15 +626,24 @@ with poke_col:
                 st.error(str(exc))
 
     with tab_fuzz:
-        st.caption(HELP["fuzz"])
-        fuzz_name = st.text_input("Experiment name", value="glass_probe", help="Used to name the saved folder under data/experiments.")
+        ui.purpose(HELP["fuzz"])
+        fz1, fz2 = st.columns(2)
+        with fz1:
+            fuzz_name = st.text_input("Experiment name", value="glass_probe", help="Used to name the saved folder under data/experiments.")
+        with fz2:
+            fuzz_backend = st.selectbox("Fuzz chat backend", ["TransformerLens", "llama.cpp normal", "llama.cpp glass"], help="Where generated outputs come from.")
         uploaded = st.file_uploader("Prompt file", type=["txt", "jsonl", "csv"], help="TXT: one prompt per line. JSONL/CSV: use prompt and optional label fields.")
-        fuzz_backend = st.selectbox("Fuzz chat backend", ["TransformerLens", "llama.cpp normal", "llama.cpp glass"], help="Where generated outputs come from.")
         trace_fuzz = st.toggle("Trace fuzz prompts", value=True, help="Captures activation summaries with the TransformerLens trace model for each prompt.")
-        layer_raw = st.text_input("Layers", value="all", help="Use 'all', comma lists like 0,4,8, or ranges like 0-8.")
-        streams = st.multiselect("Streams", ["resid_pre", "attn_out", "mlp_out", "resid_post"], default=["resid_post"], help="Which activation streams to aggregate.")
-        fuzz_top_k = st.slider("Top dims per point", 5, 100, 32, 1, help="How many active dimensions to store per selected layer/stream.")
-        fuzz_limit = st.slider("Prompt limit", 1, 1000, 200, 1, help="Caps the number of prompts from the file for this run.")
+        fzc1, fzc2 = st.columns(2)
+        with fzc1:
+            layer_raw = st.text_input("Layers", value="all", help="Use 'all', comma lists like 0,4,8, or ranges like 0-8.")
+        with fzc2:
+            streams = st.multiselect("Streams", ["resid_pre", "attn_out", "mlp_out", "resid_post"], default=["resid_post"], help="Which activation streams to aggregate.")
+        fzc3, fzc4 = st.columns(2)
+        with fzc3:
+            fuzz_top_k = st.slider("Top dims per point", 5, 100, 32, 1, help="How many active dimensions to store per selected layer/stream.")
+        with fzc4:
+            fuzz_limit = st.slider("Prompt limit", 1, 1000, 200, 1, help="Caps the number of prompts from the file for this run.")
 
         if uploaded is not None:
             try:
@@ -531,30 +726,64 @@ with poke_col:
                             except Exception as exc:
                                 st.error(str(exc))
 
-with anatomy_col:
-    st.subheader("Anatomy / Logs")
-    panel = st.radio("Panel", ["Anatomy", "Hooks", "Parameters", "Experiments", "Features", "Logs"], horizontal=True, help="Switch this quarter of the screen between model structure and saved run history.")
+# ----------------------------------------------------- Anatomy / Logs ----
+with tab_anatomy:
+    ui.section_header("Anatomy / Logs", "Inspect model architecture and saved run history.")
+    panel = st.radio(
+        "Panel",
+        ["Anatomy", "Hooks", "Parameters", "Experiments", "Features", "Logs"],
+        horizontal=True,
+        help="Switch between model structure and saved run history.",
+    )
 
     if panel == "Anatomy":
-        st.markdown("**Config**")
-        st.dataframe(config_table(model), use_container_width=True, height=230)
-        st.markdown("**Block components**")
-        st.dataframe(expected_block_table(model), use_container_width=True, height=330)
+        cfg_df = config_table(model)
+        ui.sec_label("Configuration")
+        ui.property_list([(str(row["field"]), str(row["value"])) for _, row in cfg_df.iterrows()])
+        ui.sec_label("Block components")
+        block_df = expected_block_table(model)
+        st.dataframe(
+            block_df,
+            use_container_width=True,
+            height=420,
+            hide_index=True,
+            column_config={
+                "layer": st.column_config.NumberColumn("Layer", width="small"),
+                "component": st.column_config.TextColumn("Component", width="medium"),
+                "hook_point": st.column_config.TextColumn("Hook point", width="large"),
+                "present": st.column_config.CheckboxColumn("Present", width="small"),
+            },
+        )
     elif panel == "Hooks":
-        st.markdown("**Global hooks**")
-        st.dataframe(global_hook_table(model), use_container_width=True, height=180)
-        st.markdown("**All hook points**")
-        st.dataframe(hook_table(model), use_container_width=True, height=430)
+        ui.sec_label("Global hooks")
+        st.dataframe(global_hook_table(model), use_container_width=True, height=180, hide_index=True)
+        ui.sec_label("All hook points")
+        st.dataframe(hook_table(model), use_container_width=True, height=430, hide_index=True)
     elif panel == "Parameters":
-        params = parameter_table(model)
-        st.write(f"Tensor count: `{len(params)}`")
-        if not params.empty:
-            st.write(f"Total parameters: `{int(params['parameters'].sum()):,}`")
-        st.dataframe(params, use_container_width=True, height=560)
+        params = params_df
+        m1, m2 = st.columns(2)
+        with m1:
+            st.metric("Tensor count", f"{len(params)}")
+        with m2:
+            if not params.empty:
+                st.metric("Total parameters", f"{int(params['parameters'].sum()):,}")
+        st.dataframe(params, use_container_width=True, height=520, hide_index=True)
     elif panel == "Experiments":
-        st.dataframe(pd.DataFrame(list_experiments()), use_container_width=True, height=590)
+        st.dataframe(pd.DataFrame(list_experiments()), use_container_width=True, height=590, hide_index=True)
     elif panel == "Features":
         st.caption(f"Compatible with current d_model {expected_dim}: {len(compatible_feature_names)} / {len(all_feature_names)}")
-        st.dataframe(pd.DataFrame(all_features), use_container_width=True, height=590)
+        st.dataframe(pd.DataFrame(all_features), use_container_width=True, height=590, hide_index=True)
     elif panel == "Logs":
-        st.dataframe(pd.DataFrame(recent_runs(limit=100)), use_container_width=True, height=590)
+        runs = recent_runs(limit=100)
+        log_lines = []
+        for r in runs:
+            ts = str(r.get("created_at", ""))
+            ts_short = ts[11:19] if len(ts) >= 19 else ts
+            tag = f"[{r.get('mode', '?')}]"
+            prompt_text = (r.get("prompt") or "").replace("\n", " ")
+            out_text = (r.get("output") or "").replace("\n", " ")
+            msg = f"{r.get('model_name', '?')} · {prompt_text[:80]}"
+            if out_text:
+                msg += f"  ->  {out_text[:80]}"
+            log_lines.append((ts_short, tag, msg))
+        ui.terminal("glass_skull.runs — recent activity", log_lines)

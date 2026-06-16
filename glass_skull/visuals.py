@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -199,4 +201,155 @@ def dim_frequency_fig(df: pd.DataFrame, limit: int = 50):
         labels={"count": "times in top-k", "layer_dim": "layer:dimension"},
     )
     fig.update_layout(height=420, margin=dict(l=10, r=10, t=45, b=10), yaxis=dict(autorange="reversed"))
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Architecture graphs (derived directly from the loaded model parameters)
+# ---------------------------------------------------------------------------
+def _layer_of(name: str) -> int:
+    match = re.search(r"blocks\.(\d+)\.", name)
+    return int(match.group(1)) if match else -1
+
+
+def _component_of(name: str) -> str:
+    if "blocks." not in name:
+        if "embed" in name and "unembed" not in name:
+            return "embedding"
+        if "unembed" in name:
+            return "unembedding"
+        if "ln_final" in name or name.startswith("ln"):
+            return "final layer norm"
+        return "other"
+    if ".attn." in name:
+        return "attention"
+    if ".mlp." in name:
+        return "mlp"
+    if ".ln" in name:
+        return "layer norm"
+    return "other"
+
+
+def parameters_per_layer_fig(params: pd.DataFrame):
+    if params is None or params.empty or "name" not in params.columns:
+        return None
+    df = params.copy()
+    df["layer"] = df["name"].map(_layer_of)
+    block = df[df["layer"] >= 0].groupby("layer", as_index=False)["parameters"].sum()
+    if block.empty:
+        return None
+    fig = px.bar(
+        block,
+        x="layer",
+        y="parameters",
+        title="Parameters per transformer block",
+        labels={"layer": "block index", "parameters": "parameter count"},
+        color="parameters",
+        color_continuous_scale="Tealgrn",
+    )
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=45, b=10), coloraxis_showscale=False)
+    return fig
+
+
+def parameters_by_component_fig(params: pd.DataFrame):
+    if params is None or params.empty or "name" not in params.columns:
+        return None
+    df = params.copy()
+    df["component"] = df["name"].map(_component_of)
+    agg = df.groupby("component", as_index=False)["parameters"].sum().sort_values("parameters")
+    if agg.empty:
+        return None
+    fig = px.bar(
+        agg,
+        x="parameters",
+        y="component",
+        orientation="h",
+        title="Parameters by component type",
+        labels={"parameters": "parameter count", "component": ""},
+        color="parameters",
+        color_continuous_scale="Purpor",
+    )
+    fig.update_layout(height=300, margin=dict(l=10, r=10, t=45, b=10), coloraxis_showscale=False)
+    return fig
+
+
+def parameter_shape_scatter_fig(params: pd.DataFrame):
+    if params is None or params.empty or "name" not in params.columns:
+        return None
+    df = params.copy()
+    df["layer"] = df["name"].map(_layer_of)
+    df["component"] = df["name"].map(_component_of)
+    df = df[df["parameters"] > 0]
+    if df.empty:
+        return None
+    fig = px.scatter(
+        df,
+        x="layer",
+        y="parameters",
+        color="component",
+        size="parameters",
+        hover_data=["name", "shape", "dtype"],
+        title="Parameter tensors across depth",
+        labels={"layer": "block index (-1 = global)", "parameters": "parameter count"},
+    )
+    fig.update_layout(height=340, margin=dict(l=10, r=10, t=45, b=10))
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Trace-derived graphs
+# ---------------------------------------------------------------------------
+def mean_norm_by_layer_fig(layer_norms: pd.DataFrame):
+    if layer_norms is None or layer_norms.empty:
+        return None
+    df = layer_norms.groupby(["layer", "stream"], as_index=False)["norm"].mean()
+    fig = px.line(
+        df,
+        x="layer",
+        y="norm",
+        color="stream",
+        markers=True,
+        title="Mean activation norm by layer",
+        labels={"layer": "layer", "norm": "mean L2 norm"},
+    )
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=45, b=10))
+    return fig
+
+
+def norm_growth_fig(layer_norms: pd.DataFrame):
+    if layer_norms is None or layer_norms.empty:
+        return None
+    resid = layer_norms[layer_norms["stream"] == "resid_post"]
+    if resid.empty:
+        resid = layer_norms
+    df = resid.groupby("layer", as_index=False)["norm"].mean()
+    fig = px.area(
+        df,
+        x="layer",
+        y="norm",
+        title="Residual stream magnitude through depth",
+        labels={"layer": "layer", "norm": "mean resid_post norm"},
+    )
+    fig.update_traces(line_color="#38bdf8", fillcolor="rgba(56,189,248,0.18)")
+    fig.update_layout(height=300, margin=dict(l=10, r=10, t=45, b=10))
+    return fig
+
+
+def next_token_bar_fig(df: pd.DataFrame):
+    if df is None or df.empty or "token" not in df.columns or "probability" not in df.columns:
+        return None
+    top = df.sort_values("probability", ascending=True).copy()
+    top["label"] = top["token"].astype(str) + "  (#" + top["token_id"].astype(str) + ")"
+    fig = px.bar(
+        top,
+        x="probability",
+        y="label",
+        orientation="h",
+        hover_data=["token_id", "logit"],
+        title="Top next-token probabilities",
+        labels={"probability": "probability", "label": ""},
+        color="probability",
+        color_continuous_scale="Tealgrn",
+    )
+    fig.update_layout(height=380, margin=dict(l=10, r=10, t=45, b=10), coloraxis_showscale=False)
     return fig

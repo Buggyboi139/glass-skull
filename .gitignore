@@ -1,0 +1,17 @@
+
+# local env
+.venv/
+venv/
+env/
+
+# python junk
+__pycache__/
+*.py[cod]
+*$py.class
+
+# app/runtime data
+data/experiments/
+data/logs/
+data/features/
+.streamlit/
+.cache/
