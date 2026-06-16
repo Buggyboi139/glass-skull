@@ -1,39 +1,44 @@
 # Operation Glass Skull
 
-A local interpretability cockpit for chatting with llama.cpp or TransformerLens while inspecting, mapping, fuzzing, and steering transformer activations.
+A local interpretability cockpit for chatting with llama.cpp or TransformerLens while inspecting, mapping, fuzzing, comparing, and steering transformer activations.
 
-Version `v0.6` adds:
+Version `v0.7` adds:
 
-- llama.cpp backend support
-- normal llama.cpp server checks
-- future patched llama.cpp glass-server checks
-- chat routing through TransformerLens or llama.cpp
-- prompt-file fuzzing
-- batch trace aggregation
-- saved experiment folders
-- activation pulse visuals
-- active contribution constellation visuals
-- fuzz heatmaps across prompts, labels, layers, and recurring dimensions
+- active chat model title at the top of the chat panel
+- compatible-feature filtering by current `d_model`
+- Logit Lens views
+- attention-head token maps
+- normal-vs-steered comparison mode
+- fuzz label-separation ranking
+- feature creation from fuzz labels
+
+Still intentionally not included:
+
+- SAE / SAELens integration
+- live mid-generation steering sliders
+- patched llama.cpp activation hooks
+- community feature library
+- refusal-inversion workflow
 
 ## Layout
 
 The app uses a four-panel cockpit:
 
 - 1/4 screen: chat UI
-- 1/4 screen: live trace view
-- 1/4 screen: poke, map, edges, and fuzz controls
-- 1/4 screen: anatomy, hook points, parameters, experiments, and logs
+- 1/4 screen: trace, Logit Lens, and attention views
+- 1/4 screen: steer, map, compare, edges, and fuzz controls
+- 1/4 screen: anatomy, hook points, parameters, experiments, features, and logs
 
 ## Backend model
 
-There are now two separate ideas:
+There are two separate ideas:
 
 ```text
 Chat backend:
   Where generated replies come from.
 
 Trace model:
-  The TransformerLens model used for local activation tracing, feature mapping, and steering.
+  The TransformerLens model used for local activation tracing, feature mapping, comparison, and steering.
 ```
 
 Supported chat backends:
@@ -43,6 +48,8 @@ TransformerLens
 llama.cpp normal
 llama.cpp glass
 ```
+
+The chat panel now displays the active chat model/backend at the top so you can see exactly what you are talking to.
 
 The `llama.cpp glass` option is for a future patched llama.cpp lab server running on a nonstandard port such as `8088`.
 
@@ -77,6 +84,9 @@ Current GUI:
   accurate selected MLP contribution edges
   llama.cpp chat availability
   prompt fuzzing and aggregation
+  Logit Lens estimates
+  attention-head token maps
+  normal-vs-steered comparisons
 
 Not yet:
   complete animated rendering of every transformer operation
@@ -93,6 +103,7 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 python -m compileall .
+python smoke_check.py
 streamlit run main.py
 ```
 
@@ -109,6 +120,8 @@ pythia-160m-deduped
 pythia-410m-deduped
 pythia-1b-deduped
 ```
+
+Features are model-width-specific. A vector created with a `d_model=1024` model cannot steer a `d_model=512` model. The UI now filters compatible features by the currently loaded trace model.
 
 ## llama.cpp setup
 
@@ -181,31 +194,38 @@ Each run can produce:
 - `prompt_layer_heatmap.csv`
 - `label_layer_heatmap.csv`
 - `top_recurring_dimensions.csv`
+- `label_separation.csv`
+
+After a labeled fuzz run, Glass Skull ranks label separation by layer and stream. You can then save a feature vector directly from two labels.
 
 ## Cockpit workflow
 
 ### Chat
 
-Use the left panel to talk to the selected backend. Enable `Trace every message` to capture activations with the local trace model. Enable `Use steering` to apply the selected feature vector when the backend is TransformerLens.
+Use the left panel to talk to the selected backend. Enable `Trace every message` to capture activations with the local trace model. Enable `Use steering` to apply the selected compatible feature vector when the backend is TransformerLens.
 
-### Trace
+### Trace / Lens
 
 The trace panel shows:
 
 - prompt tokens
 - activation pulse visual
 - activation heatmap
+- Logit Lens top predictions by layer
+- Logit Lens layer/token confidence heatmap
+- attention-head token maps
 - selected layer/token activation dimensions
-- next-token probability table
+- final next-token probability table
 
-### Poke / Fuzz
+### Poke / Compare / Fuzz
 
-The poke panel has four tabs:
+The poke panel has five tabs:
 
-- `Steer`: load a saved feature and set strength
+- `Steer`: load a compatible saved feature and set strength
 - `Map`: build a new feature from positive and negative examples
+- `Compare`: run normal vs steered and show activation deltas
 - `Edges`: show selected active MLP contribution edges from the current trace
-- `Fuzz`: rapid-fire prompt files and generate heatmaps
+- `Fuzz`: rapid-fire prompt files, generate heatmaps, rank label separation, and save features from labels
 
 ### Anatomy / Logs
 
@@ -216,6 +236,7 @@ The right panel shows:
 - discovered hook points
 - parameter tensors
 - saved experiments
+- saved features
 - recent SQLite logs
 
 ## Directory layout
@@ -223,15 +244,19 @@ The right panel shows:
 ```text
 glass-skull/
   main.py
+  smoke_check.py
   glass_skull/
     __init__.py
     aggregation.py
     anatomy.py
+    attention_view.py
+    comparison.py
     config.py
     contribution.py
     experiment_store.py
     feature_store.py
     fuzzing.py
+    lens.py
     llama_client.py
     logger.py
     model_loader.py
@@ -258,6 +283,8 @@ This app visualizes the active path by showing:
 - layer activation norms
 - top active residual dimensions
 - selected active contribution edges
+- Logit Lens predictions
+- attention-token routing
 - saved steering vectors
 - normal vs steered output
 - fuzzed activation patterns over many prompts
