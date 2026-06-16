@@ -165,6 +165,11 @@ def main() -> None:
 
     text = MAIN.read_text(encoding="utf-8")
 
+    if '\\"### Hugging Face Access\\"' in text or 'HELP[\\"hf_token\\"]' in text:
+        raise SystemExit(
+            "Detected broken escaped-quote output from an older HF patcher. Run `git restore main.py`, then rerun this script."
+        )
+
     text = text.replace("use_container_width=True", 'width="stretch"')
     text = text.replace("use_container_width=False", 'width="content"')
 
