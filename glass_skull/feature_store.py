@@ -40,7 +40,7 @@ def save_feature(name: str, vector: torch.Tensor, metadata: dict[str, Any]) -> t
 
 
 def _first_existing_feature_name() -> str:
-    features = list_features()
+    features = list_features(include_missing=False)
     for item in features:
         if item.get("exists") and item.get("name"):
             return str(item["name"])
@@ -65,7 +65,7 @@ def load_feature(name: str | None) -> tuple[torch.Tensor, dict[str, Any]]:
     return vector, metadata
 
 
-def list_features() -> list[dict[str, Any]]:
+def list_features(include_missing: bool = False) -> list[dict[str, Any]]:
     FEATURE_DIR.mkdir(parents=True, exist_ok=True)
     rows = []
     for meta_path in sorted(FEATURE_DIR.glob("*.json")):
@@ -87,5 +87,6 @@ def list_features() -> list[dict[str, Any]]:
         tensor_path = FEATURE_DIR / str(tensor_name)
         meta["name"] = str(name)
         meta["exists"] = tensor_path.exists()
-        rows.append(meta)
+        if include_missing or meta["exists"]:
+            rows.append(meta)
     return rows
