@@ -1,0 +1,8 @@
+torch
+transformer-lens
+streamlit
+plotly
+pandas
+numpy
+jaxtyping
+fancy-einsum
