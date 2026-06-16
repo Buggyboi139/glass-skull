@@ -20,6 +20,12 @@ def insert_after(text: str, anchor: str, insertion: str) -> str:
     return text.replace(anchor, anchor + insertion, 1)
 
 
+def replace_if_present(text: str, old: str, new: str) -> str:
+    if old in text:
+        return text.replace(old, new, 1)
+    return text
+
+
 def main() -> None:
     if not MAIN.exists():
         raise SystemExit("Run this from the glass-skull repo root")
@@ -67,7 +73,7 @@ def main() -> None:
     import_add = (
         "from glass_skull.hf_access import access_badge_text, check_model_access, validate_token\n"
         "from glass_skull.hf_loader import build_hf_load_plan\n"
-        "from glass_skull.hf_registry import capabilities_for_backend, families, get_model, model_state, registry_as_dicts, visible_models\n"
+        "from glass_skull.hf_registry import capabilities_for_backend, families, model_state, registry_as_dicts, visible_models\n"
     )
     text = insert_after(text, import_anchor, import_add)
 
@@ -83,7 +89,18 @@ def main() -> None:
         )
 
     # Session defaults.
-    if '"hf_token"' not in text[text.find("defaults = {"):text.find("defaults = {")+900]:
+    defaults_slice = text[text.find("defaults = {"):text.find("defaults = {") + 1500]
+    if '"dashboard_trace"' not in defaults_slice:
+        text = replace_once(
+            text,
+            '        "last_comparison": None,\n',
+            '        "last_comparison": None,\n'
+            '        "dashboard_trace": None,\n'
+            '        "dashboard_trace_meta": {},\n'
+            '        "dashboard_trace_counter": 0,\n'
+        )
+    defaults_slice = text[text.find("defaults = {"):text.find("defaults = {") + 1500]
+    if '"hf_token"' not in defaults_slice:
         text = replace_once(
             text,
             '        "poke_strength": 1.5,\n',
@@ -94,7 +111,18 @@ def main() -> None:
             '        "hf_selected_family": "All",\n'
             '        "hf_recommended_only": False,\n'
             '        "hf_selected_repo": "",\n'
+            '        "hf_last_load_plan": None,\n'
         )
+
+    # Clear dashboard snapshot on model reload / clear trace.
+    text = text.replace(
+        '            st.session_state.last_comparison = None\n            load_hooked_model.clear()\n',
+        '            st.session_state.last_comparison = None\n            st.session_state.dashboard_trace = None\n            st.session_state.dashboard_trace_meta = {}\n            load_hooked_model.clear()\n',
+    )
+    text = text.replace(
+        '        if st.button("Clear trace", width="stretch", help="Clears the currently cached activations."):\n            st.session_state.trace = None\n',
+        '        if st.button("Clear trace", width="stretch", help="Clears the currently cached activations."):\n            st.session_state.trace = None\n            st.session_state.dashboard_trace = None\n            st.session_state.dashboard_trace_meta = {}\n',
+    )
 
     # Helper functions.
     helper_anchor = '''def feature_names_from_rows(rows: list[dict]) -> list[str]:
@@ -102,6 +130,19 @@ def main() -> None:
 
 '''
     helper_add = r'''
+
+def set_dashboard_trace(trace, prompt: str, backend: str, trace_model: str) -> None:
+    st.session_state.dashboard_trace = trace
+    st.session_state.dashboard_trace_counter = int(st.session_state.get("dashboard_trace_counter", 0)) + 1
+    st.session_state.dashboard_trace_meta = {
+        "prompt": prompt,
+        "backend": backend,
+        "trace_model": trace_model,
+        "updated_at": datetime.now().strftime("%H:%M:%S"),
+        "token_count": len(getattr(trace, "tokens", []) or []),
+        "run": st.session_state.dashboard_trace_counter,
+    }
+
 
 def render_capability_warning(chat_backend: str) -> dict[str, bool]:
     caps = capabilities_for_backend(chat_backend)
@@ -131,6 +172,7 @@ def render_hf_catalog_panel() -> None:
             st.session_state.hf_token = ""
             st.session_state.hf_token_status = None
             st.session_state.hf_model_access_cache = {}
+            st.session_state.hf_last_load_plan = None
 
     token_status = st.session_state.get("hf_token_status")
     token_valid = bool(token_status and token_status.valid)
@@ -144,7 +186,11 @@ def render_hf_catalog_panel() -> None:
     st.markdown("### Official model catalog")
     st.caption(HELP["hf_catalog"])
     fam_options = ["All"] + families()
-    fam = st.selectbox("Family", fam_options, index=fam_options.index(st.session_state.get("hf_selected_family", "All")) if st.session_state.get("hf_selected_family", "All") in fam_options else 0)
+    fam = st.selectbox(
+        "Family",
+        fam_options,
+        index=fam_options.index(st.session_state.get("hf_selected_family", "All")) if st.session_state.get("hf_selected_family", "All") in fam_options else 0,
+    )
     st.session_state.hf_selected_family = fam
     recommended_only = st.toggle("Recommended practical first", value=bool(st.session_state.get("hf_recommended_only", False)))
     st.session_state.hf_recommended_only = recommended_only
@@ -225,6 +271,12 @@ def render_hf_catalog_panel() -> None:
             '    ui.pill("HF token", ui.GREEN if (st.session_state.get("hf_token_status") and st.session_state.hf_token_status.valid) else ui.SLATE),\n',
         )
 
+    # Dashboard should read from an explicit live snapshot that updates on every traced chat.
+    text = text.replace(
+        '    trace = st.session_state.trace\n    if trace is None:\n        ui.empty_state("No trace captured yet", "Send a message in the Chat tab with tracing enabled to populate these graphs.")\n    else:\n        st.code(trace.prompt)\n',
+        '    trace = st.session_state.get("dashboard_trace") or st.session_state.get("trace")\n    dash_meta = st.session_state.get("dashboard_trace_meta", {}) or {}\n    if trace is None:\n        ui.empty_state("No trace captured yet", "Send a message in the Chat tab with tracing enabled to populate these graphs.")\n    else:\n        ui.property_list([\n            ("updated", str(dash_meta.get("updated_at", "current run"))),\n            ("backend", str(dash_meta.get("backend", "unknown"))),\n            ("trace_model", str(dash_meta.get("trace_model", summary["model_name"]))),\n            ("tokens", str(dash_meta.get("token_count", len(trace.tokens)))),\n            ("run", str(dash_meta.get("run", "-"))),\n        ])\n        st.code(trace.prompt)\n',
+    )
+
     # Chat capability warning after backend select.
     chat_anchor = '''    with cfg3:
         temperature = st.slider("Temperature", 0.01, 1.5, 0.8, 0.05, help=HELP["temperature"], key="chat_temp")
@@ -241,6 +293,12 @@ def render_hf_catalog_panel() -> None:
     text = text.replace(
         '        use_steering = st.toggle("Use steering", value=False, help="Only applies when the chat backend is TransformerLens. Stock llama.cpp cannot be activation-steered yet.")',
         '        use_steering = st.toggle("Use steering", value=False, disabled=not caps["activation_steering"], help="Only applies when the chat backend is TransformerLens. Stock llama.cpp cannot be activation-steered yet.")',
+    )
+
+    # Make trace storage update dashboard every chat run.
+    text = text.replace(
+        '                trace = trace_prompt(model, prompt)\n                st.session_state.trace = trace\n                run_id = log_run(model_name=model_name, mode="chat_trace", prompt=prompt, metadata={"tokens": trace.tokens, "summary": summary})\n',
+        '                trace = trace_prompt(model, prompt)\n                st.session_state.trace = trace\n                set_dashboard_trace(trace, prompt, chat_backend, str(summary["model_name"]))\n                run_id = log_run(model_name=model_name, mode="chat_trace", prompt=prompt, metadata={"tokens": trace.tokens, "summary": summary, "chat_backend": chat_backend})\n',
     )
 
     # Add capability note at start of Trace and Poke tabs.
@@ -269,12 +327,12 @@ def render_hf_catalog_panel() -> None:
     )
     anatomy_logs_anchor = '''    elif panel == "Features":
         st.caption(f"Compatible with current d_model {expected_dim}: {len(compatible_feature_names)} / {len(all_feature_names)}")
-        st.dataframe(pd.DataFrame(all_features), width="stretch", height=590)
+        st.dataframe(pd.DataFrame(all_features), width="stretch", height=590, hide_index=True)
     elif panel == "Logs":
 '''
     hf_catalog_panel = '''    elif panel == "Features":
         st.caption(f"Compatible with current d_model {expected_dim}: {len(compatible_feature_names)} / {len(all_feature_names)}")
-        st.dataframe(pd.DataFrame(all_features), width="stretch", height=590)
+        st.dataframe(pd.DataFrame(all_features), width="stretch", height=590, hide_index=True)
     elif panel == "HF Catalog":
         st.dataframe(pd.DataFrame(registry_as_dicts()), width="stretch", height=590, hide_index=True)
     elif panel == "Logs":
@@ -284,6 +342,7 @@ def render_hf_catalog_panel() -> None:
 
     MAIN.write_text(text, encoding="utf-8")
     print("HF front patch applied to main.py")
+    print("Dashboard live trace snapshot enabled")
 
 
 if __name__ == "__main__":
