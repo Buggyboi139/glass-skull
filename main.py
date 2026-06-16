@@ -4,6 +4,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from glass_skull.anatomy import config_table, expected_block_table, global_hook_table, hook_table, parameter_table
 from glass_skull.config import DEFAULT_MODEL, MODEL_PRESETS, ensure_dirs, normalize_model_name
 from glass_skull.model_loader import load_hooked_model, model_summary
 from glass_skull.tracer import trace_prompt, top_active_dimensions, next_token_table
@@ -27,7 +28,8 @@ if "model_name" not in st.session_state:
 with st.sidebar:
     st.header("Model")
     preset_options = ["custom"] + MODEL_PRESETS
-    preset = st.selectbox("Preset", preset_options, index=1 if st.session_state.model_name in MODEL_PRESETS else 0)
+    preset_index = preset_options.index(st.session_state.model_name) if st.session_state.model_name in preset_options else 0
+    preset = st.selectbox("Preset", preset_options, index=preset_index)
     if preset != "custom":
         model_name = preset
     else:
@@ -55,11 +57,49 @@ with st.sidebar:
 st.sidebar.divider()
 page = st.sidebar.radio(
     "Mode",
-    ["Trace", "Active Edges", "Map Feature", "Steer", "Logs"],
+    ["Anatomy", "Trace", "Active Edges", "Map Feature", "Steer", "Logs"],
 )
 
 
-if page == "Trace":
+if page == "Anatomy":
+    st.header("0. Model anatomy")
+    st.write("This view is grounded in the loaded model config, parameter tensors, and TransformerLens hook points.")
+
+    st.subheader("Config")
+    st.dataframe(config_table(model), use_container_width=True)
+
+    st.subheader("Global hooks")
+    st.dataframe(global_hook_table(model), use_container_width=True)
+
+    st.subheader("Expected block components")
+    block_df = expected_block_table(model)
+    st.dataframe(block_df, use_container_width=True)
+
+    if not block_df.empty:
+        present_counts = block_df.groupby("component")["present"].mean().reset_index()
+        present_counts["present_fraction"] = present_counts["present"]
+        fig = px.bar(
+            present_counts,
+            x="component",
+            y="present_fraction",
+            title="Component hook availability across layers",
+            labels={"present_fraction": "fraction present"},
+        )
+        fig.update_layout(xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("All discovered hook points")
+    st.dataframe(hook_table(model), use_container_width=True)
+
+    st.subheader("Parameter tensors")
+    params = parameter_table(model)
+    st.dataframe(params, use_container_width=True)
+    if not params.empty:
+        st.write(f"Parameter tensors: `{len(params)}`")
+        st.write(f"Total parameters from table: `{int(params['parameters'].sum()):,}`")
+
+
+elif page == "Trace":
     st.header("1. Trace prompt")
     prompt = st.text_area("Prompt", value="The cat sat on the", height=120)
     top_k = st.slider("Top active dimensions", min_value=5, max_value=100, value=30, step=5)
