@@ -13,6 +13,9 @@ from glass_skull.config import DEFAULT_MODEL, MODEL_PRESETS, ensure_dirs, normal
 from glass_skull.contribution import top_contribution_edges
 from glass_skull.experiment_store import list_experiments
 from glass_skull.feature_store import compatible_features, list_features, load_feature, save_feature
+from glass_skull.hf_registry import capabilities_for_backend, families, model_state, registry_as_dicts, visible_models
+from glass_skull.hf_loader import build_hf_load_plan
+from glass_skull.hf_access import access_badge_text, check_model_access, validate_token
 from glass_skull.fuzzing import run_fuzz_experiment
 from glass_skull.lens import logit_lens_table, logit_lens_top_token_heatmap
 from glass_skull.llama_client import chat_completion, check_server
@@ -67,6 +70,8 @@ HELP = {
     "lens": "Projects each layer's internal state through the output vocabulary to estimate what the model is leaning toward at that point.",
     "attention": "Shows which prompt tokens a selected attention head is looking at.",
     "compare": "Runs the same prompt normally and with steering, then shows text and activation differences.",
+    "hf_token": "Optional Hugging Face read token. Required for gated models after you accept the model license/access terms on Hugging Face.",
+    "hf_catalog": "Official HF model catalog. Visible does not mean loadable; loadability depends on token, access, hardware, and adapter support.",
 }
 
 
@@ -83,10 +88,20 @@ def init_state() -> None:
         "llama_glass_status": None,
         "last_fuzz_result": None,
         "last_comparison": None,
+        "dashboard_trace": None,
+        "dashboard_trace_meta": {},
+        "dashboard_trace_counter": 0,
         "selected_feature": None,
         "poke_layer": 0,
         "poke_stream": "resid_post",
         "poke_strength": 1.5,
+        "hf_token": "",
+        "hf_token_status": None,
+        "hf_model_access_cache": {},
+        "hf_selected_family": "All",
+        "hf_recommended_only": False,
+        "hf_selected_repo": "",
+        "hf_last_load_plan": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -148,6 +163,120 @@ def feature_names_from_rows(rows: list[dict]) -> list[str]:
     return [str(f["name"]) for f in rows if f.get("name")]
 
 
+
+def set_dashboard_trace(trace, prompt: str, backend: str, trace_model: str) -> None:
+    st.session_state.dashboard_trace = trace
+    st.session_state.dashboard_trace_counter = int(st.session_state.get("dashboard_trace_counter", 0)) + 1
+    st.session_state.dashboard_trace_meta = {
+        "prompt": prompt,
+        "backend": backend,
+        "trace_model": trace_model,
+        "updated_at": datetime.now().strftime("%H:%M:%S"),
+        "token_count": len(getattr(trace, "tokens", []) or []),
+        "run": st.session_state.dashboard_trace_counter,
+    }
+
+
+
+def render_capability_warning(chat_backend: str) -> dict[str, bool]:
+    caps = capabilities_for_backend(chat_backend)
+    if "llama.cpp" in chat_backend.lower():
+        st.warning(
+            "llama.cpp backend is chat/output-only right now. Activation Trace, Logit Lens, Attention, Map, Steer, and activation Compare are disabled until llama.cpp-glass exposes real hooks."
+        )
+    return caps
+
+
+
+def render_hf_catalog_panel() -> None:
+    st.markdown("### Hugging Face Access")
+    token = st.text_input(
+        "HF token",
+        value=st.session_state.get("hf_token", ""),
+        type="password",
+        help=HELP["hf_token"],
+    )
+    st.session_state.hf_token = token
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Validate token", width="stretch"):
+            st.session_state.hf_token_status = validate_token(token)
+    with c2:
+        if st.button("Clear token", width="stretch"):
+            st.session_state.hf_token = ""
+            st.session_state.hf_token_status = None
+            st.session_state.hf_model_access_cache = {}
+            st.session_state.hf_last_load_plan = None
+
+    token_status = st.session_state.get("hf_token_status")
+    token_valid = bool(token_status and token_status.valid)
+    if token_status is None:
+        st.caption("HF token: not checked")
+    elif token_status.valid:
+        st.success(token_status.label())
+    else:
+        st.error(token_status.label())
+
+    st.markdown("### Official model catalog")
+    st.caption(HELP["hf_catalog"])
+    fam_options = ["All"] + families()
+    fam = st.selectbox(
+        "Family",
+        fam_options,
+        index=fam_options.index(st.session_state.get("hf_selected_family", "All")) if st.session_state.get("hf_selected_family", "All") in fam_options else 0,
+    )
+    st.session_state.hf_selected_family = fam
+    recommended_only = st.toggle("Recommended practical first", value=bool(st.session_state.get("hf_recommended_only", False)))
+    st.session_state.hf_recommended_only = recommended_only
+
+    rows = visible_models(fam, recommended_only=recommended_only)
+    if not rows:
+        st.info("No models match the current filters.")
+        return
+
+    labels = [f"{m.family} · {m.display_name} · {m.repo_id}" for m in rows]
+    selected_label = st.selectbox("Model", labels)
+    selected = rows[labels.index(selected_label)]
+    st.session_state.hf_selected_repo = selected.repo_id
+
+    cache = st.session_state.setdefault("hf_model_access_cache", {})
+    access = cache.get(selected.repo_id)
+    access_status = access.get("status") if isinstance(access, dict) else None
+    state, reason, enabled = model_state(selected, token_valid, access_status)
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.metric("Params", "?" if selected.params_b is None else f"{selected.params_b:g}B")
+    with col_b:
+        st.metric("Trace", selected.trace_level)
+    with col_c:
+        st.metric("Access", state)
+
+    st.code(selected.repo_id)
+    st.caption(reason)
+    st.caption(selected.notes)
+
+    a1, a2 = st.columns(2)
+    with a1:
+        if st.button("Check model access", width="stretch"):
+            checked = check_model_access(selected.repo_id, token=token if token_valid else None)
+            cache[selected.repo_id] = checked.__dict__
+            st.session_state.hf_model_access_cache = cache
+            st.rerun()
+    with a2:
+        if st.button("Plan HF load", width="stretch", disabled=not enabled):
+            plan = build_hf_load_plan(selected.repo_id, token=token if token_valid else None)
+            st.session_state.hf_last_load_plan = plan.__dict__
+
+    if access:
+        st.info(f"Hub access: {access_badge_text(type('A', (), access)())}")
+    if st.session_state.get("hf_last_load_plan"):
+        st.json(st.session_state.hf_last_load_plan)
+
+    st.dataframe(pd.DataFrame(registry_as_dicts()), width="stretch", height=220, hide_index=True)
+
+
 init_state()
 
 # ===========================================================================
@@ -184,6 +313,8 @@ with st.sidebar:
             st.session_state.trace = None
             st.session_state.last_output = ""
             st.session_state.last_comparison = None
+            st.session_state.dashboard_trace = None
+            st.session_state.dashboard_trace_meta = {}
             load_hooked_model.clear()
 
 model = load_hooked_model(model_name, device_choice=device_choice)
@@ -234,11 +365,17 @@ with st.sidebar:
             st.caption(f"Glass error: {glass_status.error or 'no details'}")
 
     with st.expander("Session", expanded=False):
+
+    with st.expander("Hugging Face", expanded=False):
+        render_hf_catalog_panel()
+
         if st.button("Clear chat", width="stretch", help="Clears only visible chat history. Logs stay saved."):
             st.session_state.chat_messages = []
             st.session_state.last_output = ""
         if st.button("Clear trace", width="stretch", help="Clears the currently cached activations."):
             st.session_state.trace = None
+            st.session_state.dashboard_trace = None
+            st.session_state.dashboard_trace_meta = {}
         if st.button("Clear comparison", width="stretch", help="Clears the last normal-vs-steered comparison."):
             st.session_state.last_comparison = None
 
@@ -257,6 +394,7 @@ pills = [
     ui.pill("Tracing active" if trace_active else "Trace idle", ui.AMBER if trace_active else ui.SLATE, pulse=trace_active),
     ui.pill("Normal server", ui.server_status_color(st.session_state.llama_status)),
     ui.pill("Glass server", ui.server_status_color(st.session_state.llama_glass_status)),
+    ui.pill("HF token", ui.GREEN if (st.session_state.get("hf_token_status") and st.session_state.hf_token_status.valid) else ui.SLATE),
 ]
 ui.hud(
     title="Operation Glass Skull",
@@ -307,10 +445,18 @@ with tab_dash:
 
     st.markdown("---")
     ui.section_header("Live activations", "Derived from the most recent traced prompt. Scroll for the full picture.")
-    trace = st.session_state.trace
+    trace = st.session_state.get("dashboard_trace") or st.session_state.get("trace")
+    dash_meta = st.session_state.get("dashboard_trace_meta", {}) or {}
     if trace is None:
         ui.empty_state("No trace captured yet", "Send a message in the Chat tab with tracing enabled to populate these graphs.")
     else:
+        ui.property_list([
+            ("updated", str(dash_meta.get("updated_at", "current run"))),
+            ("backend", str(dash_meta.get("backend", "unknown"))),
+            ("trace_model", str(dash_meta.get("trace_model", summary["model_name"]))),
+            ("tokens", str(dash_meta.get("token_count", len(trace.tokens)))),
+            ("run", str(dash_meta.get("run", "-"))),
+        ])
         st.code(trace.prompt)
         ui.timeline([f"{i}·{tok}" for i, tok in enumerate(trace.tokens)], current=len(trace.tokens) - 1)
 
@@ -359,10 +505,13 @@ with tab_chat:
         temperature = st.slider("Temperature", 0.01, 1.5, 0.8, 0.05, help=HELP["temperature"], key="chat_temp")
 
     tog1, tog2 = st.columns(2)
+
+    caps = render_capability_warning(chat_backend)
+
     with tog1:
         auto_trace = st.toggle("Trace every message", value=True, help="When enabled, every message also captures activations with the trace model.")
     with tog2:
-        use_steering = st.toggle("Use steering", value=False, help="Only applies when the chat backend is TransformerLens. Stock llama.cpp cannot be activation-steered yet.")
+        use_steering = st.toggle("Use steering", value=False, disabled=not caps["activation_steering"], help="Only applies when the chat backend is TransformerLens. Stock llama.cpp cannot be activation-steered yet.")
 
     # Persistent HUD line above the conversation
     config_badges = "".join(
@@ -408,7 +557,8 @@ with tab_chat:
             with st.spinner("Tracing prompt locally..."):
                 trace = trace_prompt(model, prompt)
                 st.session_state.trace = trace
-                run_id = log_run(model_name=model_name, mode="chat_trace", prompt=prompt, metadata={"tokens": trace.tokens, "summary": summary})
+                set_dashboard_trace(trace, prompt, chat_backend, str(summary["model_name"]))
+                run_id = log_run(model_name=model_name, mode="chat_trace", prompt=prompt, metadata={"tokens": trace.tokens, "summary": summary, "chat_backend": chat_backend})
                 st.session_state.last_run_id = run_id
 
         output = ""
@@ -444,6 +594,9 @@ with tab_chat:
 # ----------------------------------------------------------- Trace / Lens ----
 with tab_trace:
     ui.section_header("Trace / Lens", "Visualize model internals captured from the latest traced prompt.")
+    if 'chat_backend' in locals() and "llama.cpp" in chat_backend.lower():
+        ui.empty_state("Trace source is not llama.cpp", "The current llama.cpp backend can chat, but it does not expose activations. Switch to TransformerLens/HF trace mode for Logit Lens, Attention, and steering.")
+
     trace = st.session_state.trace
     if trace is None:
         ui.empty_state("No trace active", "Start a chat with tracing enabled to begin tracing.")
@@ -510,6 +663,9 @@ with tab_trace:
 # ------------------------------------------------ Poke / Compare / Fuzz ----
 with tab_poke:
     ui.section_header("Poke / Compare / Fuzz", "Probe and stress-test model behavior.")
+    if 'chat_backend' in locals() and "llama.cpp" in chat_backend.lower():
+        st.info("llama.cpp selected: chat and fuzz output are available, but activation Map/Steer/Compare controls target TransformerLens only until llama.cpp-glass exposes hooks.")
+
     tab_steer, tab_map, tab_compare, tab_edges, tab_fuzz = st.tabs(
         ["Steer", "Map", "Compare", "Edges", "Fuzz"]
     )
@@ -735,7 +891,7 @@ with tab_anatomy:
     ui.section_header("Anatomy / Logs", "Inspect model architecture and saved run history.")
     panel = st.radio(
         "Panel",
-        ["Anatomy", "Hooks", "Parameters", "Experiments", "Features", "Logs"],
+        ["Anatomy", "Hooks", "Parameters", "Experiments", "Features", "HF Catalog", "Logs"],
         horizontal=True,
         help="Switch between model structure and saved run history.",
     )
@@ -777,6 +933,8 @@ with tab_anatomy:
     elif panel == "Features":
         st.caption(f"Compatible with current d_model {expected_dim}: {len(compatible_feature_names)} / {len(all_feature_names)}")
         st.dataframe(pd.DataFrame(all_features), width="stretch", height=590, hide_index=True)
+    elif panel == "HF Catalog":
+        st.dataframe(pd.DataFrame(registry_as_dicts()), width="stretch", height=590, hide_index=True)
     elif panel == "Logs":
         runs = recent_runs(limit=100)
         log_lines = []
