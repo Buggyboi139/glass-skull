@@ -1,5 +1,8 @@
 torch
 transformer-lens
+transformers
+accelerate
+safetensors
 streamlit
 plotly
 pandas
