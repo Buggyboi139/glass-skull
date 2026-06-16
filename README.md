@@ -1,19 +1,13 @@
 # Operation Glass Skull
 
-A local interpretability lab for inspecting and steering transformer activations.
+A local interpretability lab for chatting with a transformer while inspecting and steering its activations.
 
-Version `v0.4` focuses on a practical local workflow:
+Version `v0.5` uses a chat-centered cockpit layout:
 
-- Load a TransformerLens-supported model
-- Inspect model anatomy from actual config, parameters, and hook points
-- Run prompts through the model
-- Capture activation caches
-- Display token/layer activation heatmaps
-- Inspect top active dimensions
-- Build contrast vectors from positive/negative prompt sets
-- Save and reload feature vectors
-- Steer generation with activation hooks
-- Log runs to SQLite
+- 1/4 screen: chat UI
+- 1/4 screen: live trace view
+- 1/4 screen: poke/map/edge controls
+- 1/4 screen: anatomy, hook points, parameters, and logs
 
 This is not a llama.cpp/GGUF project. It uses PyTorch + TransformerLens so the app can see and modify internal activations directly.
 
@@ -73,6 +67,39 @@ pythia-410m-deduped
 pythia-1b-deduped
 ```
 
+## Cockpit workflow
+
+### Chat
+
+Use the left panel to talk to the model. Enable `Trace every message` to capture activations for each prompt. Enable `Use steering` to apply the selected feature vector from the Poke panel.
+
+### Trace
+
+The trace panel shows:
+
+- prompt tokens
+- activation heatmap
+- selected layer/token activation dimensions
+- next-token probability table
+
+### Poke
+
+The poke panel has three tabs:
+
+- `Steer`: load a saved feature and set strength
+- `Map`: build a new feature from positive and negative examples
+- `Edges`: show selected active MLP contribution edges from the current trace
+
+### Anatomy / Logs
+
+The right panel shows:
+
+- model config
+- expected block components
+- discovered hook points
+- parameter tensors
+- recent SQLite logs
+
 ## Directory layout
 
 ```text
@@ -109,18 +136,4 @@ This app visualizes the active path by showing:
 - saved steering vectors
 - normal vs steered output
 
-The animated/visual edges are not literal wires. They are top computed contribution paths derived from real activations and real weight matrices.
-
-## Run levels
-
-### v0.1
-Capture activations.
-
-### v0.2
-Inspect top active dimensions and contribution edges.
-
-### v0.3
-Build feature vectors from prompt contrasts.
-
-### v0.4
-Inject saved vectors during generation and compare output.
+The visual edges are not literal wires. They are top computed contribution paths derived from real activations and real weight matrices.
