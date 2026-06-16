@@ -364,11 +364,10 @@ with st.sidebar:
         elif glass_status is not None:
             st.caption(f"Glass error: {glass_status.error or 'no details'}")
 
-    with st.expander("Session", expanded=False):
-
     with st.expander("Hugging Face", expanded=False):
         render_hf_catalog_panel()
 
+    with st.expander("Session", expanded=False):
         if st.button("Clear chat", width="stretch", help="Clears only visible chat history. Logs stay saved."):
             st.session_state.chat_messages = []
             st.session_state.last_output = ""
