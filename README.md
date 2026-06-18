@@ -1,3 +1,5 @@
+✨Vibe-Code✨
+
 # Operation Glass Skull
 
 A local interpretability cockpit for chatting with llama.cpp, TransformerLens, and planned Hugging Face model backends while inspecting, mapping, fuzzing, comparing, and steering transformer activations.
