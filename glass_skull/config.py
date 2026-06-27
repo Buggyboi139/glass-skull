@@ -9,6 +9,9 @@ DATA_DIR = APP_DIR / "data"
 FEATURE_DIR = DATA_DIR / "features"
 LOG_DIR = DATA_DIR / "logs"
 PROMPT_SET_DIR = DATA_DIR / "prompt_sets"
+CONTROL_SET_DIR = DATA_DIR / "control_sets"
+CONTROL_VECTOR_DIR = DATA_DIR / "control_vectors"
+CHAT_DIR = DATA_DIR / "chats"
 DB_PATH = LOG_DIR / "glass_skull.db"
 
 
@@ -48,5 +51,5 @@ def normalize_model_name(model_name: str) -> str:
 
 
 def ensure_dirs() -> None:
-    for path in [DATA_DIR, FEATURE_DIR, LOG_DIR, PROMPT_SET_DIR]:
+    for path in [DATA_DIR, FEATURE_DIR, LOG_DIR, PROMPT_SET_DIR, CONTROL_SET_DIR, CONTROL_VECTOR_DIR, CHAT_DIR]:
         path.mkdir(parents=True, exist_ok=True)

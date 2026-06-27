@@ -126,6 +126,7 @@ def capabilities_for_backend(backend: str, trace_source: str = "TransformerLens"
         "chat": True,
         "server_metadata": is_llama,
         "fuzz_outputs": True,
+        "control_vector_steering": is_llama,
         "activation_trace": not is_llama and trace_source == "TransformerLens",
         "logit_lens": not is_llama and trace_source == "TransformerLens",
         "attention": not is_llama and trace_source == "TransformerLens",

@@ -13,5 +13,11 @@ __pycache__/
 data/experiments/
 data/logs/
 data/features/
+data/chats/
+data/control_sets/
+data/control_vectors/
 .streamlit/
 .cache/
+
+# local working notes
+llm.txt

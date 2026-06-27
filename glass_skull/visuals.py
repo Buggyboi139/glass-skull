@@ -297,6 +297,128 @@ def parameter_shape_scatter_fig(params: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
+# GGUF model graphs (derived from local tensor index, no model load required)
+# ---------------------------------------------------------------------------
+def _gguf_layer_of(name: str) -> int:
+    match = re.search(r"blk\.(\d+)\.", name)
+    return int(match.group(1)) if match else -1
+
+
+def _gguf_component_of(name: str) -> str:
+    if name.startswith("token_embd"):
+        return "embedding"
+    if name.startswith("output."):
+        return "output"
+    if "norm" in name:
+        return "norm"
+    if ".attn" in name:
+        return "attention"
+    if ".ffn" in name:
+        return "ffn / moe"
+    if ".ssm" in name:
+        return "ssm / mtp"
+    return "other"
+
+
+def gguf_tensors_per_layer_fig(tensors: pd.DataFrame):
+    if tensors is None or tensors.empty or "name" not in tensors.columns:
+        return None
+    df = tensors.copy()
+    df["layer"] = df["name"].map(_gguf_layer_of)
+    block = df[df["layer"] >= 0].groupby("layer", as_index=False).agg(
+        tensors=("name", "count"),
+        elements=("elements", "sum"),
+    )
+    if block.empty:
+        return None
+    fig = px.bar(
+        block,
+        x="layer",
+        y="elements",
+        hover_data=["tensors"],
+        title="GGUF tensor elements per local model block",
+        labels={"layer": "block index", "elements": "tensor elements"},
+        color="elements",
+        color_continuous_scale="Tealgrn",
+    )
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=45, b=10), coloraxis_showscale=False)
+    return fig
+
+
+def gguf_tensors_by_component_fig(tensors: pd.DataFrame):
+    if tensors is None or tensors.empty or "name" not in tensors.columns:
+        return None
+    df = tensors.copy()
+    df["component"] = df["name"].map(_gguf_component_of)
+    agg = df.groupby("component", as_index=False).agg(
+        tensors=("name", "count"),
+        elements=("elements", "sum"),
+    ).sort_values("elements")
+    if agg.empty:
+        return None
+    fig = px.bar(
+        agg,
+        x="elements",
+        y="component",
+        orientation="h",
+        hover_data=["tensors"],
+        title="GGUF tensor elements by component",
+        labels={"elements": "tensor elements", "component": ""},
+        color="elements",
+        color_continuous_scale="Purpor",
+    )
+    fig.update_layout(height=300, margin=dict(l=10, r=10, t=45, b=10), coloraxis_showscale=False)
+    return fig
+
+
+def gguf_tensor_dtype_fig(tensors: pd.DataFrame):
+    if tensors is None or tensors.empty or "dtype" not in tensors.columns:
+        return None
+    agg = tensors.groupby("dtype", as_index=False).agg(
+        tensors=("name", "count"),
+        elements=("elements", "sum"),
+    ).sort_values("elements")
+    if agg.empty:
+        return None
+    fig = px.bar(
+        agg,
+        x="elements",
+        y="dtype",
+        orientation="h",
+        hover_data=["tensors"],
+        title="GGUF quantization types",
+        labels={"elements": "tensor elements", "dtype": ""},
+        color="elements",
+        color_continuous_scale="Viridis",
+    )
+    fig.update_layout(height=260, margin=dict(l=10, r=10, t=45, b=10), coloraxis_showscale=False)
+    return fig
+
+
+def gguf_tensor_shape_scatter_fig(tensors: pd.DataFrame):
+    if tensors is None or tensors.empty or "name" not in tensors.columns:
+        return None
+    df = tensors.copy()
+    df["layer"] = df["name"].map(_gguf_layer_of)
+    df["component"] = df["name"].map(_gguf_component_of)
+    df = df[df["elements"] > 0]
+    if df.empty:
+        return None
+    fig = px.scatter(
+        df,
+        x="layer",
+        y="elements",
+        color="component",
+        size="elements",
+        hover_data=["name", "shape", "dtype"],
+        title="GGUF tensors across local model depth",
+        labels={"layer": "block index (-1 = global)", "elements": "tensor elements"},
+    )
+    fig.update_layout(height=340, margin=dict(l=10, r=10, t=45, b=10))
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # Trace-derived graphs
 # ---------------------------------------------------------------------------
 def mean_norm_by_layer_fig(layer_norms: pd.DataFrame):

@@ -48,6 +48,7 @@ def run_fuzz_experiment(
     trace_enabled: bool,
     model: HookedTransformer | None = None,
     llama_url: str | None = None,
+    llama_model_alias: str | None = None,
     max_new_tokens: int = 80,
     temperature: float = 0.8,
     layers: list[int] | None = None,
@@ -68,6 +69,7 @@ def run_fuzz_experiment(
         "name": name,
         "chat_backend": chat_backend,
         "llama_url": llama_url,
+        "llama_model_alias": llama_model_alias,
         "trace_enabled": trace_enabled,
         "max_new_tokens": max_new_tokens,
         "temperature": temperature,
@@ -98,6 +100,7 @@ def run_fuzz_experiment(
                     item.prompt,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
+                    model_alias=llama_model_alias,
                 )
             else:
                 output = model.generate(

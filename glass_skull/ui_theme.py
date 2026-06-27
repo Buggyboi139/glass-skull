@@ -89,12 +89,18 @@ def inject_theme() -> None:
             font-size: 0.82em;
         }}
 
-        /* ---------- Sidebar ---------- */
+        /* ---------- Sidebar ----------
+           Configuration lives in the Settings tab. Keep Streamlit's sidebar
+           shell hidden so the app does not present two control surfaces. */
         [data-testid="stSidebar"] {{
-            background: linear-gradient(180deg, {BG_ELEVATED} 0%, {BG} 100%);
-            border-right: 1px solid {BORDER_SOFT};
+            display: none;
         }}
-        [data-testid="stSidebar"] .block-container {{ padding-top: 1rem; }}
+        [data-testid="stSidebarCollapsedControl"] {{
+            display: none;
+        }}
+        [data-testid="collapsedControl"] {{
+            display: none;
+        }}
 
         /* ---------- Buttons ---------- */
         .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{

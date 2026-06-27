@@ -153,21 +153,22 @@ DeepSeek:
 
 ## Backend capability rules
 
-When chat backend is `llama.cpp normal` or `llama.cpp glass`:
+When chat backend is `Local GGUF normal (llama.cpp)` or `Local GGUF steered (llama.cpp)`:
 
 ```text
 Enabled:
   Chat
   Server metadata
   Fuzz outputs
+  Control-vector steering through llama.cpp startup flags
 
 Disabled / warning-gated:
   Activation Trace
   Logit Lens
   Attention
   Map
-  Steer
-  Activation Compare
+  TransformerLens-style activation Steer
+  Tensor-level Activation Compare
 ```
 
 When backend is TransformerLens:
@@ -195,7 +196,60 @@ python smoke_check.py
 streamlit run main.py
 ```
 
+On first boot, Glass Skull opens a workflow setup dialog. Pick the model sources
+for the session:
+
+- Local GGUF (llama.cpp)
+- Hugging Face models
+- Trace model (TransformerLens)
+
+Each source includes an info tooltip with its runtime requirements. Successful
+setup adds the configured sources to the `Models` tab, which appears after
+`Anatomy / Logs`.
+
+Runtime configuration lives in the `Settings` tab, not the sidebar. `Settings`
+is organized as `Local`, `HF`, `Trace`, and `Session`; start in `Local` to set
+the router model alias, GGUF path, llama.cpp server URLs, and local tool paths.
+Chat, fuzzing, Local Alter launch commands, and local model flags all consume
+that same Local configuration.
+
+The Chat tab includes `Send message`, `Cancel chat`, `New chat`, and `Load chat`
+controls beside the message box. `New chat` archives the current transcript
+under `data/chats/`; `Load chat` restores the most recent saved transcript.
+
 ## llama.cpp reminder
+
+Glass Skull can now stage local GGUF control-vector runs around upstream
+llama.cpp flags. Put positive/negative prompt files under
+`data/control_sets/`, generate vectors under `data/control_vectors/`, then
+use the Local Alter tab to preflight the model and build launch commands. The
+generator omits `-ngl` by default so llama.cpp can auto-fit GPU layers; set it
+only from Advanced generator options when you need an explicit value.
+
+Launch a normal server and a steered server on separate ports, then compare
+`Local GGUF normal (llama.cpp)` and `Local GGUF steered (llama.cpp)` in Chat:
+
+```bash
+/home/dsmason321/llama.cpp/build/bin/llama-server \
+  -m /path/to/qwen3.6-35b.gguf \
+  --host 127.0.0.1 \
+  --port 8080 \
+  -ngl 999 \
+  --alias qwen3.6-35b-mtp-q4-ks-vision
+
+/home/dsmason321/llama.cpp/build/bin/llama-server \
+  -m /path/to/qwen3.6-35b.gguf \
+  --host 127.0.0.1 \
+  --port 8088 \
+  -ngl 999 \
+  --alias qwen3.6-35b-mtp-q4-ks-vision \
+  --control-vector-scaled data/control_vectors/my_behavior.gguf:1.25 \
+  --control-vector-layer-range 20 60
+```
+
+Local Alter also preserves full stdout/stderr for failed generator attempts and
+classifies common failures, including explicit `-ngl 999` auto-fit conflicts and
+the likely Qwen3.6 MoE/MTP `diff_filtered.size() == n_layers - 1` assertion.
 
 For Gemma 4 models, disable reasoning if the chat endpoint returns empty visible content:
 
