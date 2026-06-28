@@ -59,10 +59,10 @@ def build_model_meta(summary: dict, local_model_context: dict | None, backend: s
         else _int_or_none(summary.get("context_length") or summary.get("n_ctx"))
     )
     return {
-        "source": local_model_context.get("source") if is_local else "TransformerLens",
+        "source": local_model_context.get("source") if is_local else "Local GGUF",
         "backend": backend,
         "modelName": local_model_context.get("display_name") if is_local else str(summary.get("model_name", "")),
-        "architecture": local_model_context.get("architecture") if is_local else str(summary.get("architecture", "transformer")),
+        "architecture": local_model_context.get("architecture") if is_local else str(summary.get("architecture", "local")),
         "layerCount": max(layer_count or 0, 0),
         "hiddenSize": max(hidden_size or 0, 0),
         "attentionHeads": heads,
@@ -73,7 +73,7 @@ def build_model_meta(summary: dict, local_model_context: dict | None, backend: s
         "quantization": str(metadata.get("general.file_type") or metadata.get("quantization") or ""),
         "parameterCount": _int_or_none(summary.get("parameters")),
         "tensorCount": _int_or_none(local_model_context.get("tensor_count")) if is_local else None,
-        "metadataSource": "gguf" if is_local else "transformerlens",
+        "metadataSource": "gguf" if is_local else "local",
         "metadataErrors": list(local_model_context.get("errors") or []),
         "visualizationMode": "clustered" if layer_count else "unavailable",
     }
@@ -194,7 +194,7 @@ def build_activation_map_payload(
     selected_group: str | None = None,
     selected_batch: str | None = None,
 ) -> dict:
-    backend = str(artifact.get("backend") or summary.get("backend") or "TransformerLens")
+    backend = str(artifact.get("backend") or summary.get("backend") or "llama.cpp")
     model_meta = build_model_meta(summary, local_model_context, backend)
     batches = _batch_rows(artifact)
     trace_rows = _artifact_trace_rows(artifact)
@@ -286,7 +286,7 @@ def build_activation_map_payload(
             "layerId": f"L{layer_index}",
             "index": layer_index,
             "name": f"L{layer_index}",
-            "layerType": "transformer_block",
+            "layerType": "llm_block",
             "nodeCount": hidden_size,
             "groupCount": group_count,
             "activationDensity": (len(active_groups) / group_count) if group_count else 0.0,

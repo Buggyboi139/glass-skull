@@ -1,0 +1,85 @@
+Glass Skull local-only architecture
+==================================
+
+Glass Skull is a local-only application. Models are run locally. llama.cpp is
+the execution backend. The app does not call remote model services and does not
+download model weights.
+
+Local execution backend
+-----------------------
+
+The normal runtime is a local llama.cpp server using a GGUF model selected by
+the user. Glass Skull stores the server URL, model alias, GGUF path, local
+llama-server path, and local llama-cvector-generator path in Streamlit session
+state through the Settings tab.
+
+The managed local source lives under:
+
+    managed/llama.cpp-glass/
+
+The patch record lives under:
+
+    patches/llama.cpp-glass/0001-glass-skull-per-request-steering.patch
+
+Local environment patches are expected. They should be documented by keeping
+the patch file current, recording the managed llama.cpp commit, and verifying
+that the managed checkout can be reversed or rebuilt from that patch record.
+
+Core workflow
+-------------
+
+1. A user enters a prompt or batch of prompts in the Run tab.
+2. Glass Skull sends chat requests to the configured local llama.cpp server.
+3. When tracing is enabled, Glass Skull also calls the local
+   /glass-skull/trace endpoint.
+4. The trace payload is normalized into run-artifact rows containing prompt id,
+   label, layer, stream, token index, token text, activation norm, trace source,
+   and unavailable-reason diagnostics.
+5. The app stores a local artifact with prompts, outputs, trace rows, behavior
+   scores, batch metadata, and error state.
+6. The Map tab turns the artifact into a canvas payload and visualizes local LLM
+   activity.
+7. The Steer tab prepares local control sets, generates GGUF control vectors,
+   and shows llama.cpp launch commands for steered runs.
+8. The Timeline tab compares behavior scores across local runs.
+
+Visual representation
+---------------------
+
+Layers represent local model blocks from GGUF metadata or the highest traced
+layer returned by llama.cpp.
+
+Nodes represent grouped hidden dimensions. When top-dimension data is available,
+the map assigns dimensions into groups and marks stronger activation groups.
+When only layer summaries are available, the map marks the view as sampled. When
+no activation rows are available, the canvas switches to unavailable diagnostics
+instead of inventing data.
+
+Activation paths connect prompt or batch activity across layers. Path strength
+comes from normalized activation norms in the local trace rows. Paths are
+sampled unless the local backend returns exact internal structures.
+
+Batch and message remapping happens through run artifacts. Single prompts use a
+single batch id. Batch runs map each prompt id and label into its own batch row,
+then aggregate by prompt, label, or all prompts for tables and heatmaps.
+
+Heatmaps summarize average activation norm by prompt, label, layer, and stream.
+They are diagnostic summaries, not causal proof.
+
+Tooltips and diagnostics expose the selected batch, layer, node group, activation
+value, prompt preview, output preview, trace availability, trace mode, and
+unavailable reasons. The canvas keeps unavailable states explicit so local
+server limitations are visible.
+
+Intentionally not supported
+---------------------------
+
+The following systems are intentionally not supported in this repository:
+
+- Hugging Face
+- TransformerLens
+- remote model providers
+- bundled model download tooling
+
+Models must be obtained and managed outside this repository, then pointed at
+through a local GGUF path and local llama.cpp server configuration.

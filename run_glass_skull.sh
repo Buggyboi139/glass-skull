@@ -9,8 +9,8 @@ ADDRESS="${STREAMLIT_SERVER_ADDRESS:-localhost}"
 START_LLAMA_CPP="${START_LLAMA_CPP:-1}"
 LLAMA_HOST="${LLAMA_HOST:-127.0.0.1}"
 LLAMA_PORT="${LLAMA_PORT:-8080}"
-LLAMA_MODEL_PATH="${LLAMA_MODEL_PATH:-/home/dsmason321/models/Best/Qwen3.6-35B-MTP-Q4_KS.gguf}"
-LLAMA_MODEL_ALIAS="${LLAMA_MODEL_ALIAS:-qwen3.6-35b-mtp-q4-ks-vision}"
+LLAMA_MODEL_PATH="${LLAMA_MODEL_PATH:-}"
+LLAMA_MODEL_ALIAS="${LLAMA_MODEL_ALIAS:-local-gguf}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-}"
 LLAMA_LOG_FILE="${LLAMA_LOG_FILE:-$SCRIPT_DIR/data/logs/llama-server.log}"
 LLAMA_EXTRA_ARGS="${LLAMA_EXTRA_ARGS:---jinja --flash-attn auto --cache-type-k q4_0 --cache-type-v q4_0 --no-mmap}"
@@ -164,6 +164,7 @@ start_llama_cpp() {
         -m "$LLAMA_MODEL_PATH" \
         --host "$LLAMA_HOST" \
         --port "$LLAMA_PORT" \
+        --offline \
         -ngl "$LLAMA_N_GPU_LAYERS" \
         --alias "$LLAMA_MODEL_ALIAS" \
         "${extra_args[@]}" \
@@ -189,13 +190,6 @@ source .venv/bin/activate
 log "Installing Python requirements"
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-
-if grep -q "def render_hf_catalog_panel" main.py && grep -q "workflow_setup_complete" main.py; then
-    log "Local UI patch already present"
-else
-    log "Applying local UI patch"
-    python scripts/apply_hf_front_patch.py
-fi
 
 log "Running startup checks"
 python -m compileall main.py glass_skull scripts smoke_check.py

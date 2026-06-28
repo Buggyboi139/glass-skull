@@ -326,10 +326,16 @@ def _glass_trace_payload(
         payload["streams"] = _coerce_streams(streams)
     if max_new_tokens is not None:
         payload["max_new_tokens"] = int(max_new_tokens)
+        payload["max_tokens"] = int(max_new_tokens)
     if top_k is not None:
         payload["top_k"] = int(top_k)
     if with_pieces is not None:
         payload["with_pieces"] = bool(with_pieces)
+    payload["capture"] = {
+        "prompt_tokens": True,
+        "layer_inputs": bool(layers is not None or streams is not None),
+        "next_token_logits": False,
+    }
 
     return payload
 
@@ -363,6 +369,20 @@ def _validate_trace_response(result: dict[str, Any], context: str) -> None:
         raise RuntimeError(
             f"{context} returned invalid shape: field 'layer_norms' is "
             f"{_json_shape(layer_norms)}, expected array"
+        )
+
+    layer_inputs = result.get("layer_inputs")
+    if layer_inputs is not None and not isinstance(layer_inputs, list):
+        raise RuntimeError(
+            f"{context} returned invalid shape: field 'layer_inputs' is "
+            f"{_json_shape(layer_inputs)}, expected array"
+        )
+
+    logits = result.get("logits")
+    if logits is not None and not isinstance(logits, (dict, list)):
+        raise RuntimeError(
+            f"{context} returned invalid shape: field 'logits' is "
+            f"{_json_shape(logits)}, expected object or array"
         )
 
     prompt = result.get("prompt")
@@ -474,9 +494,9 @@ def trace_glass_prompt(
 ) -> dict[str, Any]:
     """Request a local llama.cpp trace payload.
 
-    The endpoint is intentionally separate from TransformerLens tracing. It may
-    return a limited but accurate payload when only coarse local internals are
-    available.
+    The endpoint returns local llama.cpp trace data when the managed Glass Skull
+    patch is present. It may return token-only diagnostics when activation
+    capture is unavailable.
     """
 
     payload = _glass_trace_payload(

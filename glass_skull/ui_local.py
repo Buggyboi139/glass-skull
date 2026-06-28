@@ -6,7 +6,7 @@ from uuid import uuid4
 from .prompt_loader import PromptItem
 
 
-LOCAL_TABS = ["Chat", "Dashboard", "Local Controls", "Anatomy / Logs", "Models", "Settings"]
+LOCAL_TABS = ["Run", "Map", "Steer", "Timeline", "Model", "Settings"]
 
 
 def new_run_id(prefix: str = "run") -> str:

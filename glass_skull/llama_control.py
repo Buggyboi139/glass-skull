@@ -351,7 +351,7 @@ def model_compatibility_warnings(model_architecture: str | None, metadata: dict[
     if "qwen35moe" in arch or "qwen35moe" in keys:
         warnings.append("Model architecture is qwen35moe; stock cvector generation may hit the layer-count assertion on MoE/MTP graphs.")
     elif "moe" in arch or ".expert_" in keys or "expert_count" in keys:
-        warnings.append("Model appears to be MoE; stock cvector generation may not capture one output tensor per transformer layer.")
+        warnings.append("Model appears to be MoE; stock cvector generation may not capture one output tensor per model layer.")
     if "mtp" in path_text or "nextn" in keys or "mtp" in keys:
         warnings.append("Model appears to include MTP/next-token-prediction heads; cvector-generator compatibility may require a llama.cpp patch.")
     return warnings
@@ -435,7 +435,7 @@ def classify_cvector_failure(stderr: str, stdout: str = "") -> CVectorFailure:
     if "diff_filtered.size() == n_layers - 1" in combined:
         return CVectorFailure(
             "Captured layer-output count did not match llama-cvector-generator's expected layer count.",
-            "Treat this as likely Qwen3.6 MoE/MTP cvector incompatibility; use the compatibility patch path or try a non-MoE GGUF.",
+            "Treat this as a likely architecture/control-vector incompatibility; use the compatibility patch path or try a simpler GGUF.",
             warnings,
         )
     if "PCA iterations must" in combined:

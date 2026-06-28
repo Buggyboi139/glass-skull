@@ -74,47 +74,13 @@ def _llama_tokens(payload: dict[str, Any]) -> list[Any]:
 
 
 def _unavailable_reason(payload: dict[str, Any]) -> str:
-    for key in ("activations", "layer_norms", "trace"):
+    for key in ("activations", "layer_inputs", "layer_norms", "logits", "trace"):
         value = payload.get(key)
         if isinstance(value, dict):
             reason = value.get("reason") or value.get("error")
             if reason:
                 return str(reason)
     return "activation summaries were not returned by this backend"
-
-
-def normalize_transformerlens_trace(
-    trace: Any,
-    prompt_id: Any,
-    label: str | None,
-    metadata: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    metadata = metadata or {}
-    run_id = str(metadata.get("run_id") or "")
-    layer_norms = getattr(trace, "layer_norms", pd.DataFrame())
-    if layer_norms is None or getattr(layer_norms, "empty", True):
-        return []
-    tokens = list(getattr(trace, "tokens", []) or [])
-    rows: list[dict[str, Any]] = []
-    for row in layer_norms.to_dict("records"):
-        token_index = _int_or_none(row.get("token_index"))
-        stream = str(row.get("stream") or row.get("component") or "resid_post")
-        rows.append({
-            "run_id": run_id,
-            "prompt_id": prompt_id,
-            "label": label or "unlabeled",
-            "layer": _int_or_none(row.get("layer")),
-            "stream": stream,
-            "component": stream,
-            "token_index": token_index,
-            "token": _token_from_trace(tokens, token_index, row.get("token")),
-            "activation_norm": _finite_float(row.get("activation_norm", row.get("norm"))),
-            "trace_available": True,
-            "trace_source": "transformerlens",
-            "unavailable_reason": "",
-            "top_dims": row.get("top_dims", []),
-        })
-    return rows
 
 
 def normalize_llama_trace(
@@ -125,17 +91,21 @@ def normalize_llama_trace(
 ) -> list[dict[str, Any]]:
     metadata = metadata or {}
     run_id = str(metadata.get("run_id") or "")
-    layer_norms = payload.get("layer_norms")
-    if not isinstance(layer_norms, list) or not layer_norms:
+    trace_points = payload.get("layer_inputs")
+    default_stream = "resid_pre"
+    if not isinstance(trace_points, list) or not trace_points:
+        trace_points = payload.get("layer_norms")
+        default_stream = "resid_post"
+    if not isinstance(trace_points, list) or not trace_points:
         return []
 
     tokens = _llama_tokens(payload)
     rows: list[dict[str, Any]] = []
-    for row in layer_norms:
+    for row in trace_points:
         if not isinstance(row, dict):
             continue
         token_index = _int_or_none(row.get("token_index"))
-        stream = str(row.get("stream") or row.get("component") or "resid_post")
+        stream = str(row.get("stream") or row.get("component") or default_stream)
         rows.append({
             "run_id": run_id,
             "prompt_id": prompt_id,
@@ -145,7 +115,7 @@ def normalize_llama_trace(
             "component": stream,
             "token_index": token_index,
             "token": _token_from_trace(tokens, token_index, row.get("token")),
-            "activation_norm": _finite_float(row.get("activation_norm", row.get("norm"))),
+            "activation_norm": _finite_float(row.get("activation_norm", row.get("norm", row.get("l2_norm")))),
             "trace_available": True,
             "trace_source": "llama.cpp",
             "unavailable_reason": "",

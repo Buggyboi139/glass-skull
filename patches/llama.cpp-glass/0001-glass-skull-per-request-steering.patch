@@ -7,18 +7,18 @@ index 3e0fe66af..6bf24873b 100644
  #include <sstream>
  #include <stdexcept>
 +#include <vector>
- 
+
  // vec
- 
+
 @@ -121,12 +122,16 @@ bool llama_adapter_cvec::apply(
      layer_start = il_start;
      layer_end   = il_end;
- 
+
 +    const std::vector<float> zeros(n_embd, 0.0f);
 +
      for (size_t il = 1; il < hparams.n_layer(); il++) {
          assert(tensors[il] != nullptr);
- 
+
          const size_t off = n_embd * (il - 1); // buffer doesn't have data for layer 0, since it's never present
          if (off + n_embd <= len) {
              ggml_backend_tensor_set(tensors[il], data + off, 0, n_embd * ggml_element_size(tensors[il]));
@@ -26,15 +26,26 @@ index 3e0fe66af..6bf24873b 100644
 +            ggml_backend_tensor_set(tensors[il], zeros.data(), 0, n_embd * ggml_element_size(tensors[il]));
          }
      }
- 
+
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index ca91449d2..4a03ee9d2 100644
+index ca91449d2..70404bff0 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -53,6 +53,36 @@ static uint32_t server_n_outputs_max(const common_params & params) {
+@@ -16,7 +16,10 @@
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
+
++#include "../../src/llama-ext.h"
++
+ #include <algorithm>
++#include <cmath>
+ #include <cstddef>
+ #include <cinttypes>
+ #include <exception>
+@@ -53,6 +56,36 @@ static uint32_t server_n_outputs_max(const common_params & params) {
      return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
  }
- 
+
 +static std::string server_model_meta_val_str(const llama_model * model, const char * key) {
 +    char buf[256];
 +    int32_t len = llama_model_meta_val_str(model, key, buf, sizeof(buf));
@@ -68,59 +79,95 @@ index ca91449d2..4a03ee9d2 100644
  // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
  enum slot_state {
      SLOT_STATE_IDLE,
-@@ -287,7 +317,7 @@ struct server_slot {
+@@ -273,6 +306,8 @@ struct server_slot {
+
+     common_sampler_ptr smpl;
+
++    std::vector<glass_trace_layer_input> glass_trace_rows;
++
+     llama_token sampled; // in speculative mode, this is the last accepted token
+
+     // stats
+@@ -287,7 +322,7 @@ struct server_slot {
      double t_prompt_processing = 0.0; // ms
      double t_token_generation = 0.0;  // ms
- 
+
 -    std::function<void(int /* id_slot */)> callback_on_release;
-+    std::function<void(int /* id_slot */, bool /* was_steered */, int /* id_task */)> callback_on_release;
- 
++    std::function<void(int /* id_slot */, bool /* was_steered */, bool /* was_glass_trace */, int /* id_task */)> callback_on_release;
+
      // Speculative decoding stats
      int32_t n_draft_total = 0;      // Total draft tokens generated
-@@ -494,9 +524,12 @@ struct server_slot {
+@@ -315,6 +350,7 @@ struct server_slot {
+         }
+         generated_tokens.clear();
+         generated_token_probs.clear();
++        glass_trace_rows.clear();
+         json_schema = json();
+
+         // clear speculative decoding stats
+@@ -494,9 +530,13 @@ struct server_slot {
                  prompt_clear(false);
              }
- 
+
 +            const bool was_steered = task->params.steering.enabled;
++            const bool was_glass_trace = task->type == SERVER_TASK_TYPE_GLASS_TRACE;
 +            const int id_task = task->id;
 +
              reset();
- 
+
 -            callback_on_release(id);
-+            callback_on_release(id, was_steered, id_task);
++            callback_on_release(id, was_steered, was_glass_trace, id_task);
          }
      }
- 
-@@ -920,6 +953,12 @@ private:
- 
+
+@@ -920,6 +960,21 @@ private:
+
      server_metrics metrics;
- 
+
 +    common_control_vector_data default_cvec = { -1, {} };
 +    int32_t default_cvec_layer_start = -1;
 +    int32_t default_cvec_layer_end   = -1;
++    common_control_vector_data global_cvec = { -1, {} };
++    std::string global_cvec_path;
++    float global_cvec_strength = 1.0f;
++    int32_t global_cvec_layer_start = -1;
++    int32_t global_cvec_layer_end = -1;
++    bool global_cvec_enabled = false;
 +    bool active_request_steering = false;
 +    int active_request_steering_task = -1;
++    bool active_glass_trace = false;
++    int active_glass_trace_task = -1;
++    std::vector<int32_t> active_glass_trace_layers;
 +
      json json_ui_settings = json::object();
- 
+
      // Necessary similarity of prompt for slot selection
-@@ -934,6 +973,12 @@ private:
+@@ -934,6 +989,21 @@ private:
      int64_t t_last_load_progress_ms = 0;
- 
+
      void destroy() {
 +        default_cvec = { -1, {} };
 +        default_cvec_layer_start = -1;
 +        default_cvec_layer_end = -1;
++        global_cvec = { -1, {} };
++        global_cvec_path.clear();
++        global_cvec_strength = 1.0f;
++        global_cvec_layer_start = -1;
++        global_cvec_layer_end = -1;
++        global_cvec_enabled = false;
 +        active_request_steering = false;
 +        active_request_steering_task = -1;
++        active_glass_trace = false;
++        active_glass_trace_task = -1;
++        active_glass_trace_layers.clear();
 +
          spec.reset();
          ctx_dft.reset();
          model_dft.reset();
-@@ -947,6 +992,126 @@ private:
+@@ -947,6 +1017,331 @@ private:
          mctx = nullptr;
      }
- 
+
 +    void pad_control_vector(common_control_vector_data & cvec) const {
 +        if (cvec.n_embd <= 0 || model_tgt == nullptr) {
 +            return;
@@ -153,23 +200,48 @@ index ca91449d2..4a03ee9d2 100644
 +        pad_control_vector(default_cvec);
 +    }
 +
-+    bool restore_default_control_vector() {
-+        if (default_cvec.n_embd > 0 && !default_cvec.data.empty()) {
++    bool apply_control_vector(const common_control_vector_data & cvec, int32_t layer_start, int32_t layer_end) {
++        if (cvec.n_embd > 0 && !cvec.data.empty()) {
 +            return llama_set_adapter_cvec(
 +                ctx_tgt,
-+                default_cvec.data.data(),
-+                default_cvec.data.size(),
-+                default_cvec.n_embd,
-+                default_cvec_layer_start,
-+                default_cvec_layer_end) == 0;
++                cvec.data.data(),
++                cvec.data.size(),
++                cvec.n_embd,
++                layer_start,
++                layer_end) == 0;
 +        }
 +
 +        return llama_set_adapter_cvec(ctx_tgt, nullptr, 0, 0, -1, -1) == 0;
 +    }
 +
++    bool restore_default_control_vector() {
++        if (default_cvec.n_embd > 0 && !default_cvec.data.empty()) {
++            return apply_control_vector(default_cvec, default_cvec_layer_start, default_cvec_layer_end);
++        }
++
++        return apply_control_vector({ -1, {} }, -1, -1);
++    }
++
++    bool restore_effective_control_vector() {
++        if (global_cvec_enabled) {
++            return apply_control_vector(global_cvec, global_cvec_layer_start, global_cvec_layer_end);
++        }
++
++        return restore_default_control_vector();
++    }
++
 +    bool any_slot_processing() const {
 +        for (const auto & slot : slots) {
 +            if (slot.is_processing()) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    bool any_glass_trace_processing() const {
++        for (const auto & slot : slots) {
++            if (slot.is_processing() && slot.task && slot.task->type == SERVER_TASK_TYPE_GLASS_TRACE) {
 +                return true;
 +            }
 +        }
@@ -231,63 +303,259 @@ index ca91449d2..4a03ee9d2 100644
 +            return;
 +        }
 +
-+        if (!restore_default_control_vector()) {
-+            SRV_ERR("failed to restore default control vector after task %d\n", id_task);
++        if (!restore_effective_control_vector()) {
++            SRV_ERR("failed to restore effective control vector after task %d\n", id_task);
 +        } else {
-+            SRV_INF("restored default control vector after task %d\n", id_task);
++            SRV_INF("restored effective control vector after task %d\n", id_task);
 +        }
 +
 +        active_request_steering = false;
 +        active_request_steering_task = -1;
 +    }
 +
++    bool load_and_apply_global_steering(const task_params::request_steering_params & steering, std::string & error) {
++        const int32_t n_layer = llama_model_n_layer(model_tgt);
++        int32_t layer_start = steering.layer_start <= 0 ? 1 : steering.layer_start;
++        int32_t layer_end   = steering.layer_end   <= 0 ? n_layer : steering.layer_end;
++
++        if (layer_start < 1 || layer_end < layer_start || layer_end > n_layer) {
++            error = string_format(
++                "invalid glass_skull.steering layer range [%d, %d]; llama.cpp control vectors use 1-based layers in [1, %d]",
++                layer_start,
++                layer_end,
++                n_layer);
++            return false;
++        }
++
++        if (steering.control_vector.empty()) {
++            error = "glass_skull.steering.control_vector is required";
++            return false;
++        }
++
++        if (!std::filesystem::exists(steering.control_vector)) {
++            error = "glass_skull.steering.control_vector does not exist: " + steering.control_vector;
++            return false;
++        }
++
++        common_control_vector_data cvec = common_control_vector_load({{ steering.strength, steering.control_vector }});
++        if (cvec.n_embd == -1 || cvec.data.empty()) {
++            error = "failed to load glass_skull.steering.control_vector: " + steering.control_vector;
++            return false;
++        }
++
++        pad_control_vector(cvec);
++        if (!apply_control_vector(cvec, layer_start, layer_end)) {
++            error = "failed to apply glass_skull.steering.control_vector; vector width may not match the model embedding width";
++            return false;
++        }
++
++        global_cvec = std::move(cvec);
++        global_cvec_path = steering.control_vector;
++        global_cvec_strength = steering.strength;
++        global_cvec_layer_start = layer_start;
++        global_cvec_layer_end = layer_end;
++        global_cvec_enabled = true;
++        return true;
++    }
++
++    bool clear_global_steering(std::string & error) {
++        global_cvec = { -1, {} };
++        global_cvec_path.clear();
++        global_cvec_strength = 1.0f;
++        global_cvec_layer_start = -1;
++        global_cvec_layer_end = -1;
++        global_cvec_enabled = false;
++
++        if (!restore_default_control_vector()) {
++            error = "failed to restore startup/default control vector after clearing global Glass Skull steering";
++            return false;
++        }
++        return true;
++    }
++
++    json glass_steering_state_json() const {
++        return json {
++            {"object", "glass_skull.steering"},
++            {"enabled", global_cvec_enabled},
++            {"control_vector", global_cvec_enabled ? json(global_cvec_path) : json(nullptr)},
++            {"strength", global_cvec_enabled ? json(global_cvec_strength) : json(nullptr)},
++            {"layer_start", global_cvec_enabled ? json(global_cvec_layer_start) : json(nullptr)},
++            {"layer_end", global_cvec_enabled ? json(global_cvec_layer_end) : json(nullptr)},
++            {"startup_control_vector", {
++                {"configured", default_cvec.n_embd > 0 && !default_cvec.data.empty()},
++                {"layer_start", default_cvec_layer_start},
++                {"layer_end", default_cvec_layer_end},
++            }},
++            {"request_steering_active", active_request_steering},
++        };
++    }
++
++    bool begin_glass_trace(const server_task & task, std::string & error) {
++        if (task.params.glass_trace.layers.empty()) {
++            error = "glass_skull.trace.layers must contain at least one layer";
++            return false;
++        }
++
++        const int32_t n_layer = llama_model_n_layer(model_tgt);
++        active_glass_trace_layers.clear();
++        for (int32_t layer : task.params.glass_trace.layers) {
++            if (layer < 0 || layer >= n_layer) {
++                error = string_format("glass_skull.trace layer %d is out of range [0, %d)", layer, n_layer);
++                active_glass_trace_layers.clear();
++                return false;
++            }
++            if (std::find(active_glass_trace_layers.begin(), active_glass_trace_layers.end(), layer) == active_glass_trace_layers.end()) {
++                active_glass_trace_layers.push_back(layer);
++            }
++        }
++
++        for (int32_t layer : active_glass_trace_layers) {
++            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) layer, true);
++        }
++
++        active_glass_trace = true;
++        active_glass_trace_task = task.id;
++        return true;
++    }
++
++    void finish_glass_trace(int id_task) {
++        if (!active_glass_trace || active_glass_trace_task != id_task) {
++            return;
++        }
++
++        for (int32_t layer : active_glass_trace_layers) {
++            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) layer, false);
++        }
++        active_glass_trace_layers.clear();
++        active_glass_trace = false;
++        active_glass_trace_task = -1;
++    }
++
++    static std::vector<std::pair<int32_t, float>> glass_trace_top_dims(const float * data, int32_t n_embd, int32_t top_k) {
++        std::vector<std::pair<int32_t, float>> dims;
++        dims.reserve(n_embd);
++        for (int32_t i = 0; i < n_embd; ++i) {
++            dims.push_back({ i, data[i] });
++        }
++
++        const int32_t n = std::max<int32_t>(0, std::min<int32_t>(top_k, n_embd));
++        auto by_abs = [](const auto & a, const auto & b) {
++            return std::fabs(a.second) > std::fabs(b.second);
++        };
++        if (n < n_embd) {
++            std::partial_sort(dims.begin(), dims.begin() + n, dims.end(), by_abs);
++            dims.resize(n);
++        } else {
++            std::sort(dims.begin(), dims.end(), by_abs);
++        }
++        return dims;
++    }
++
++    void collect_glass_trace_rows(server_slot & slot, const llama_batch & batch_view) {
++        if (!slot.task || slot.task->type != SERVER_TASK_TYPE_GLASS_TRACE) {
++            return;
++        }
++
++        const int32_t n_embd = llama_model_n_embd(model_tgt);
++        for (int32_t layer : slot.task->params.glass_trace.layers) {
++            const float * layer_inp = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) layer);
++            if (layer_inp == nullptr) {
++                continue;
++            }
++
++            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
++                if (batch_view.n_seq_id[i] < 1 || batch_view.seq_id[i][0] != slot.id) {
++                    continue;
++                }
++                const int32_t token_index = batch_view.pos[i];
++                if (token_index < 0 || token_index >= slot.task->n_tokens()) {
++                    continue;
++                }
++
++                const float * row = layer_inp + (size_t) i * n_embd;
++                double sum_sq = 0.0;
++                for (int32_t j = 0; j < n_embd; ++j) {
++                    sum_sq += (double) row[j] * (double) row[j];
++                }
++
++                glass_trace_layer_input item;
++                item.layer = layer;
++                item.stream = "resid_pre";
++                item.token_index = token_index;
++                item.token = batch_view.token[i];
++                item.norm = (float) std::sqrt(sum_sq);
++                item.top_dims = glass_trace_top_dims(row, n_embd, slot.task->params.glass_trace.top_k);
++                if (slot.task->params.glass_trace.include_vectors) {
++                    item.vector.assign(row, row + n_embd);
++                }
++                slot.glass_trace_rows.push_back(std::move(item));
++            }
++        }
++    }
++
      void handle_sleeping_state(bool new_state) {
          GGML_ASSERT(sleeping != new_state);
          if (new_state) {
-@@ -1164,6 +1329,8 @@ private:
+@@ -1164,6 +1559,8 @@ private:
              return false;
          }
- 
+
 +        load_default_control_vector_state();
 +
          vocab = llama_model_get_vocab(model_tgt);
- 
+
          n_ctx = llama_n_ctx(ctx_tgt);
-@@ -1356,8 +1523,11 @@ private:
- 
+@@ -1356,8 +1753,14 @@ private:
+
              SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
- 
+
 -            slot.callback_on_release = [this](int id_slot) {
-+            slot.callback_on_release = [this](int id_slot, bool was_steered, int id_task) {
++            slot.callback_on_release = [this](int id_slot, bool was_steered, bool was_glass_trace, int id_task) {
                  queue_tasks.pop_deferred_task(id_slot);
 +                if (was_steered) {
 +                    finish_request_steering(id_task);
 +                }
++                if (was_glass_trace) {
++                    finish_glass_trace(id_task);
++                }
              };
- 
+
              slot.reset();
-@@ -1574,7 +1744,7 @@ private:
+@@ -1574,7 +1977,7 @@ private:
          }
- 
+
          // find the slot that has at least n% prompt similarity
 -        if (slot_prompt_similarity != 0.0f) {
 +        if (!task.params.steering.enabled && slot_prompt_similarity != 0.0f) {
              float sim_best = 0;
- 
+
              for (server_slot & slot : slots) {
-@@ -1645,7 +1815,7 @@ private:
+@@ -1645,7 +2048,7 @@ private:
          }
- 
+
          if (ret) {
 -            update_cache = update_cache && prompt_cache;
 +            update_cache = update_cache && prompt_cache && !task.params.steering.enabled;
- 
+
              // cache prompts only for completion tasks
              update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
-@@ -1786,6 +1956,21 @@ private:
+@@ -1786,6 +2189,34 @@ private:
              return false;
          }
- 
+
++        if (task.type == SERVER_TASK_TYPE_GLASS_TRACE) {
++            task.params.cache_prompt = false;
++            task.params.n_cache_reuse = 0;
++            slot.prompt_clear(false);
++
++            std::string error;
++            if (!begin_glass_trace(task, error)) {
++                send_error(task, error, ERROR_TYPE_INVALID_REQUEST);
++                finish_glass_trace(task.id);
++                return false;
++            }
++        }
++
 +        if (task.params.steering.enabled) {
 +            task.params.cache_prompt = false;
 +            task.params.n_cache_reuse = 0;
@@ -296,7 +564,7 @@ index ca91449d2..4a03ee9d2 100644
 +            std::string error;
 +            if (!begin_request_steering(task, error)) {
 +                send_error(task, error, ERROR_TYPE_INVALID_REQUEST);
-+                restore_default_control_vector();
++                restore_effective_control_vector();
 +                active_request_steering = false;
 +                active_request_steering_task = -1;
 +                return false;
@@ -304,14 +572,55 @@ index ca91449d2..4a03ee9d2 100644
 +        }
 +
          SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
- 
+
          // initialize samplers
-@@ -2367,6 +2552,23 @@ private:
- 
+@@ -2209,6 +2640,20 @@ private:
+         queue_results.send(std::move(res));
+     }
+
++    void send_glass_trace(const server_slot & slot) {
++        auto res = std::make_unique<server_task_result_glass_trace>();
++        res->id = slot.task->id;
++        res->index = slot.task->index;
++        res->layer_inputs = slot.glass_trace_rows;
++        res->n_embd = llama_model_n_embd(model_tgt);
++        res->top_k = slot.task->params.glass_trace.top_k;
++        res->include_vectors = slot.task->params.glass_trace.include_vectors;
++
++        SLT_DBG(slot, "%s", "sending Glass Skull trace\n");
++
++        queue_results.send(std::move(res));
++    }
++
+     void send_rerank(const server_slot & slot, const llama_batch & batch) {
+         auto res = std::make_unique<server_task_result_rerank>();
+         res->id       = slot.task->id;
+@@ -2356,6 +2801,7 @@ private:
+             case SERVER_TASK_TYPE_INFILL:
+             case SERVER_TASK_TYPE_EMBEDDING:
+             case SERVER_TASK_TYPE_RERANK:
++            case SERVER_TASK_TYPE_GLASS_TRACE:
+                 {
+                     // special case: if input is provided via CLI, tokenize it first
+                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
+@@ -2367,6 +2813,35 @@ private:
+
                      const int id_task = task.id;
- 
+
 +                    if (active_request_steering && !task.params.steering.enabled) {
 +                        SRV_DBG("per-request steering is active, defer unsteered task, id_task = %d\n", id_task);
++                        queue_tasks.defer(std::move(task));
++                        break;
++                    }
++
++                    if (active_glass_trace && task.type != SERVER_TASK_TYPE_GLASS_TRACE) {
++                        SRV_DBG("Glass Skull trace is active, defer task, id_task = %d\n", id_task);
++                        queue_tasks.defer(std::move(task));
++                        break;
++                    }
++
++                    if (task.type == SERVER_TASK_TYPE_GLASS_TRACE && (active_request_steering || active_glass_trace || any_slot_processing())) {
++                        SRV_DBG("Glass Skull trace requires exclusive execution, defer task, id_task = %d\n", id_task);
 +                        queue_tasks.defer(std::move(task));
 +                        break;
 +                    }
@@ -328,10 +637,84 @@ index ca91449d2..4a03ee9d2 100644
 +                    }
 +
                      server_slot * slot = get_available_slot(task);
- 
+
                      //
-@@ -3995,8 +4197,13 @@ server_context_meta server_context::get_meta() const {
- 
+@@ -2423,6 +2898,51 @@ private:
+                         }
+                     }
+                 } break;
++            case SERVER_TASK_TYPE_GLASS_STEERING_GET:
++                {
++                    auto res = std::make_unique<server_task_result_json>();
++                    res->id = task.id;
++                    res->data = glass_steering_state_json();
++                    queue_results.send(std::move(res));
++                } break;
++            case SERVER_TASK_TYPE_GLASS_STEERING_SET:
++                {
++                    if (active_request_steering || active_glass_trace || any_slot_processing()) {
++                        SRV_DBG("global Glass Skull steering change requires idle server, defer task, id_task = %d\n", task.id);
++                        queue_tasks.defer(std::move(task));
++                        break;
++                    }
++
++                    std::string error;
++                    if (!load_and_apply_global_steering(task.glass_steering, error)) {
++                        send_error(task, error, ERROR_TYPE_INVALID_REQUEST);
++                        break;
++                    }
++
++                    auto res = std::make_unique<server_task_result_json>();
++                    res->id = task.id;
++                    res->data = glass_steering_state_json();
++                    queue_results.send(std::move(res));
++                } break;
++            case SERVER_TASK_TYPE_GLASS_STEERING_CLEAR:
++                {
++                    if (active_request_steering || active_glass_trace || any_slot_processing()) {
++                        SRV_DBG("global Glass Skull steering clear requires idle server, defer task, id_task = %d\n", task.id);
++                        queue_tasks.defer(std::move(task));
++                        break;
++                    }
++
++                    std::string error;
++                    if (!clear_global_steering(error)) {
++                        send_error(task, error, ERROR_TYPE_SERVER);
++                        break;
++                    }
++
++                    auto res = std::make_unique<server_task_result_json>();
++                    res->id = task.id;
++                    res->data = glass_steering_state_json();
++                    queue_results.send(std::move(res));
++                } break;
+             case SERVER_TASK_TYPE_CANCEL:
+                 {
+                     // release slot linked with the task id
+@@ -3707,6 +4227,7 @@ private:
+                 if (slot.task->params.stream && slot.task->params.return_progress) {
+                     send_partial_response(slot, {}, true);
+                 }
++                collect_glass_trace_rows(slot, batch_view);
+             }
+
+             if (!is_inside_view(slot.i_batch)) {
+@@ -3730,6 +4251,13 @@ private:
+                     return;
+                 }
+
++                if (slot.task->type == SERVER_TASK_TYPE_GLASS_TRACE) {
++                    send_glass_trace(slot);
++                    slot.release();
++                    slot.i_batch = -1;
++                    return;
++                }
++
+                 GGML_ASSERT(slot.task->need_sampling());
+
+                 // prompt evaluated for next-token prediction
+@@ -3995,8 +4523,13 @@ server_context_meta server_context::get_meta() const {
+
          /* model_vocab_type       */ llama_vocab_type(impl->vocab),
          /* model_vocab_n_tokens   */ llama_vocab_n_tokens(impl->vocab),
 +        /* model_architecture     */ server_model_meta_val_str(impl->model_tgt, "general.architecture"),
@@ -344,10 +727,10 @@ index ca91449d2..4a03ee9d2 100644
          /* model_n_params         */ llama_model_n_params(impl->model_tgt),
          /* model_size             */ llama_model_size(impl->model_tgt),
      };
-@@ -4311,6 +4518,107 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
+@@ -4311,6 +4844,118 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
      init_routes();
  }
- 
+
 +static json format_response_glass_skull_capabilities(const server_context_meta & meta, const common_params & params) {
 +    return json {
 +        {"completion", true},
@@ -368,8 +751,14 @@ index ca91449d2..4a03ee9d2 100644
 +                {"reason", "not exposed by this conservative endpoint; use completion APIs with logprobs for generated-token probabilities"},
 +            }},
 +            {"activations", {
-+                {"supported", false},
-+                {"reason", "llama.cpp server does not expose stable per-layer activation capture through this endpoint"},
++                {"supported", true},
++                {"streams", {"resid_pre"}},
++                {"vectors", true},
++            }},
++            {"layer_inputs", {
++                {"supported", true},
++                {"streams", {"resid_pre"}},
++                {"vectors", true},
 +            }},
 +        }},
 +        {"steering", {
@@ -396,6 +785,11 @@ index ca91449d2..4a03ee9d2 100644
 +                {"configured", !params.control_vectors.empty()},
 +                {"layer_start", params.control_vector_layer_start},
 +                {"layer_end", params.control_vector_layer_end},
++            }},
++            {"global_control_vector", {
++                {"supported", true},
++                {"endpoint", "/glass-skull/steering"},
++                {"layer_range", "1-based inclusive"},
 +            }},
 +        }},
 +    };
@@ -452,10 +846,10 @@ index ca91449d2..4a03ee9d2 100644
  void server_routes::init_routes() {
      // IMPORTANT: all lambda functions must start with create_response()
      // this is to ensure that the server_res_generator can handle sleeping case correctly
-@@ -4857,6 +5165,98 @@ void server_routes::init_routes() {
+@@ -4857,6 +5502,281 @@ void server_routes::init_routes() {
          return res;
      };
- 
+
 +    this->get_glass_skull_info = [this](const server_http_req &) {
 +        auto res = create_response(true);
 +
@@ -465,6 +859,91 @@ index ca91449d2..4a03ee9d2 100644
 +        GGML_UNUSED(ctx_server);
 +
 +        res->ok(format_response_glass_skull_info(*meta, params));
++        return res;
++    };
++
++    this->get_glass_skull_steering = [this](const server_http_req & req) {
++        auto res = create_response();
++        auto & rd = res->rd;
++        {
++            server_task task(SERVER_TASK_TYPE_GLASS_STEERING_GET);
++            task.id = rd.get_new_id();
++            rd.post_task(std::move(task));
++        }
++
++        auto result = rd.next(req.should_stop);
++        if (!result) {
++            GGML_ASSERT(req.should_stop());
++            return res;
++        }
++        if (result->is_error()) {
++            res->error(result->to_json());
++            return res;
++        }
++        res->ok(result->to_json());
++        return res;
++    };
++
++    this->post_glass_skull_steering = [this](const server_http_req & req) {
++        auto res = create_response();
++        const json body = json::parse(req.body);
++
++        if (!body.contains("control_vector") || !body.at("control_vector").is_string() || body.at("control_vector").get<std::string>().empty()) {
++            res->error(format_error_response("\"control_vector\" must be a non-empty string", ERROR_TYPE_INVALID_REQUEST));
++            return res;
++        }
++
++        const int32_t layer_start = json_value(body, "layer_start", -1);
++        const int32_t layer_end = json_value(body, "layer_end", -1);
++        if ((layer_start <= 0) != (layer_end <= 0)) {
++            res->error(format_error_response("\"layer_start\" and \"layer_end\" must be provided together", ERROR_TYPE_INVALID_REQUEST));
++            return res;
++        }
++
++        auto & rd = res->rd;
++        {
++            server_task task(SERVER_TASK_TYPE_GLASS_STEERING_SET);
++            task.id = rd.get_new_id();
++            task.glass_steering.enabled = true;
++            task.glass_steering.control_vector = body.at("control_vector").get<std::string>();
++            task.glass_steering.strength = json_value(body, "strength", 1.0f);
++            task.glass_steering.layer_start = layer_start;
++            task.glass_steering.layer_end = layer_end;
++            rd.post_task(std::move(task));
++        }
++
++        auto result = rd.next(req.should_stop);
++        if (!result) {
++            GGML_ASSERT(req.should_stop());
++            return res;
++        }
++        if (result->is_error()) {
++            res->error(result->to_json());
++            return res;
++        }
++        res->ok(result->to_json());
++        return res;
++    };
++
++    this->delete_glass_skull_steering = [this](const server_http_req & req) {
++        auto res = create_response();
++        auto & rd = res->rd;
++        {
++            server_task task(SERVER_TASK_TYPE_GLASS_STEERING_CLEAR);
++            task.id = rd.get_new_id();
++            rd.post_task(std::move(task));
++        }
++
++        auto result = rd.next(req.should_stop);
++        if (!result) {
++            GGML_ASSERT(req.should_stop());
++            return res;
++        }
++        if (result->is_error()) {
++            res->error(result->to_json());
++            return res;
++        }
++        res->ok(result->to_json());
 +        return res;
 +    };
 +
@@ -482,6 +961,52 @@ index ca91449d2..4a03ee9d2 100644
 +            const bool add_special   = json_value(body, "add_special", true);
 +            const bool parse_special = json_value(body, "parse_special", true);
 +            const bool with_pieces   = json_value(body, "with_pieces", false);
++            const int32_t top_k      = std::max(0, json_value(body, "top_k", 8));
++            const bool include_vectors = json_value(body, "include_vectors", true);
++
++            bool capture_layer_inputs = body.contains("layers");
++            if (body.contains("capture")) {
++                if (!body.at("capture").is_object()) {
++                    res->error(format_error_response("\"capture\" must be an object", ERROR_TYPE_INVALID_REQUEST));
++                    return res;
++                }
++                capture_layer_inputs = capture_layer_inputs || json_value(body.at("capture"), "layer_inputs", false);
++            }
++
++            if (body.contains("streams")) {
++                if (!body.at("streams").is_array()) {
++                    res->error(format_error_response("\"streams\" must be an array", ERROR_TYPE_INVALID_REQUEST));
++                    return res;
++                }
++                for (const auto & stream : body.at("streams")) {
++                    if (!stream.is_string() || stream.get<std::string>() != "resid_pre") {
++                        res->error(format_error_response("glass-skull trace streams only supports \"resid_pre\"", ERROR_TYPE_INVALID_REQUEST));
++                        return res;
++                    }
++                }
++            }
++
++            std::vector<int32_t> layers;
++            if (capture_layer_inputs) {
++                if (!body.contains("layers") || !body.at("layers").is_array() || body.at("layers").empty()) {
++                    res->error(format_error_response("\"layers\" must be a non-empty array when layer input capture is requested", ERROR_TYPE_INVALID_REQUEST));
++                    return res;
++                }
++                for (const auto & layer : body.at("layers")) {
++                    if (!layer.is_number_integer()) {
++                        res->error(format_error_response("\"layers\" must contain integer layer indexes", ERROR_TYPE_INVALID_REQUEST));
++                        return res;
++                    }
++                    const int32_t layer_idx = layer.get<int32_t>();
++                    if (layer_idx < 0 || layer_idx >= meta->model_n_layer) {
++                        res->error(format_error_response(
++                            string_format("layer index %d is out of range [0, %d)", layer_idx, meta->model_n_layer),
++                            ERROR_TYPE_INVALID_REQUEST));
++                        return res;
++                    }
++                    layers.push_back(layer_idx);
++                }
++            }
 +
 +            std::vector<server_tokens> tokenized_prompts =
 +                tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, add_special, parse_special);
@@ -536,10 +1061,62 @@ index ca91449d2..4a03ee9d2 100644
 +                }},
 +                {"activations", {
 +                    {"supported", false},
-+                    {"reason", "not exposed; this endpoint does not install eval callbacks or fabricate intermediate tensors"},
++                    {"reason", capture_layer_inputs
++                        ? "layer input capture was requested but not run"
++                        : "not requested; pass layers and streams=[\"resid_pre\"] to capture layer inputs"},
 +                }},
 +                {"capabilities", format_response_glass_skull_capabilities(*meta, params)},
 +            };
++
++            if (capture_layer_inputs) {
++                if (contains_media) {
++                    response["activations"] = {
++                        {"supported", false},
++                        {"reason", "layer input capture supports text prompt tokens only; multimodal positions were present"},
++                    };
++                    res->ok(response);
++                    return res;
++                }
++
++                auto & rd = res->rd;
++                {
++                    std::vector<server_task> tasks;
++                    for (size_t i = 0; i < tokenized_prompts.size(); i++) {
++                        server_task task(SERVER_TASK_TYPE_GLASS_TRACE);
++                        task.id = rd.get_new_id();
++                        task.index = i;
++                        task.tokens = std::move(tokenized_prompts[i]);
++                        task.params.glass_trace.layers = layers;
++                        task.params.glass_trace.top_k = top_k;
++                        task.params.glass_trace.include_vectors = include_vectors;
++                        task.params.cache_prompt = false;
++                        task.params.n_cache_reuse = 0;
++                        tasks.push_back(std::move(task));
++                    }
++                    rd.post_tasks(std::move(tasks));
++                }
++
++                auto all_results = rd.wait_for_all(req.should_stop);
++                if (all_results.is_terminated) {
++                    return res;
++                }
++                if (all_results.error) {
++                    res->error(all_results.error->to_json());
++                    return res;
++                }
++
++                json layer_inputs = json::array();
++                for (auto & task_res : all_results.results) {
++                    GGML_ASSERT(dynamic_cast<server_task_result_glass_trace*>(task_res.get()) != nullptr);
++                    json trace_result = task_res->to_json();
++                    for (auto & row : trace_result.at("layer_inputs")) {
++                        row["prompt_index"] = task_res->index;
++                        layer_inputs.push_back(std::move(row));
++                    }
++                    response["activations"] = trace_result.at("activations");
++                }
++                response["layer_inputs"] = std::move(layer_inputs);
++            }
 +
 +            res->ok(response);
 +        } catch (const std::exception & e) {
@@ -551,7 +1128,7 @@ index ca91449d2..4a03ee9d2 100644
      this->post_tokenize = [this](const server_http_req & req) {
          auto res = create_response();
          const json body = json::parse(req.body);
-@@ -5074,9 +5474,14 @@ json server_routes::get_model_info() const {
+@@ -5074,9 +5994,14 @@ json server_routes::get_model_info() const {
          {"meta",     {
              {"vocab_type",  meta->model_vocab_type},
              {"n_vocab",     meta->model_vocab_n_tokens},
@@ -567,7 +1144,7 @@ index ca91449d2..4a03ee9d2 100644
              {"size",        meta->model_size},
          }},
 diff --git a/tools/server/server-context.h b/tools/server/server-context.h
-index 952f825f7..a9edd0b48 100644
+index 952f825f7..f6123789c 100644
 --- a/tools/server/server-context.h
 +++ b/tools/server/server-context.h
 @@ -46,8 +46,13 @@ struct server_context_meta {
@@ -584,23 +1161,60 @@ index 952f825f7..a9edd0b48 100644
      uint64_t model_n_params;
      uint64_t model_size;
  };
-@@ -145,6 +150,8 @@ struct server_routes {
+@@ -145,6 +150,11 @@ struct server_routes {
      server_http_context::handler_t post_anthropic_count_tokens;
      server_http_context::handler_t post_apply_template;
      server_http_context::handler_t get_models;
 +    server_http_context::handler_t get_glass_skull_info;
 +    server_http_context::handler_t post_glass_skull_trace;
++    server_http_context::handler_t get_glass_skull_steering;
++    server_http_context::handler_t post_glass_skull_steering;
++    server_http_context::handler_t delete_glass_skull_steering;
      server_http_context::handler_t post_tokenize;
      server_http_context::handler_t post_detokenize;
      server_http_context::handler_t post_embeddings;
+diff --git a/tools/server/server-models.cpp b/tools/server/server-models.cpp
+index a87e4e423..661502c97 100644
+--- a/tools/server/server-models.cpp
++++ b/tools/server/server-models.cpp
+@@ -1630,6 +1630,17 @@ void server_models_routes::init_routes() {
+         return models.proxy_request(req, method, name, true); // update last usage for POST request only
+     };
+
++    this->proxy_delete = [this](const server_http_req & req) {
++        std::string method = "DELETE";
++        std::string name = req.get_param("model");
++        bool autoload = is_autoload(params, req);
++        auto error_res = std::make_unique<server_http_res>();
++        if (!router_validate_model(name, models, autoload, error_res)) {
++            return error_res;
++        }
++        return models.proxy_request(req, method, name, true);
++    };
++
+     this->post_router_models_load = [this](const server_http_req & req) {
+         auto res = std::make_unique<server_http_res>();
+         json body = json::parse(req.body);
+diff --git a/tools/server/server-models.h b/tools/server/server-models.h
+index 9ed4aeead..41f275c71 100644
+--- a/tools/server/server-models.h
++++ b/tools/server/server-models.h
+@@ -261,6 +261,7 @@ struct server_models_routes {
+     server_http_context::handler_t get_router_props;
+     server_http_context::handler_t proxy_get;
+     server_http_context::handler_t proxy_post;
++    server_http_context::handler_t proxy_delete;
+     server_http_context::handler_t get_router_models;
+     server_http_context::handler_t post_router_models_load;
+     server_http_context::handler_t post_router_models_unload;
 diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
 index ed4bda241..d5a7f5720 100644
 --- a/tools/server/server-schema.cpp
 +++ b/tools/server/server-schema.cpp
 @@ -4,6 +4,63 @@
- 
+
  namespace server_schema {
- 
+
 +static const json * find_glass_skull_steering(const json & data) {
 +    if (data.contains("glass_skull") && data.at("glass_skull").is_object()) {
 +        const json & glass = data.at("glass_skull");
@@ -664,7 +1278,7 @@ index ed4bda241..d5a7f5720 100644
 @@ -522,8 +579,14 @@ task_params eval_llama_cmpl_schema(
          f->eval(ctx, data);
      }
- 
+
 +    parse_glass_skull_steering(params, data);
 +
      // post-processing
@@ -677,19 +1291,28 @@ index ed4bda241..d5a7f5720 100644
              // note: should be the slot's context and not the full context, but it's ok
              params.sampling.penalty_last_n = n_ctx_slot;
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index a9ebac013..07b7e8bb3 100644
+index a9ebac013..f86fdeaff 100644
 --- a/tools/server/server-task.cpp
 +++ b/tools/server/server-task.cpp
-@@ -40,7 +40,7 @@ json task_params::to_json(bool only_metrics) const {
+@@ -10,6 +10,8 @@
+ #include "speculative.h"
+ #include "server-common.h"
+
++#include <cmath>
++
+ using json = nlohmann::ordered_json;
+
+ //
+@@ -40,7 +42,7 @@ json task_params::to_json(bool only_metrics) const {
      }
- 
+
      if (only_metrics) {
 -        return json {
 +        json res = {
              {"seed",                      sampling.seed},
              {"temperature",               sampling.temp},
              {"dynatemp_range",            sampling.dynatemp_range},
-@@ -82,6 +82,15 @@ json task_params::to_json(bool only_metrics) const {
+@@ -82,6 +84,15 @@ json task_params::to_json(bool only_metrics) const {
              {"backend_sampling",          sampling.backend_sampling},
              {"lora",                      lora},
          };
@@ -703,18 +1326,18 @@ index a9ebac013..07b7e8bb3 100644
 +        }
 +        return res;
      }
- 
+
      auto grammar_triggers = json::array();
-@@ -90,7 +99,7 @@ json task_params::to_json(bool only_metrics) const {
+@@ -90,7 +101,7 @@ json task_params::to_json(bool only_metrics) const {
          grammar_triggers.push_back(ct.to_json());
      }
- 
+
 -    return json {
 +    json res = {
          {"seed",                      sampling.seed},
          {"temperature",               sampling.temp},
          {"dynatemp_range",            sampling.dynatemp_range},
-@@ -139,6 +148,17 @@ json task_params::to_json(bool only_metrics) const {
+@@ -139,6 +150,17 @@ json task_params::to_json(bool only_metrics) const {
          {"backend_sampling",          sampling.backend_sampling},
          {"lora",                      lora},
      };
@@ -730,16 +1353,84 @@ index a9ebac013..07b7e8bb3 100644
 +    }
 +    return res;
  }
- 
+
+ //
+@@ -1487,6 +1509,47 @@ json server_task_result_rerank::to_json() {
+     };
+ }
+
++//
++// server_task_result_glass_trace
++//
++json server_task_result_glass_trace::to_json() {
++    json rows = json::array();
++    for (const auto & row : layer_inputs) {
++        json top_dims = json::array();
++        for (const auto & dim : row.top_dims) {
++            top_dims.push_back({
++                {"dimension", dim.first},
++                {"activation", dim.second},
++                {"abs_activation", std::abs(dim.second)},
++            });
++        }
++
++        json item = {
++            {"layer", row.layer},
++            {"stream", row.stream},
++            {"token_index", row.token_index},
++            {"token", row.token},
++            {"norm", row.norm},
++            {"activation_norm", row.norm},
++            {"top_dims", std::move(top_dims)},
++        };
++        if (include_vectors) {
++            item["vector"] = row.vector;
++        }
++        rows.push_back(std::move(item));
++    }
++
++    return json {
++        {"layer_inputs", std::move(rows)},
++        {"activations", {
++            {"supported", true},
++            {"streams", {"resid_pre"}},
++            {"vectors", include_vectors},
++            {"n_embd", n_embd},
++        }},
++    };
++}
++
+ //
+ // server_task_result_error
  //
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 293bdf053..4b9ae3ab0 100644
+index 293bdf053..e64cbb222 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
-@@ -67,6 +67,15 @@ struct task_params {
- 
+@@ -7,6 +7,8 @@
+ #include <unordered_set>
+ #include <list>
+ #include <map>
++#include <utility>
++#include <vector>
+
+ // TODO: prevent including the whole server-common.h as we only use server_tokens
+ #include "server-common.h"
+@@ -27,6 +29,10 @@ enum server_task_type {
+     SERVER_TASK_TYPE_SLOT_ERASE,
+     SERVER_TASK_TYPE_GET_LORA,
+     SERVER_TASK_TYPE_SET_LORA,
++    SERVER_TASK_TYPE_GLASS_TRACE,
++    SERVER_TASK_TYPE_GLASS_STEERING_GET,
++    SERVER_TASK_TYPE_GLASS_STEERING_SET,
++    SERVER_TASK_TYPE_GLASS_STEERING_CLEAR,
+ };
+
+ // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
+@@ -67,6 +73,22 @@ struct task_params {
+
      std::map<int, float> lora; // mapping adapter ID -> scale
- 
+
 +    struct request_steering_params {
 +        bool enabled = false;
 +        std::string control_vector;
@@ -749,39 +1440,210 @@ index 293bdf053..4b9ae3ab0 100644
 +    };
 +    request_steering_params steering;
 +
++    struct glass_trace_params {
++        std::vector<int32_t> layers;
++        int32_t top_k = 8;
++        bool include_vectors = true;
++    };
++    glass_trace_params glass_trace;
++
      std::vector<std::string> antiprompt;
      std::vector<std::string> response_fields;
- 
-@@ -238,6 +247,10 @@ struct server_task {
+
+@@ -172,6 +194,8 @@ struct server_task {
+     // used by SERVER_TASK_TYPE_SET_LORA
+     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
++    task_params::request_steering_params glass_steering;
++
+     server_task() = default;
+
+     server_task(server_task_type type) : type(type) {}
+@@ -238,6 +262,10 @@ struct server_task {
              copy.params.sampling.seed += (uint32_t)child_tasks.size() + 1;
          }
- 
+
 +        // cvec state is context-global in llama.cpp. Keep per-request steering
 +        // single-output until the scheduler has independent per-slot cvec state.
 +        copy.params.steering.enabled = false;
 +
          child_tasks.push_back(std::move(copy));
      }
- 
+
+@@ -490,6 +518,25 @@ struct server_task_result_rerank : server_task_result {
+     virtual json to_json() override;
+ };
+
++struct glass_trace_layer_input {
++    int32_t layer = -1;
++    std::string stream;
++    int32_t token_index = -1;
++    llama_token token = LLAMA_TOKEN_NULL;
++    float norm = 0.0f;
++    std::vector<std::pair<int32_t, float>> top_dims;
++    std::vector<float> vector;
++};
++
++struct server_task_result_glass_trace : server_task_result {
++    std::vector<glass_trace_layer_input> layer_inputs;
++    int32_t n_embd = 0;
++    int32_t top_k = 8;
++    bool include_vectors = true;
++
++    virtual json to_json() override;
++};
++
+ struct server_task_result_error : server_task_result {
+     error_type err_type = ERROR_TYPE_SERVER;
+     std::string err_msg;
+@@ -565,6 +612,14 @@ struct server_task_result_control : server_task_result {
+     }
+ };
+
++struct server_task_result_json : server_task_result {
++    json data;
++
++    virtual json to_json() override {
++        return data;
++    }
++};
++
+ struct server_task_result_get_lora : server_task_result {
+     struct lora {
+         common_adapter_lora_info info;
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
-index dd4b1c507..7804f5682 100644
+index dd4b1c507..b04d8ccdf 100644
 --- a/tools/server/server.cpp
 +++ b/tools/server/server.cpp
-@@ -169,6 +169,8 @@ int llama_server(int argc, char ** argv) {
+@@ -169,6 +169,11 @@ int llama_server(int argc, char ** argv) {
          routes.post_apply_template         = models_routes->proxy_post;
          routes.post_chat_completions_tok   = models_routes->proxy_post;
          routes.post_responses_tok_oai      = models_routes->proxy_post;
 +        routes.get_glass_skull_info        = models_routes->proxy_get;
 +        routes.post_glass_skull_trace      = models_routes->proxy_post;
++        routes.get_glass_skull_steering    = models_routes->proxy_get;
++        routes.post_glass_skull_steering   = models_routes->proxy_post;
++        routes.delete_glass_skull_steering = models_routes->proxy_delete;
          routes.get_lora_adapters           = models_routes->proxy_get;
          routes.post_lora_adapters          = models_routes->proxy_post;
          routes.get_slots                   = models_routes->proxy_get;
-@@ -192,6 +194,8 @@ int llama_server(int argc, char ** argv) {
+@@ -192,6 +197,11 @@ int llama_server(int argc, char ** argv) {
      ctx_http.post("/props",                    ex_wrapper(routes.post_props));
      ctx_http.get ("/models",                   ex_wrapper(routes.get_models)); // public endpoint (no API key check)
      ctx_http.get ("/v1/models",                ex_wrapper(routes.get_models)); // public endpoint (no API key check)
 +    ctx_http.get ("/glass-skull/info",         ex_wrapper(routes.get_glass_skull_info));
 +    ctx_http.post("/glass-skull/trace",        ex_wrapper(routes.post_glass_skull_trace));
++    ctx_http.get ("/glass-skull/steering",     ex_wrapper(routes.get_glass_skull_steering));
++    ctx_http.post("/glass-skull/steering",     ex_wrapper(routes.post_glass_skull_steering));
++    ctx_http.del ("/glass-skull/steering",     ex_wrapper(routes.delete_glass_skull_steering));
      ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
      ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
      ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
+diff --git a/tools/server/tests/unit/test_glass_skull.py b/tools/server/tests/unit/test_glass_skull.py
+new file mode 100644
+index 000000000..3b4849e4f
+--- /dev/null
++++ b/tools/server/tests/unit/test_glass_skull.py
+@@ -0,0 +1,102 @@
++import math
++
++import pytest
++
++from utils import *
++
++server = ServerPreset.tinyllama2()
++
++
++@pytest.fixture(autouse=True)
++def create_server():
++    global server
++    server = ServerPreset.tinyllama2()
++
++
++def test_glass_skull_trace_token_only():
++    global server
++    server.start()
++    res = server.make_request("POST", "/glass-skull/trace", data={
++        "prompt": "hello",
++        "with_pieces": True,
++    })
++    assert res.status_code == 200
++    assert res.body["prompt"]["n_tokens_total"] > 0
++    assert res.body["prompt"]["traces"][0]["pieces"]
++    assert res.body["activations"]["supported"] is False
++    assert "layer_inputs" not in res.body
++
++
++def test_glass_skull_trace_layer_inputs():
++    global server
++    server.start()
++    info = server.make_request("GET", "/glass-skull/info")
++    assert info.status_code == 200
++    n_embd = info.body["meta"]["n_embd"]
++
++    res = server.make_request("POST", "/glass-skull/trace", data={
++        "prompt": "hello",
++        "layers": [0],
++        "streams": ["resid_pre"],
++        "with_pieces": True,
++        "include_vectors": True,
++        "top_k": 4,
++    })
++    assert res.status_code == 200
++    assert res.body["activations"]["supported"] is True
++    assert res.body["layer_inputs"]
++
++    prompt_tokens = res.body["prompt"]["traces"][0]["tokens"]
++    rows = [row for row in res.body["layer_inputs"] if row["layer"] == 0]
++    assert len(rows) == len(prompt_tokens)
++    for i, row in enumerate(rows):
++        assert row["stream"] == "resid_pre"
++        assert row["token_index"] == i
++        assert row["token"] == prompt_tokens[i]
++        assert len(row["vector"]) == n_embd
++        assert math.isfinite(row["norm"])
++        assert len(row["top_dims"]) <= 4
++
++
++def test_glass_skull_trace_unsupported_stream_fails_closed():
++    global server
++    server.start()
++    res = server.make_request("POST", "/glass-skull/trace", data={
++        "prompt": "hello",
++        "layers": [0],
++        "streams": ["mlp_out"],
++    })
++    assert res.status_code == 400
++    assert "streams" in res.body["error"]["message"]
++
++
++def test_glass_skull_global_steering_state_and_validation():
++    global server
++    server.start()
++
++    res = server.make_request("GET", "/glass-skull/steering")
++    assert res.status_code == 200
++    assert res.body["enabled"] is False
++    assert res.body["startup_control_vector"]["configured"] is False
++
++    res = server.make_request("POST", "/glass-skull/steering", data={
++        "control_vector": "/tmp/does-not-exist.gguf",
++        "strength": 1.0,
++        "layer_start": 1,
++        "layer_end": 1,
++    })
++    assert res.status_code == 400
++    assert "does not exist" in res.body["error"]["message"]
++
++    res = server.make_request("POST", "/glass-skull/steering", data={
++        "control_vector": "/tmp/does-not-exist.gguf",
++        "strength": 1.0,
++        "layer_start": 2,
++        "layer_end": 1,
++    })
++    assert res.status_code == 400
++    assert "layer range" in res.body["error"]["message"]
++
++    res = server.make_request("DELETE", "/glass-skull/steering")
++    assert res.status_code == 200
++    assert res.body["enabled"] is False

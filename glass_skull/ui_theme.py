@@ -565,7 +565,7 @@ def terminal(title: str, lines: list[tuple[str, str, str]]) -> None:
 def render_network(summary: dict) -> None:
     """Animated SVG of the model graph, drawn accurately from the model spec.
 
-    Columns = embedding -> one node-stack per transformer block -> unembedding.
+    Columns = embedding -> one node-stack per model block -> unembedding.
     Animated signal dots and a flowing dashed line illustrate activations /
     weights propagating through the layers. All counts come from model.cfg.
     """
