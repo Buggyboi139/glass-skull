@@ -531,6 +531,7 @@ def main() -> None:
     )
     unavailable_payload = build_activation_map_payload(unavailable_artifact, map_summary, local_model_context=None)
     assert unavailable_payload["visualizationMode"] == "unavailable"
+    assert unavailable_payload["batches"][0]["traceAvailable"] is False
     assert unavailable_payload["unavailableReason"] == "not exposed"
     assert unavailable_payload["diagnostics"]["visualizationMode"] == "unavailable"
     assert unavailable_payload["diagnostics"]["unavailableReason"] == "not exposed"

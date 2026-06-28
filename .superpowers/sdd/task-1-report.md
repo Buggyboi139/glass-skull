@@ -95,3 +95,45 @@ Output:
 ```text
 Glass Skull smoke check passed.
 ```
+
+## Final Re-review Fix
+
+### Finding Addressed
+
+- Batch-level `traceAvailable` now matches activation-path usability instead of raw `trace_available` flags alone. A batch is marked available only when at least one trace row is not explicitly unavailable, has a concrete layer, and has a numeric `activation_norm`.
+
+### Verification
+
+#### RED
+
+Command:
+
+```text
+.venv/bin/python smoke_check.py
+```
+
+Output:
+
+```text
+Traceback (most recent call last):
+  File "/home/dsmason321/repos/glass-skull/smoke_check.py", line 696, in <module>
+    main()
+  File "/home/dsmason321/repos/glass-skull/smoke_check.py", line 589, in main
+    assert unavailable_payload["batches"][0]["traceAvailable"] is False
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+```
+
+#### GREEN
+
+Command:
+
+```text
+.venv/bin/python smoke_check.py
+```
+
+Output:
+
+```text
+Glass Skull smoke check passed.
+```

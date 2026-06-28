@@ -95,6 +95,14 @@ def _source_indices(group_index: int, group_count: int, hidden_size: int) -> lis
     return list(range(start, end))
 
 
+def _usable_trace_row(row: dict[str, Any]) -> bool:
+    if row.get("trace_available", True) == False:
+        return False
+    if _int_or_none(row.get("layer")) is None:
+        return False
+    return not pd.isna(pd.to_numeric(row.get("activation_norm"), errors="coerce"))
+
+
 def _batch_rows(artifact: dict) -> list[dict]:
     rows = []
     for prompt in artifact.get("prompts", []):
@@ -106,7 +114,10 @@ def _batch_rows(artifact: dict) -> list[dict]:
             "promptPreview": _preview(prompt.get("prompt")),
             "tokenRange": "",
             "outputToken": _preview(prompt.get("output"), 32),
-            "traceAvailable": any(row.get("trace_available", True) for row in prompt.get("trace_rows", [])),
+            "traceAvailable": any(
+                isinstance(row, dict) and _usable_trace_row(row)
+                for row in prompt.get("trace_rows", [])
+            ),
         })
     return rows
 
