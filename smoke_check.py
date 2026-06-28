@@ -9,6 +9,7 @@ import pandas as pd
 
 from glass_skull.aggregation import label_separation_table
 from glass_skull.activation_map import build_activation_map_payload, build_model_meta
+from glass_skull.activation_map_view import activation_map_html
 from glass_skull.attention_view import indexed_tokens
 from glass_skull.chat_store import load_chat, save_chat
 from glass_skull.config import CONTROL_SET_DIR, CONTROL_VECTOR_DIR, DEFAULT_MODEL, MODEL_PRESETS, ensure_dirs
@@ -487,6 +488,16 @@ def main() -> None:
     assert activation_payload["diagnostics"]["selectedLayer"]["name"] == "L1"
     assert activation_payload["diagnostics"]["selectedGroup"]["groupId"] == "L1-G0"
     assert activation_payload["diagnostics"]["modelMeta"]["hiddenSize"] == 12
+    map_html = activation_map_html(activation_payload, height=720)
+    assert '<canvas id="gs-activation-map"' in map_html
+    assert 'function drawOverview' in map_html
+    assert 'function drawLayerPane' in map_html
+    assert 'function drawDrilldownPane' in map_html
+    assert 'function drawDiagnostics' in map_html
+    assert 'mousemove' in map_html
+    assert 'click' in map_html
+    assert '"layerCount": 3' in map_html
+    assert 'visualizationMode' in map_html
     first_path = activation_payload["activationPaths"][0]
     assert {"batchId", "promptId", "points", "strength", "visualizationMode"}.issubset(first_path)
     assert first_path["points"], "paths should include per-layer Canvas points"
