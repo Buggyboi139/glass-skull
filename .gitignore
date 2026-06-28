@@ -18,6 +18,7 @@ data/control_sets/
 data/control_vectors/
 .streamlit/
 .cache/
+managed/
 
 # local working notes
 llm.txt

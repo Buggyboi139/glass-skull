@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlencode
 
 
 @dataclass
@@ -17,6 +18,7 @@ class LlamaServerStatus:
     models: list[str]
     glass_available: bool
     glass_info: dict[str, Any]
+    steering_supported: bool = False
     error: str | None = None
 
 
@@ -40,6 +42,14 @@ def normalize_base_url(base_url: str) -> str:
 
 def _join_url(base_url: str, path: str) -> str:
     return normalize_base_url(base_url) + "/" + path.lstrip("/")
+
+
+def _append_query(url: str, params: dict[str, str]) -> str:
+    clean = {key: value for key, value in params.items() if value}
+    if not clean:
+        return url
+    separator = "&" if "?" in url else "?"
+    return url + separator + urlencode(clean)
 
 
 def _request_text(
@@ -66,6 +76,8 @@ def _request_text(
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code} from {url}: {body[:1000]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Request failed for {url}: {exc.reason}") from exc
 
 
 def _request_json(
@@ -213,7 +225,181 @@ def _extract_sse_content(text: str) -> str:
     return "".join(chunks)
 
 
-def check_server(base_url: str, timeout: float = 3.0) -> LlamaServerStatus:
+def _json_shape(value: Any) -> str:
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    return type(value).__name__
+
+
+def _request_json_object(
+    method: str,
+    url: str,
+    payload: dict[str, Any] | None = None,
+    timeout: float = 120.0,
+    context: str = "llama.cpp request",
+) -> dict[str, Any]:
+    try:
+        result = _request_json(method, url, payload=payload, timeout=timeout)
+    except RuntimeError as exc:
+        raise RuntimeError(f"{context} failed: {exc}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"{context} failed: {exc}") from exc
+
+    if not isinstance(result, dict):
+        raise RuntimeError(f"{context} returned JSON {_json_shape(result)}, expected object")
+
+    if result.get("error"):
+        raise RuntimeError(f"{context} returned error: {result['error']}")
+
+    return result
+
+
+def per_request_steering_supported(glass_info: dict[str, Any] | None) -> bool:
+    if not isinstance(glass_info, dict):
+        return False
+    capabilities = glass_info.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return False
+    steering = capabilities.get("steering")
+    if not isinstance(steering, dict):
+        return False
+    per_request = steering.get("per_request")
+    return isinstance(per_request, dict) and per_request.get("supported") is True
+
+
+def build_steering_metadata(
+    control_vector: str,
+    strength: float,
+    layer_start: int,
+    layer_end: int,
+) -> dict[str, Any]:
+    control_vector = str(control_vector).strip()
+    if not control_vector:
+        raise ValueError("control_vector is required")
+    layer_start = int(layer_start)
+    layer_end = int(layer_end)
+    if layer_start < 1 or layer_end < layer_start:
+        raise ValueError("layer_start and layer_end must be a valid 1-based inclusive range")
+    return {
+        "control_vector": control_vector,
+        "strength": float(strength),
+        "layer_start": layer_start,
+        "layer_end": layer_end,
+    }
+
+
+def _coerce_layers(layers: list[int] | None) -> list[int] | None:
+    if layers is None:
+        return None
+    if isinstance(layers, (str, bytes)):
+        raise ValueError("layers must be a list of integers")
+    return [int(layer) for layer in layers]
+
+
+def _coerce_streams(streams: list[str] | None) -> list[str] | None:
+    if streams is None:
+        return None
+    if isinstance(streams, (str, bytes)):
+        raise ValueError("streams must be a list of stream names")
+    return [str(stream).strip() for stream in streams if str(stream).strip()]
+
+
+def _glass_trace_payload(
+    prompt: str,
+    model_alias: str | None = None,
+    layers: list[int] | None = None,
+    streams: list[str] | None = None,
+    max_new_tokens: int | None = None,
+    top_k: int | None = None,
+    with_pieces: bool | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"prompt": prompt}
+
+    if model_alias:
+        payload["model"] = str(model_alias).strip()
+        payload["model_alias"] = str(model_alias).strip()
+    if layers is not None:
+        payload["layers"] = _coerce_layers(layers)
+    if streams is not None:
+        payload["streams"] = _coerce_streams(streams)
+    if max_new_tokens is not None:
+        payload["max_new_tokens"] = int(max_new_tokens)
+    if top_k is not None:
+        payload["top_k"] = int(top_k)
+    if with_pieces is not None:
+        payload["with_pieces"] = bool(with_pieces)
+
+    return payload
+
+
+def _validate_trace_response(result: dict[str, Any], context: str) -> None:
+    list_fields = ("tokens", "trace_layers")
+    for field in list_fields:
+        if field in result and not isinstance(result[field], list):
+            raise RuntimeError(
+                f"{context} returned invalid shape: field {field!r} is "
+                f"{_json_shape(result[field])}, expected array"
+            )
+
+    text_fields = ("content", "completion", "generated_text", "text")
+    for field in text_fields:
+        if field in result and result[field] is not None and not isinstance(result[field], str):
+            raise RuntimeError(
+                f"{context} returned invalid shape: field {field!r} is "
+                f"{_json_shape(result[field])}, expected string"
+            )
+
+    activations = result.get("activations")
+    if activations is not None and not isinstance(activations, (dict, list)):
+        raise RuntimeError(
+            f"{context} returned invalid shape: field 'activations' is "
+            f"{_json_shape(activations)}, expected object or array"
+        )
+
+    layer_norms = result.get("layer_norms")
+    if layer_norms is not None and not isinstance(layer_norms, list):
+        raise RuntimeError(
+            f"{context} returned invalid shape: field 'layer_norms' is "
+            f"{_json_shape(layer_norms)}, expected array"
+        )
+
+    prompt = result.get("prompt")
+    if prompt is not None:
+        if not isinstance(prompt, dict):
+            raise RuntimeError(
+                f"{context} returned invalid shape: field 'prompt' is "
+                f"{_json_shape(prompt)}, expected object"
+            )
+        traces = prompt.get("traces")
+        if traces is not None:
+            if not isinstance(traces, list):
+                raise RuntimeError(
+                    f"{context} returned invalid shape: field 'prompt.traces' is "
+                    f"{_json_shape(traces)}, expected array"
+                )
+            for index, trace in enumerate(traces):
+                if not isinstance(trace, dict):
+                    raise RuntimeError(
+                        f"{context} returned invalid shape: field 'prompt.traces[{index}]' is "
+                        f"{_json_shape(trace)}, expected object"
+                    )
+                tokens = trace.get("tokens")
+                if tokens is not None and not isinstance(tokens, list):
+                    raise RuntimeError(
+                        f"{context} returned invalid shape: field 'prompt.traces[{index}].tokens' is "
+                        f"{_json_shape(tokens)}, expected array"
+                    )
+                pieces = trace.get("pieces")
+                if pieces is not None and not isinstance(pieces, list):
+                    raise RuntimeError(
+                        f"{context} returned invalid shape: field 'prompt.traces[{index}].pieces' is "
+                        f"{_json_shape(pieces)}, expected array"
+                    )
+
+
+def check_server(base_url: str, timeout: float = 3.0, model_alias: str | None = None) -> LlamaServerStatus:
     base_url = normalize_base_url(base_url)
     start = time.perf_counter()
     models: list[str] = []
@@ -237,11 +423,13 @@ def check_server(base_url: str, timeout: float = 3.0) -> LlamaServerStatus:
             models=[],
             glass_available=False,
             glass_info={},
+            steering_supported=False,
             error=str(exc),
         )
 
     try:
-        glass_info = _request_json("GET", _join_url(base_url, "/glass-skull/info"), timeout=timeout)
+        glass_model = _resolve_model_id(base_url, model_alias)
+        glass_info = get_glass_info(base_url, model_alias=glass_model, timeout=timeout)
         glass_available = True
     except Exception:
         glass_info = {}
@@ -254,8 +442,64 @@ def check_server(base_url: str, timeout: float = 3.0) -> LlamaServerStatus:
         models=models,
         glass_available=glass_available,
         glass_info=glass_info,
+        steering_supported=per_request_steering_supported(glass_info),
         error=None,
     )
+
+
+def get_glass_info(base_url: str, model_alias: str | None = None, timeout: float = 5.0) -> dict[str, Any]:
+    """Read Glass Skull model metadata from a patched llama.cpp server."""
+
+    url = _join_url(base_url, "/glass-skull/info")
+    if model_alias:
+        url = _append_query(url, {"model": str(model_alias).strip()})
+    return _request_json_object(
+        "GET",
+        url,
+        timeout=timeout,
+        context="Glass Skull info request",
+    )
+
+
+def trace_glass_prompt(
+    base_url: str,
+    prompt: str,
+    model_alias: str | None = None,
+    layers: list[int] | None = None,
+    streams: list[str] | None = None,
+    max_new_tokens: int | None = None,
+    top_k: int | None = None,
+    with_pieces: bool | None = None,
+    timeout: float = 300.0,
+) -> dict[str, Any]:
+    """Request a local llama.cpp trace payload.
+
+    The endpoint is intentionally separate from TransformerLens tracing. It may
+    return a limited but accurate payload when only coarse local internals are
+    available.
+    """
+
+    payload = _glass_trace_payload(
+        prompt=prompt,
+        model_alias=model_alias,
+        layers=layers,
+        streams=streams,
+        max_new_tokens=max_new_tokens,
+        top_k=top_k,
+        with_pieces=with_pieces,
+    )
+    result = _request_json_object(
+        "POST",
+        _join_url(base_url, "/glass-skull/trace"),
+        payload=payload,
+        timeout=timeout,
+        context="Glass Skull trace request",
+    )
+    if result.get("supported") is False:
+        reason = result.get("reason") or result.get("error") or "server reported trace unsupported"
+        raise RuntimeError(str(reason))
+    _validate_trace_response(result, "Glass Skull trace request")
+    return result
 
 
 def _model_items(base_url: str) -> list[dict[str, Any]]:
@@ -323,19 +567,31 @@ def chat_completion(
     max_new_tokens: int = 80,
     temperature: float = 0.8,
     system_prompt: str | None = None,
+    messages: list[dict[str, str]] | None = None,
     model_alias: str | None = None,
+    steering: dict[str, Any] | None = None,
+    steering_supported: bool = False,
     timeout: float = 300.0,
 ) -> str:
     base_url = normalize_base_url(base_url)
 
+    if steering is not None and not steering_supported:
+        raise RuntimeError("This llama.cpp server does not advertise per-request Glass Skull steering support.")
+
     system_parts = [LOCAL_DIRECT_SYSTEM_PROMPT]
     if system_prompt:
         system_parts.append(system_prompt.strip())
-    messages = [{"role": "system", "content": "\n\n".join(part for part in system_parts if part)}]
-    messages.append({"role": "user", "content": prompt})
+    chat_messages = [{"role": "system", "content": "\n\n".join(part for part in system_parts if part)}]
+    for message in messages or []:
+        role = str(message.get("role", "")).strip()
+        content = str(message.get("content", "")).strip()
+        if role in {"user", "assistant"} and content:
+            chat_messages.append({"role": role, "content": content})
+    if not chat_messages or chat_messages[-1].get("role") != "user" or chat_messages[-1].get("content") != prompt:
+        chat_messages.append({"role": "user", "content": prompt})
 
     payload: dict[str, Any] = {
-        "messages": messages,
+        "messages": chat_messages,
         "max_tokens": int(max_new_tokens),
         "temperature": float(temperature),
         "stream": False,
@@ -347,6 +603,9 @@ def chat_completion(
     model_id = _resolve_model_id(base_url, model_alias)
     if model_id:
         payload["model"] = model_id
+    if steering is not None:
+        payload["glass_skull"] = {"steering": steering}
+        payload["metadata"] = {"glass_skull": {"steering": steering}}
 
     # Primary OpenAI-compatible chat endpoint.
     result = _request_json(
@@ -359,7 +618,11 @@ def chat_completion(
 
     # Fallback to legacy llama.cpp /completion if chat returns empty.
     if not content.strip():
-        legacy_prompt = f"System: {LOCAL_DIRECT_SYSTEM_PROMPT}\n\nUser: {prompt}\n\nAssistant:"
+        history_lines = []
+        for message in chat_messages:
+            role = message["role"].title()
+            history_lines.append(f"{role}: {message['content']}")
+        legacy_prompt = "\n\n".join(history_lines) + "\n\nAssistant:"
         legacy_payload = {
             "prompt": legacy_prompt,
             "n_predict": int(max_new_tokens),
@@ -369,6 +632,8 @@ def chat_completion(
         }
         if model_id:
             legacy_payload["model"] = model_id
+        if steering is not None:
+            legacy_payload["glass_skull"] = {"steering": steering}
         legacy_result = _request_json(
             "POST",
             _join_url(base_url, "/completion"),
@@ -394,10 +659,11 @@ def trace_summary(
     top_k: int = 32,
     timeout: float = 120.0,
 ) -> dict[str, Any]:
-    payload = {
-        "prompt": prompt,
-        "layers": layers or [],
-        "streams": streams or ["resid_post"],
-        "top_k": int(top_k),
-    }
-    return _request_json("POST", _join_url(base_url, "/glass-skull/trace-summary"), payload=payload, timeout=timeout)
+    return trace_glass_prompt(
+        base_url,
+        prompt,
+        layers=layers,
+        streams=streams,
+        top_k=top_k,
+        timeout=timeout,
+    )

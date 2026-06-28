@@ -39,6 +39,19 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def write_run_artifact(path: Path, artifact: dict[str, Any]) -> None:
+    target = path if path.name == "artifact.json" else path / "artifact.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    write_json(target, artifact)
+
+
+def load_run_artifact(path: Path | str) -> dict[str, Any]:
+    source = Path(path)
+    if source.is_dir():
+        source = source / "artifact.json"
+    return json.loads(source.read_text(encoding="utf-8"))
+
+
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -62,4 +75,33 @@ def list_experiments() -> list[dict[str, Any]]:
             except Exception:
                 summary = {"error": "failed to read summary"}
         rows.append({"name": path.name, "path": str(path), **summary})
+    return rows
+
+
+def latest_run_artifacts(limit: int = 25) -> list[dict[str, Any]]:
+    EXPERIMENT_DIR.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    for path in sorted(EXPERIMENT_DIR.iterdir(), reverse=True):
+        if not path.is_dir():
+            continue
+        artifact_path = path / "artifact.json"
+        if not artifact_path.exists():
+            continue
+        try:
+            artifact = load_run_artifact(artifact_path)
+            rows.append({
+                "name": path.name,
+                "path": str(path),
+                "artifact_path": str(artifact_path),
+                "run_id": artifact.get("run_id"),
+                "mode": artifact.get("mode"),
+                "backend": artifact.get("backend"),
+                "model": artifact.get("model"),
+                "created_at": artifact.get("created_at"),
+                "summary": artifact.get("summary", {}),
+            })
+        except Exception as exc:
+            rows.append({"name": path.name, "path": str(path), "error": str(exc)})
+        if len(rows) >= limit:
+            break
     return rows

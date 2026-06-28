@@ -7,6 +7,67 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 
+def activation_path_graph(df: pd.DataFrame):
+    if df is None or df.empty:
+        return None
+    required = {"layer", "stream", "activation_norm"}
+    if not required.issubset(df.columns):
+        return None
+    plot_df = df[df.get("trace_available", True) != False].copy()
+    if plot_df.empty:
+        return None
+    plot_df["activation_norm"] = pd.to_numeric(plot_df["activation_norm"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["layer", "stream", "activation_norm"])
+    if plot_df.empty:
+        return None
+    max_norm = max(float(plot_df["activation_norm"].max()), 1e-6)
+    plot_df["marker_size"] = 8 + 18 * (plot_df["activation_norm"] / max_norm)
+    hover_cols = [col for col in ["prompt_id", "label", "token_index", "token", "activation_norm"] if col in plot_df.columns]
+    fig = px.scatter(
+        plot_df,
+        x="layer",
+        y="stream",
+        size="marker_size",
+        color="activation_norm",
+        color_continuous_scale="Turbo",
+        hover_data=hover_cols,
+        title="Activation path",
+        labels={"layer": "Layer", "stream": "Stream/component", "activation_norm": "activation norm"},
+    )
+    fig.update_traces(marker=dict(sizemode="diameter", sizeref=1))
+    fig.update_layout(height=340, margin=dict(l=10, r=10, t=45, b=10))
+    return fig
+
+
+def batch_activation_heatmap(df: pd.DataFrame):
+    if df is None or df.empty:
+        return None
+    required = {"group", "layer", "stream", "activation_norm"}
+    if not required.issubset(df.columns):
+        return None
+    heat = df.copy()
+    heat["path"] = heat["layer"].astype(str) + ":" + heat["stream"].astype(str)
+    pivot = heat.pivot_table(index="group", columns="path", values="activation_norm", aggfunc="mean")
+    if pivot.empty:
+        return None
+    fig = px.imshow(
+        pivot,
+        aspect="auto",
+        color_continuous_scale="Turbo",
+        labels={"x": "layer:stream", "y": "group", "color": "avg activation norm"},
+        title="Batch activation heatmap",
+    )
+    fig.update_layout(height=360, margin=dict(l=10, r=10, t=45, b=10))
+    return fig
+
+
+def label_activation_heatmap(df: pd.DataFrame):
+    fig = batch_activation_heatmap(df)
+    if fig is not None:
+        fig.update_layout(title="Label activation heatmap")
+    return fig
+
+
 def activation_heatmap(layer_norms: pd.DataFrame):
     if layer_norms.empty:
         return None

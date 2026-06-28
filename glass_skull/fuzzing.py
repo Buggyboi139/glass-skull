@@ -3,13 +3,25 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
+import pandas as pd
 from transformer_lens import HookedTransformer
 
-from .experiment_store import append_jsonl, create_experiment_dir, write_dataframe, write_json
-from .llama_client import chat_completion
+from .experiment_store import append_jsonl, create_experiment_dir, write_dataframe, write_json, write_run_artifact
+from .llama_client import chat_completion, trace_glass_prompt
 from .prompt_loader import PromptItem, prompt_items_to_records
 from .tracer import top_active_dimensions, trace_prompt
 from .aggregation import label_layer_heatmap, label_separation_table, prompt_layer_heatmap, top_recurring_dimensions
+from .run_artifacts import (
+    activation_path_df,
+    batch_heatmap_df,
+    build_run_artifact,
+    dimension_frequency_df,
+    label_heatmap_df,
+    llama_trace_unavailable_reason,
+    normalize_llama_trace,
+    normalize_transformerlens_trace,
+    trace_unavailable_row,
+)
 
 
 def trace_layers_for_prompt(
@@ -54,6 +66,8 @@ def run_fuzz_experiment(
     layers: list[int] | None = None,
     streams: list[str] | None = None,
     top_k: int = 32,
+    run_id: str | None = None,
+    mode: str = "fuzz",
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> dict[str, Any]:
     if chat_backend == "transformerlens" and model is None:
@@ -77,11 +91,14 @@ def run_fuzz_experiment(
         "streams": streams,
         "top_k": top_k,
         "prompt_count": len(prompts),
+        "run_id": run_id,
+        "mode": mode,
     }
     write_json(exp_dir / "config.json", config)
     write_json(exp_dir / "prompts.json", prompt_items_to_records(prompts))
 
     records: list[dict[str, Any]] = []
+    artifact_prompts: list[dict[str, Any]] = []
     outputs_path = exp_dir / "outputs.jsonl"
 
     for idx, item in enumerate(prompts, start=1):
@@ -92,6 +109,7 @@ def run_fuzz_experiment(
         error = None
         output = ""
         trace_layers: list[dict[str, Any]] = []
+        trace_rows: list[dict[str, Any]] = []
 
         try:
             if chat_backend == "llama.cpp":
@@ -112,14 +130,57 @@ def run_fuzz_experiment(
         except Exception as exc:
             error = str(exc)
 
-        if trace_enabled and model is not None:
+        if trace_enabled and chat_backend == "llama.cpp":
             try:
-                trace_layers, _ = trace_layers_for_prompt(model, item.prompt, layers, streams, top_k)
+                payload = trace_glass_prompt(
+                    llama_url or "",
+                    item.prompt,
+                    model_alias=llama_model_alias,
+                    layers=layers,
+                    streams=streams,
+                    max_new_tokens=max_new_tokens,
+                    top_k=top_k,
+                    with_pieces=True,
+                )
+                trace_rows = normalize_llama_trace(
+                    payload,
+                    prompt_id=item.prompt_id,
+                    label=item.label,
+                    metadata={"run_id": run_id, "mode": mode},
+                )
+                if trace_rows:
+                    trace_layers = _trace_layers_from_rows(trace_rows)
+                else:
+                    trace_rows = [
+                        trace_unavailable_row(
+                            str(run_id or ""),
+                            item.prompt_id,
+                            item.label,
+                            "llama.cpp",
+                            llama_trace_unavailable_reason(payload),
+                        )
+                    ]
             except Exception as exc:
                 if error:
                     error = error + " | trace: " + str(exc)
                 else:
                     error = "trace: " + str(exc)
+                trace_rows = [trace_unavailable_row(str(run_id or ""), item.prompt_id, item.label, "llama.cpp", str(exc))]
+        elif trace_enabled and model is not None:
+            try:
+                trace_layers, trace = trace_layers_for_prompt(model, item.prompt, layers, streams, top_k)
+                trace_rows = normalize_transformerlens_trace(
+                    trace,
+                    prompt_id=item.prompt_id,
+                    label=item.label,
+                    metadata={"run_id": run_id, "mode": mode},
+                )
+            except Exception as exc:
+                if error:
+                    error = error + " | trace: " + str(exc)
+                else:
+                    error = "trace: " + str(exc)
+                trace_rows = [trace_unavailable_row(str(run_id or ""), item.prompt_id, item.label, "transformerlens", str(exc))]
 
         elapsed_ms = (time.perf_counter() - started) * 1000
         rec = {
@@ -130,10 +191,40 @@ def run_fuzz_experiment(
             "error": error,
             "elapsed_ms": elapsed_ms,
             "trace_layers": trace_layers,
-            "metadata": item.metadata or {},
+            "metadata": {**(item.metadata or {}), "run_id": run_id, "mode": mode},
         }
         records.append(rec)
+        artifact_prompts.append({
+            "prompt_id": item.prompt_id,
+            "label": item.label,
+            "prompt": item.prompt,
+            "output": output,
+            "error": error,
+            "elapsed_ms": elapsed_ms,
+            "metadata": rec["metadata"],
+            "trace_rows": trace_rows,
+        })
         append_jsonl(outputs_path, rec)
+
+    artifact = build_run_artifact(
+        run_id=run_id,
+        mode=mode,
+        backend=chat_backend,
+        model=llama_model_alias if chat_backend == "llama.cpp" else getattr(getattr(model, "cfg", None), "model_name", None),
+        prompts=artifact_prompts,
+        summary={
+            "experiment_path": str(exp_dir),
+            "trace_enabled": trace_enabled,
+            "layers": layers,
+            "streams": streams,
+        },
+    )
+    write_run_artifact(exp_dir, artifact)
+    activation_df = activation_path_df(artifact)
+    batch_prompt_df = batch_heatmap_df(artifact, group_by="prompt")
+    batch_label_df = label_heatmap_df(artifact)
+    batch_all_df = batch_heatmap_df(artifact, group_by="all")
+    recurring_dims_df = dimension_frequency_df(artifact)
 
     prompt_df = prompt_layer_heatmap(records)
     label_df = label_layer_heatmap(records)
@@ -148,6 +239,16 @@ def run_fuzz_experiment(
         write_dataframe(exp_dir / "top_recurring_dimensions.csv", top_dims_df)
     if not separation_df.empty:
         write_dataframe(exp_dir / "label_separation.csv", separation_df)
+    if not activation_df.empty:
+        write_dataframe(exp_dir / "activation_path.csv", activation_df)
+    if not batch_prompt_df.empty:
+        write_dataframe(exp_dir / "batch_prompt_heatmap.csv", batch_prompt_df)
+    if not batch_label_df.empty:
+        write_dataframe(exp_dir / "batch_label_heatmap.csv", batch_label_df)
+    if not batch_all_df.empty:
+        write_dataframe(exp_dir / "batch_all_heatmap.csv", batch_all_df)
+    if not recurring_dims_df.empty:
+        write_dataframe(exp_dir / "recurring_dimensions.csv", recurring_dims_df)
 
     summary = {
         "experiment_path": str(exp_dir),
@@ -155,6 +256,11 @@ def run_fuzz_experiment(
         "error_count": sum(1 for r in records if r.get("error")),
         "chat_backend": chat_backend,
         "trace_enabled": trace_enabled,
+        "run_id": run_id,
+        "mode": mode,
+        "artifact_path": str(exp_dir / "artifact.json"),
+        "trace_supported": artifact["summary"].get("trace_supported", False),
+        "trace_unavailable_count": artifact["summary"].get("trace_unavailable_count", 0),
     }
     write_json(exp_dir / "summary.json", summary)
     return {
@@ -164,4 +270,27 @@ def run_fuzz_experiment(
         "label_layer_df": label_df,
         "top_dims_df": top_dims_df,
         "separation_df": separation_df,
+        "artifact": artifact,
+        "activation_path_df": activation_df,
+        "batch_prompt_heatmap_df": batch_prompt_df,
+        "batch_label_heatmap_df": batch_label_df,
+        "batch_all_heatmap_df": batch_all_df,
+        "recurring_dimensions_df": recurring_dims_df,
     }
+
+
+def _trace_layers_from_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    df = pd.DataFrame([row for row in rows if row.get("trace_available", True)])
+    if df.empty:
+        return []
+    grouped = df.groupby(["layer", "stream"], as_index=False)["activation_norm"].mean()
+    return [
+        {
+            "layer": int(row["layer"]),
+            "stream": str(row["stream"]),
+            "norm": float(row["activation_norm"]),
+            "top_dims": [],
+        }
+        for row in grouped.to_dict("records")
+        if row.get("layer") is not None
+    ]

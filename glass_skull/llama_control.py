@@ -12,11 +12,10 @@ from typing import Any
 
 from .config import CONTROL_SET_DIR, CONTROL_VECTOR_DIR
 from .experiment_store import safe_slug
+from .llama_paths import DEFAULT_CVECTOR_GENERATOR, DEFAULT_LLAMA_SERVER, MANAGED_LLAMA_CPP_DIR
 
 
-DEFAULT_LLAMA_CPP_DIR = Path("/home/dsmason321/llama.cpp")
-DEFAULT_CVECTOR_GENERATOR = DEFAULT_LLAMA_CPP_DIR / "build/bin/llama-cvector-generator"
-DEFAULT_LLAMA_SERVER = DEFAULT_LLAMA_CPP_DIR / "build/bin/llama-server"
+DEFAULT_LLAMA_CPP_DIR = MANAGED_LLAMA_CPP_DIR
 
 GGML_TYPE_NAMES = {
     0: "F32",

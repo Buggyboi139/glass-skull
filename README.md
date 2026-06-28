@@ -6,7 +6,19 @@ A local interpretability cockpit for chatting with llama.cpp, TransformerLens, a
 
 ## Current status
 
-Glass Skull now separates three worlds:
+Glass Skull now starts local-first. The default cockpit is:
+
+```text
+Local:
+  Chat, Dashboard, Local Controls, Anatomy / Logs, Models, Settings.
+  No TransformerLens model is loaded unless Trace model is selected in setup.
+
+Lab:
+  Optional Hugging Face and TransformerLens tools.
+  Visible only when Hugging Face models or Trace model are selected in setup.
+```
+
+The backend worlds are still separated:
 
 ```text
 TransformerLens:
@@ -16,7 +28,8 @@ TransformerLens:
 llama.cpp:
   Fast GGUF chat path.
   Chat, server checks, metadata, fuzz output.
-  No activation hooks until llama.cpp-glass grows real endpoints.
+  Per-request control-vector steering only when llama.cpp-glass advertises it.
+  Startup control-vector servers remain the fallback.
 
 Hugging Face front:
   Official model catalog, token validation, gated model access checks, and future generic HF loading.
@@ -76,7 +89,7 @@ HUD:
 
 Chat:
   llama.cpp capability warning
-  steering toggle disabled when llama.cpp is selected
+  steering toggle is fail-closed unless /glass-skull/info advertises support
 
 Trace / Lens:
   warning when llama.cpp is selected because stock llama.cpp does not expose activations
@@ -204,8 +217,8 @@ for the session:
 - Trace model (TransformerLens)
 
 Each source includes an info tooltip with its runtime requirements. Successful
-setup adds the configured sources to the `Models` tab, which appears after
-`Anatomy / Logs`.
+setup adds the configured sources to `Models`. `Lab` appears only when Hugging
+Face or Trace model is selected.
 
 Runtime configuration lives in the `Settings` tab, not the sidebar. `Settings`
 is organized as `Local`, `HF`, `Trace`, and `Session`; start in `Local` to set
@@ -213,18 +226,57 @@ the router model alias, GGUF path, llama.cpp server URLs, and local tool paths.
 Chat, fuzzing, Local Alter launch commands, and local model flags all consume
 that same Local configuration.
 
-The Chat tab includes `Send message`, `Cancel chat`, `New chat`, and `Load chat`
-controls beside the message box. `New chat` archives the current transcript
-under `data/chats/`; `Load chat` restores the most recent saved transcript.
+The Chat tab starts with the composer. Pick `Single message` for one prompt or
+`Batch run` for pasted payloads, repeated current-message prompts, and optional
+TXT/JSONL/CSV file uploads. Every single or batch run gets a run ID that is shown
+in Chat and Dashboard and stored in run metadata. `New chat` archives the current
+transcript under `data/chats/`; `Load chat` restores the most recent saved
+transcript.
 
 ## llama.cpp reminder
 
-Glass Skull can now stage local GGUF control-vector runs around upstream
-llama.cpp flags. Put positive/negative prompt files under
+Glass Skull can stage local GGUF control-vector runs around either the managed
+`llama.cpp-glass` patch or upstream llama.cpp startup flags. Put positive/negative prompt files under
 `data/control_sets/`, generate vectors under `data/control_vectors/`, then
 use the Local Alter tab to preflight the model and build launch commands. The
 generator omits `-ngl` by default so llama.cpp can auto-fit GPU layers; set it
 only from Advanced generator options when you need an explicit value.
+
+To create the managed patched checkout without touching `/home/dsmason321/llama.cpp`:
+
+```bash
+python scripts/setup_llama_cpp_glass.py
+```
+
+Defaults:
+
+```text
+clone: managed/llama.cpp-glass
+commit: 73618f27a801c0b8614ceaf3547d3c2a99baae14
+build: Release
+cmake: GGML_VULKAN=ON, LLAMA_BUILD_SERVER=ON, LLAMA_BUILD_TOOLS=ON
+```
+
+The setup script aborts on a dirty managed clone, applies
+`patches/llama.cpp-glass/*.patch` as a local patch commit, and builds
+`llama-server` plus `llama-cvector-generator`. The app defaults point at the
+managed build, but Settings > Local can still override the binary paths.
+
+Per-request steering uses this request shape and is sent only after the server
+advertises `capabilities.steering.per_request.supported == true`:
+
+```json
+{
+  "glass_skull": {
+    "steering": {
+      "control_vector": "data/control_vectors/my_behavior.gguf",
+      "strength": 1.25,
+      "layer_start": 20,
+      "layer_end": 60
+    }
+  }
+}
+```
 
 Launch a normal server and a steered server on separate ports, then compare
 `Local GGUF normal (llama.cpp)` and `Local GGUF steered (llama.cpp)` in Chat:
@@ -265,7 +317,7 @@ For Gemma 4 models, disable reasoning if the chat endpoint returns empty visible
   -ub 2048 \
   --jinja \
   --reasoning-budget 0 \
-  --flash-attn \
+  --flash-attn auto \
   --cache-type-k q4_0 \
   --cache-type-v q4_0 \
   --no-mmap
