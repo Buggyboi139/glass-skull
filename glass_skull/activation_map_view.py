@@ -191,6 +191,31 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     hitTargets.push({{ x, y, w, h, tooltip: tooltipHtmlValue, ...meta }});
   }}
 
+  function addPathSegmentHitTarget(x1, y1, x2, y2, tooltipHtmlValue, meta = {{}}) {{
+    hitTargets.push({{
+      type: 'segment',
+      x1,
+      y1,
+      x2,
+      y2,
+      padding: 10,
+      tooltip: tooltipHtmlValue,
+      ...meta,
+    }});
+  }}
+
+  function distanceToSegment(px, py, x1, y1, x2, y2) {{
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    if (!dx && !dy) {{
+      return Math.hypot(px - x1, py - y1);
+    }}
+    const t = Math.max(0, Math.min(1, (((px - x1) * dx) + ((py - y1) * dy)) / ((dx * dx) + (dy * dy))));
+    const sx = x1 + t * dx;
+    const sy = y1 + t * dy;
+    return Math.hypot(px - sx, py - sy);
+  }}
+
   function panel(x, y, w, h) {{
     ctx.save();
     const fill = ctx.createLinearGradient(x, y, x, y + h);
@@ -255,6 +280,32 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     ctx.shadowBlur = selectedPath ? 18 : 10;
     ctx.stroke();
     ctx.restore();
+
+    coords.slice(1).forEach((coord, coordIndex) => {{
+      const prev = coords[coordIndex];
+      addPathSegmentHitTarget(
+        prev.x,
+        prev.y,
+        coord.x,
+        coord.y,
+        tooltipHtml('Path', [
+          ['batch', path.batchId],
+          ['prompt', path.promptId],
+          ['layers', path.frequency || points.length],
+          ['tokenRange', trimText(path.tokenRange || '', 24)],
+          ['output', trimText(path.outputToken || '', 24)],
+          ['summary', trimText(path.activationSummary || '', 24)],
+          ['strength', fmtNumber(path.strength)],
+          ['attr', fmtNumber(path.attributionScore)],
+          ['confidence', fmtNumber(path.confidence)],
+          ...visualizationRows(path),
+        ]),
+        {{
+          batchId: path.batchId,
+          pathId: path.pathId,
+        }},
+      );
+    }});
 
     coords.forEach((coord) => {{
       const isFocusedPoint = coord.point.groupId === selected.groupId || coord.point.layerId === selected.layerId;
@@ -444,6 +495,32 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     }}
   }}
 
+  function selectedDiagnostics() {{
+    const base = payload.diagnostics || {{}};
+    const selectedLayer = layerById(selected.layerId) || base.selectedLayer || null;
+    const selectedGroup = groupById(selected.groupId) || base.selectedGroup || null;
+    const selectedBatch = batchById(selected.batchId) || base.selectedBatch || null;
+    const selectedPath = pathByBatchId(selected.batchId) || null;
+    const pathPoints = selectedPath?.points || [];
+    const selectedPoint = pathPoints.find((point) => point.groupId === selected.groupId)
+      || pathPoints.find((point) => point.layerId === selected.layerId)
+      || pathPoints[0]
+      || null;
+
+    return {{
+      ...base,
+      selectedBatch,
+      selectedLayer,
+      selectedGroup,
+      activationValue: selectedPoint?.activationValue ?? selectedGroup?.activationValue ?? base.activationValue ?? 0,
+      attributionScore: selectedGroup?.attributionScore ?? selectedPath?.attributionScore ?? base.attributionScore ?? 0,
+      confidence: selectedPath?.confidence ?? base.confidence ?? 0,
+      visualizationMode: selectedPoint?.visualizationMode || selectedGroup?.visualizationMode || selectedLayer?.visualizationMode || selectedPath?.visualizationMode || base.visualizationMode || payload.visualizationMode || '',
+      sourceToken: selectedPoint?.token || base.sourceToken || '',
+      destinationToken: selectedBatch?.outputToken || base.destinationToken || '',
+    }};
+  }}
+
   function drawDiagnosticText(x, y, d) {{
     const state = effectiveVisualizationState(d);
     const rows = [
@@ -454,6 +531,9 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
       ['activationValue', fmtNumber(d.activationValue || 0)],
       ['attributionScore', fmtNumber(d.attributionScore || 0)],
       ['confidence', fmtNumber(d.confidence || 0)],
+      ['sourceToken', trimText(d.sourceToken || '', 24)],
+      ['destinationToken', trimText(d.destinationToken || '', 24)],
+      ['model', trimText(d.modelMeta?.modelName || '', 24)],
     ];
     if (state.reason) {{
       rows.push(['unavailableReason', trimText(state.reason, 42)]);
@@ -515,13 +595,16 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   function drawDiagnostics(rect) {{
     const x = 62, y = Math.max(640, rect.height * 0.80), w = rect.width - 124, h = rect.height - y - 16;
     panel(x, y, w, Math.max(110, h));
-    const d = payload.diagnostics || {{}};
-    drawDiagnosticText(x + 18, y + 28, d);
+    drawDiagnosticText(x + 18, y + 28, selectedDiagnostics());
   }}
 
   function findTarget(x, y) {{
     for (let i = hitTargets.length - 1; i >= 0; i--) {{
       const t = hitTargets[i];
+      if (t.type === 'segment') {{
+        if (distanceToSegment(x, y, t.x1, t.y1, t.x2, t.y2) <= (t.padding || 0)) return t;
+        continue;
+      }}
       if (x >= t.x && x <= t.x + t.w && y >= t.y && y <= t.y + t.h) return t;
     }}
     return null;
