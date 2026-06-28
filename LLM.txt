@@ -32,9 +32,10 @@ Core workflow
 2. Glass Skull sends chat requests to the configured local llama.cpp server.
 3. When tracing is enabled, Glass Skull also calls the local
    /glass-skull/trace endpoint.
-4. The trace payload is normalized into run-artifact rows containing prompt id,
-   label, layer, stream, token index, token text, activation norm, trace source,
-   and unavailable-reason diagnostics.
+4. The trace payload is normalized into run-artifact rows preserving run id,
+   batch id, prompt id, token id/token index, label, layer, stream, token text,
+   activation norm, top dimensions, optional vectors, trace source, and
+   unavailable-reason diagnostics.
 5. The app stores a local artifact with prompts, outputs, trace rows, behavior
    scores, batch metadata, and error state.
 6. The Map tab turns the artifact into a canvas payload and visualizes local LLM
@@ -43,33 +44,51 @@ Core workflow
    and shows llama.cpp launch commands for steered runs.
 8. The Timeline tab compares behavior scores across local runs.
 
-Visual representation
----------------------
+Activation map contract
+-----------------------
 
 Layers represent local model blocks from GGUF metadata or the highest traced
 layer returned by llama.cpp.
 
-Nodes represent grouped hidden dimensions. When top-dimension data is available,
-the map assigns dimensions into groups and marks stronger activation groups.
-When only layer summaries are available, the map marks the view as sampled. When
-no activation rows are available, the canvas switches to unavailable diagnostics
-instead of inventing data.
+The activation map is a guitar-neck/fret visualization of prompt-token activity
+through layers. It must preserve run id, batch id, prompt id, token id, and layer
+through the whole pipeline. It must never merge unrelated prompts or tokens into
+one pretty path.
 
-Activation paths connect prompt or batch activity across layers. Path strength
-comes from normalized activation norms in the local trace rows. Paths are
-sampled unless the local backend returns exact internal structures.
+Nodes represent activation locations derived from real trace rows. With full
+vectors, nodes and edges are vector-backed. With top-dimension rows, nodes and
+edges are explicitly labeled as top-k approximations. With scalar-only rows, the
+renderer shows aggregate heatmap context only. It does not invent prompt paths.
 
-Batch and message remapping happens through run artifacts. Single prompts use a
-single batch id. Batch runs map each prompt id and label into its own batch row,
-then aggregate by prompt, label, or all prompts for tables and heatmaps.
+Activation paths are per prompt and per selected token. Adjacent layers may be
+connected only when the source rows share the same prompt id and token id. The
+default mode is:
 
-Heatmaps summarize average activation norm by prompt, label, layer, and stream.
-They are diagnostic summaries, not causal proof.
+- single_prompt when one prompt has available trace rows
+- batch_overlay when multiple prompts have available trace rows
+- aggregate_heatmap only when selected by the user or forced by aggregate-only
+  or scalar-only backend data
 
-Tooltips and diagnostics expose the selected batch, layer, node group, activation
-value, prompt preview, output preview, trace availability, trace mode, and
-unavailable reasons. The canvas keeps unavailable states explicit so local
-server limitations are visible.
+In batch_overlay, each prompt gets its own path for the selected token. Fifteen
+unrelated prompts must show fifteen prompt paths, not one averaged or smeared
+trajectory.
+
+aggregate_heatmap is not a path mode. It shows activation density/cloud data and
+must not draw a single connected trajectory unless a future centroid feature is
+explicitly labeled as a centroid.
+
+compare_prompts shows deltas between selected prompts. It does not combine
+prompt activations into a shared path.
+
+Heatmaps summarize activation density by layer/node/prompt context. They are
+diagnostic summaries, not causal proof and not prompt trajectories.
+
+Tooltips and diagnostics expose the exact selected source data: run id, batch id,
+prompt id, token id/token text, layer, node id, cluster id, activation,
+normalized activation, source fields, confidence, mode, edge method, and whether
+the visual element is real or approximate. If the backend trace is already
+aggregated, the UI must say that per-prompt paths are unavailable and render
+aggregate heatmap only.
 
 Intentionally not supported
 ---------------------------
