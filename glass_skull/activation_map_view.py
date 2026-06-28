@@ -161,6 +161,32 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     return `<div class="gs-tip-title">${{title}}</div>${{body}}`;
   }}
 
+  function effectiveVisualizationState(detail = null) {{
+    const payloadMode = payload.visualizationMode || payload.diagnostics?.visualizationMode || '';
+    const payloadReason = payload.unavailableReason || payload.diagnostics?.unavailableReason || '';
+    if (payload.visualizationMode === 'unavailable') {{
+      return {{
+        mode: 'unavailable',
+        reason: detail?.unavailableReason || payloadReason,
+      }};
+    }}
+    const detailMode = detail?.visualizationMode || '';
+    const mode = detailMode || payloadMode;
+    return {{
+      mode,
+      reason: mode === 'unavailable' ? (detail?.unavailableReason || payloadReason) : '',
+    }};
+  }}
+
+  function visualizationRows(detail = null) {{
+    const state = effectiveVisualizationState(detail);
+    const rows = [['mode', state.mode || '']];
+    if (state.reason) {{
+      rows.push(['unavailableReason', trimText(state.reason, 42)]);
+    }}
+    return rows;
+  }}
+
   function addHitTarget(x, y, w, h, tooltipHtmlValue, meta = {{}}) {{
     hitTargets.push({{ x, y, w, h, tooltip: tooltipHtmlValue, ...meta }});
   }}
@@ -252,7 +278,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
           ['group', coord.point.groupId],
           ['token', trimText(coord.point.token || '')],
           ['strength', fmtNumber(path.strength)],
-          ['mode', path.visualizationMode || payload.visualizationMode || ''],
+          ...visualizationRows(path),
         ]),
         {{
           batchId: path.batchId,
@@ -312,7 +338,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
         ['layer', layer.layerId],
         ['groups', layer.groupCount || 0],
         ['density', fmtNumber(layer.activationDensity || 0)],
-        ['mode', layer.visualizationMode || payload.visualizationMode || ''],
+        ...visualizationRows(layer),
       ]),
       {{ layerId: layer.layerId }},
     );
@@ -360,7 +386,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
         ['batches', group.batchParticipation || 0],
         ['activation', fmtNumber(group.activationValue || 0)],
         ['attr', fmtNumber(group.attributionScore || 0)],
-        ['mode', group.visualizationMode || payload.visualizationMode || ''],
+        ...visualizationRows(group),
       ]),
       {{
         groupId: group.groupId,
@@ -413,19 +439,15 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     ctx.restore();
 
     drawLabel(selectedGroup?.groupId || 'No group', x, y - 8, 'center', 'rgba(236, 246, 255, 0.96)', 13, 700);
-    drawLabel(selected.batchId || 'No batch', x, y + 12, 'center', 'rgba(163, 177, 205, 0.86)', 11, 600);
     if (selectedLayer) {{
       drawLabel(selectedLayer.name || selectedLayer.layerId, x - 132, y, 'left', 'rgba(158, 173, 205, 0.72)', 11, 600);
-    }}
-    const destination = payload.diagnostics?.destinationToken || batchById(selected.batchId)?.outputToken || '';
-    if (destination) {{
-      drawLabel(trimText(destination, 22), x + 132, y, 'right', 'rgba(158, 173, 205, 0.72)', 11, 600);
     }}
   }}
 
   function drawDiagnosticText(x, y, d) {{
+    const state = effectiveVisualizationState(d);
     const rows = [
-      ['visualizationMode', d.visualizationMode || payload.visualizationMode || ''],
+      ['visualizationMode', state.mode || ''],
       ['selectedBatch', d.selectedBatch?.batchId || selected.batchId || ''],
       ['selectedLayer', d.selectedLayer?.layerId || selected.layerId || ''],
       ['selectedGroup', d.selectedGroup?.groupId || selected.groupId || ''],
@@ -433,8 +455,8 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
       ['attributionScore', fmtNumber(d.attributionScore || 0)],
       ['confidence', fmtNumber(d.confidence || 0)],
     ];
-    if (d.unavailableReason) {{
-      rows.push(['unavailableReason', trimText(d.unavailableReason, 42)]);
+    if (state.reason) {{
+      rows.push(['unavailableReason', trimText(state.reason, 42)]);
     }}
     ctx.save();
     ctx.fillStyle = 'rgba(224, 231, 244, 0.90)';
@@ -450,8 +472,6 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   function drawOverview(rect) {{
     const x = 12, y = 10, w = rect.width - 24, h = Math.max(260, rect.height * 0.36);
     panel(x, y, w, h);
-    drawLabel('Activation Overview', x + 18, y + 19, 'left', 'rgba(234, 243, 255, 0.94)', 12, 700);
-    drawLabel(payload.modelMeta?.modelName || 'Activation Map', x + w - 18, y + 19, 'right', 'rgba(153, 168, 197, 0.78)', 11, 600);
     const layers = payload.layers || [];
     const paths = payload.activationPaths || [];
     const left = x + 56, right = x + w - 56, top = y + 48, bottom = y + h - 54;
@@ -477,9 +497,10 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     panel(x, y, w, h);
     const layer = layerById(selected.layerId) || payload.layers?.[0] || null;
     const groups = (payload.nodeGroups || []).filter((g) => g.layerId === selected.layerId).slice(0, 120);
-    drawLabel(layer?.name ? `Layer ${{layer.name}}` : 'Layer', x + 18, y + 19, 'left', 'rgba(234, 243, 255, 0.94)', 12, 700);
-    drawLabel(groups.length ? `${{groups.length}} groups` : 'No groups', x + w - 18, y + 19, 'right', 'rgba(153, 168, 197, 0.78)', 11, 600);
     groups.forEach((group, index) => drawGroupDot(group, index, groups.length, x + 76, y + 46, w - 132, h - 70));
+    if (layer) {{
+      drawLabel(layer.name || layer.layerId, x + 18, y + 19, 'left', 'rgba(141, 228, 255, 0.82)', 11, 700);
+    }}
     if (selected.groupId) {{
       drawLabel(selected.groupId, x + 18, y + h - 18, 'left', 'rgba(141, 228, 255, 0.82)', 11, 700);
     }}
@@ -488,16 +509,14 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   function drawDrilldownPane(rect) {{
     const x = 62, y = Math.max(470, rect.height * 0.61), w = rect.width - 124, h = 150;
     panel(x, y, w, h);
-    drawLabel('Drilldown', x + 18, y + 19, 'left', 'rgba(234, 243, 255, 0.94)', 12, 700);
     drawSelectedTarget(x + w / 2, y + h / 2 + 6, selected.groupId);
   }}
 
   function drawDiagnostics(rect) {{
     const x = 62, y = Math.max(640, rect.height * 0.80), w = rect.width - 124, h = rect.height - y - 16;
     panel(x, y, w, Math.max(110, h));
-    drawLabel('Diagnostics', x + 18, y + 19, 'left', 'rgba(234, 243, 255, 0.94)', 12, 700);
     const d = payload.diagnostics || {{}};
-    drawDiagnosticText(x + 18, y + 46, d);
+    drawDiagnosticText(x + 18, y + 28, d);
   }}
 
   function findTarget(x, y) {{

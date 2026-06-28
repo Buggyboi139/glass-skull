@@ -497,6 +497,16 @@ def main() -> None:
     assert 'mousemove' in map_html
     assert 'click' in map_html
     assert '"layerCount": 3' in map_html
+    assert 'function effectiveVisualizationState' in map_html
+    assert "payload.visualizationMode === 'unavailable'" in map_html
+    assert "drawLabel('Activation Overview'" not in map_html
+    assert "drawLabel('Drilldown'" not in map_html
+    assert "drawLabel('Diagnostics'" not in map_html
+    assert "drawLabel(payload.modelMeta?.modelName || 'Activation Map'" not in map_html
+    assert "drawLabel(layer?.name ? `Layer ${layer.name}` : 'Layer'" not in map_html
+    assert "drawLabel(groups.length ? `${groups.length} groups` : 'No groups'" not in map_html
+    assert "drawLabel(selected.batchId || 'No batch'" not in map_html
+    assert "drawLabel(trimText(destination, 22)" not in map_html
     assert 'visualizationMode' in map_html
     first_path = activation_payload["activationPaths"][0]
     assert {"batchId", "promptId", "points", "strength", "visualizationMode"}.issubset(first_path)
@@ -547,6 +557,8 @@ def main() -> None:
     assert unavailable_payload["diagnostics"]["visualizationMode"] == "unavailable"
     assert unavailable_payload["diagnostics"]["unavailableReason"] == "not exposed"
     assert unavailable_payload["activationPaths"] == []
+    unavailable_html = activation_map_html(unavailable_payload, height=720)
+    assert "['unavailableReason', trimText(state.reason, 42)]" in unavailable_html
 
     jsonl = '\n'.join([
         json.dumps({"label": "animal", "prompt": "Explain what a mouse is."}),
