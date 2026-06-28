@@ -104,6 +104,17 @@ class ActivationMap:
     heatmap: list[dict[str, Any]]
     diagnostics: dict[str, Any]
     nodes: list[ActivationNode] = field(default_factory=list)
+    render_bounds: RenderLayerBounds | None = None
+
+
+@dataclass(frozen=True)
+class RenderLayerBounds:
+    first_layer: int
+    last_layer: int
+    layer_count: int
+    layer_ids: list[int]
+    source: str
+    warnings: list[str]
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -382,6 +393,163 @@ def _layer_count(rows: list[dict[str, Any]], model_meta: dict[str, Any]) -> int:
     return count
 
 
+def _positive_count(value: Any) -> int | None:
+    count = _int_or_none(value)
+    return count if count is not None and count > 0 else None
+
+
+def _layer_ids_from_rows(rows: list[dict[str, Any]]) -> list[int]:
+    layer_ids = {
+        layer
+        for layer in (_int_or_none(row.get("layer")) for row in rows)
+        if layer is not None and layer >= 0
+    }
+    return sorted(layer_ids)
+
+
+def _layer_count_from_backend_info(info: dict[str, Any] | None) -> int | None:
+    if not isinstance(info, dict):
+        return None
+    count = _positive_count(info.get("layers"))
+    if count is not None:
+        return count
+    layers = info.get("layers")
+    if isinstance(layers, list) and layers:
+        return len(layers)
+    meta = info.get("meta")
+    if isinstance(meta, dict):
+        count = _positive_count(meta.get("n_layer") or meta.get("n_layers"))
+        if count is not None:
+            return count
+    return None
+
+
+def _backend_info_from_sources(artifact: dict[str, Any], summary: dict[str, Any] | None, backend_info: dict[str, Any] | None) -> dict[str, Any] | None:
+    if isinstance(backend_info, dict):
+        return backend_info
+    for source in (artifact, summary or {}, artifact.get("summary") if isinstance(artifact.get("summary"), dict) else {}):
+        if not isinstance(source, dict):
+            continue
+        for key in ("backend_info", "backendInfo", "glass_info", "glassInfo"):
+            value = source.get(key)
+            if isinstance(value, dict):
+                return value
+    return None
+
+
+def _max_layer_from_mapping(value: dict[str, Any] | None) -> int | None:
+    if not isinstance(value, dict):
+        return None
+    for key in ("max_layer", "maxLayer", "trace_max_layer", "traceMaxLayer"):
+        layer = _int_or_none(value.get(key))
+        if layer is not None and layer >= 0:
+            return layer
+    return None
+
+
+def _trace_artifact_max_layer(artifact: dict[str, Any]) -> int | None:
+    candidates = [
+        artifact,
+        artifact.get("summary") if isinstance(artifact.get("summary"), dict) else None,
+        artifact.get("diagnostics") if isinstance(artifact.get("diagnostics"), dict) else None,
+    ]
+    for candidate in candidates:
+        max_layer = _max_layer_from_mapping(candidate)
+        if max_layer is not None:
+            return max_layer
+    for prompt in artifact.get("prompts", []):
+        if not isinstance(prompt, dict):
+            continue
+        for key in ("trace_layers", "traceLayers"):
+            values = prompt.get(key)
+            if not isinstance(values, list):
+                continue
+            layer_values = [
+                _int_or_none(item.get("layer") if isinstance(item, dict) else item)
+                for item in values
+            ]
+            layer_values = [layer for layer in layer_values if layer is not None and layer >= 0]
+            if layer_values:
+                return max(layer_values)
+    return None
+
+
+def _contiguous_zero_based(layer_ids: list[int]) -> bool:
+    return layer_ids == list(range(len(layer_ids)))
+
+
+def _render_layer_warnings(
+    layer_ids: list[int],
+    *,
+    backend_count: int | None,
+    model_count: int | None,
+    source: str,
+) -> list[str]:
+    warnings: list[str] = []
+    if layer_ids and not _contiguous_zero_based(layer_ids):
+        warnings.append(f"Trace layer ids are non-contiguous: {layer_ids}. Rendering actual layer ids only.")
+    if source == "trace_rows" and layer_ids:
+        trace_count = len(layer_ids)
+        trace_last = max(layer_ids)
+        if backend_count is not None and backend_count != trace_count:
+            warnings.append(
+                f"Layer count mismatch: trace layers {trace_count} (last L{trace_last}) but backend info reports {backend_count}."
+            )
+        if model_count is not None and model_count != trace_count:
+            warnings.append(
+                f"Layer count mismatch: trace layers {trace_count} (last L{trace_last}) but model metadata reports {model_count}."
+            )
+    return warnings
+
+
+def resolve_render_layers(
+    artifact: dict[str, Any],
+    backend_info: dict[str, Any] | None,
+    model_meta: dict[str, Any] | None,
+) -> RenderLayerBounds:
+    """Resolve visible renderer layers without inventing empty metadata tail layers."""
+
+    model_meta = model_meta or {}
+    summary = artifact.get("summary") if isinstance(artifact.get("summary"), dict) else {}
+    backend_info = _backend_info_from_sources(artifact, summary, backend_info)
+    backend_count = _layer_count_from_backend_info(backend_info)
+    model_count = _positive_count(model_meta.get("layerCount"))
+
+    trace_layer_ids = _layer_ids_from_rows(_available_rows(_artifact_trace_rows(artifact)))
+    if trace_layer_ids:
+        source = "trace_rows"
+        layer_ids = trace_layer_ids
+    else:
+        max_layer = _trace_artifact_max_layer(artifact)
+        if max_layer is not None:
+            source = "trace_artifact_max_layer"
+            layer_ids = list(range(max_layer + 1))
+        elif backend_count is not None:
+            source = "backend_info"
+            layer_ids = list(range(backend_count))
+        elif model_count is not None:
+            source = "model_meta"
+            layer_ids = list(range(model_count))
+        else:
+            source = "fallback"
+            layer_ids = [0]
+
+    layer_ids = sorted({layer for layer in layer_ids if layer >= 0}) or [0]
+    return RenderLayerBounds(
+        first_layer=layer_ids[0],
+        last_layer=layer_ids[-1],
+        layer_count=len(layer_ids),
+        layer_ids=layer_ids,
+        source=source,
+        warnings=_render_layer_warnings(
+            layer_ids,
+            backend_count=backend_count,
+            model_count=model_count,
+            source=source,
+        ),
+    )
+
+
 def _unavailable_reason(rows: list[dict[str, Any]]) -> str:
     reasons: list[str] = []
     for row in rows:
@@ -608,9 +776,16 @@ def _rows_by_identity(rows: list[dict[str, Any]]) -> dict[tuple[str, str, str], 
     return grouped
 
 
-def _build_paths(rows: list[dict[str, Any]], data_mode: str, hidden_size: int, top_k: int) -> list[ActivationPath]:
+def _build_paths(
+    rows: list[dict[str, Any]],
+    data_mode: str,
+    hidden_size: int,
+    top_k: int,
+    layer_ids: list[int] | None = None,
+) -> list[ActivationPath]:
     if data_mode not in {"real_vectors", "top_dims_approx"}:
         return []
+    layer_ordinals = {layer: index for index, layer in enumerate(layer_ids or [])}
     paths: list[ActivationPath] = []
     for (_batch_id, _prompt_id, _token_id), identity_rows in sorted(_rows_by_identity(rows).items(), key=lambda item: item[0]):
         rows_by_layer: dict[int, list[dict[str, Any]]] = {}
@@ -633,7 +808,14 @@ def _build_paths(rows: list[dict[str, Any]], data_mode: str, hidden_size: int, t
             continue
         _normalise_nodes(nodes)
         _normalise_nodes(branches)
-        edges = [_edge_between(left, right, data_mode) for left, right in zip(nodes, nodes[1:]) if right.layer == left.layer + 1]
+        edges = []
+        for left, right in zip(nodes, nodes[1:]):
+            if layer_ordinals:
+                adjacent = layer_ordinals.get(right.layer) == layer_ordinals.get(left.layer, -2) + 1
+            else:
+                adjacent = right.layer == left.layer + 1
+            if adjacent:
+                edges.append(_edge_between(left, right, data_mode))
         path_confidence = min((node.confidence for node in nodes), default=0.0)
         paths.append(ActivationPath(
             run_id=nodes[0].run_id,
@@ -766,17 +948,34 @@ def _filter_rows_for_renderer(
     return filtered
 
 
+def _path_completeness_warnings(paths: list[ActivationPath], last_layer: int) -> list[str]:
+    warnings: list[str] = []
+    incomplete: list[str] = []
+    for path in paths:
+        path_last = max((node.layer for node in path.nodes), default=None)
+        if path_last is not None and path_last < last_layer:
+            incomplete.append(f"{path.batch_id}:{path.prompt_id}:{path.token_id} ends at L{path_last}")
+    if incomplete:
+        warnings.append(
+            f"Selected path ends before last trace-supported layer L{last_layer}: {', '.join(incomplete[:5])}."
+        )
+    return warnings
+
+
 def inspect_trace_artifact(artifact: dict, summary: dict | None = None, local_model_context: dict | None = None) -> dict[str, Any]:
     summary = summary or artifact.get("summary") or {}
     backend = str(artifact.get("backend") or summary.get("backend") or "llama.cpp")
     model_meta = build_model_meta(summary, local_model_context, backend)
     all_rows = _artifact_trace_rows(artifact)
     available = _available_rows(all_rows)
+    render_bounds = resolve_render_layers(artifact, _backend_info_from_sources(artifact, summary, None), model_meta)
+    trace_layer_ids = _layer_ids_from_rows(available)
+    backend_count = _layer_count_from_backend_info(_backend_info_from_sources(artifact, summary, None))
+    model_count = _positive_count(model_meta.get("layerCount"))
     data_mode = _data_mode(available)
     prompt_count = _prompt_count(artifact, available)
     batch_count = _batch_count(available)
     token_count = _token_count(available)
-    layer_count = _layer_count(available, model_meta)
     renderer_mode = _default_visualization_mode(data_mode, prompt_count, None)
     return {
         "run_id": artifact.get("run_id"),
@@ -784,7 +983,7 @@ def inspect_trace_artifact(artifact: dict, summary: dict | None = None, local_mo
         "batch_count": batch_count,
         "prompt_count": prompt_count,
         "token_count": token_count,
-        "layer_count": layer_count,
+        "layer_count": render_bounds.layer_count,
         "rows": len(available),
         "rows_per_layer": _rows_per_layer(available),
         "fields_present": _fields_present(all_rows),
@@ -801,6 +1000,17 @@ def inspect_trace_artifact(artifact: dict, summary: dict | None = None, local_mo
         "data_mode": data_mode,
         "renderer_mode": renderer_mode,
         "mode": renderer_mode,
+        "renderLayerSource": render_bounds.source,
+        "renderLayerCount": render_bounds.layer_count,
+        "renderFirstLayer": render_bounds.first_layer,
+        "renderLastLayer": render_bounds.last_layer,
+        "renderLayerIds": render_bounds.layer_ids,
+        "traceLayerCount": len(trace_layer_ids),
+        "traceMinLayer": min(trace_layer_ids) if trace_layer_ids else None,
+        "traceMaxLayer": max(trace_layer_ids) if trace_layer_ids else None,
+        "backendInfoLayerCount": backend_count,
+        "modelMetaLayerCount": model_count,
+        "layerMismatchWarning": " | ".join(render_bounds.warnings),
     }
 
 
@@ -809,6 +1019,7 @@ def build_activation_map(
     summary: dict,
     local_model_context: dict | None = None,
     *,
+    backend_info: dict[str, Any] | None = None,
     visualization_mode: str | None = None,
     selected_prompt: Any = None,
     selected_token: int | None = None,
@@ -822,7 +1033,11 @@ def build_activation_map(
     hidden_size = _hidden_size(rows, model_meta)
     if hidden_size > model_meta.get("hiddenSize", 0):
         model_meta["hiddenSize"] = hidden_size
-    layer_count = _layer_count(rows, model_meta)
+    render_bounds = resolve_render_layers(artifact, backend_info, model_meta)
+    trace_layer_ids = _layer_ids_from_rows(rows)
+    resolved_backend_info = _backend_info_from_sources(artifact, summary, backend_info)
+    model_meta_layer_count = _positive_count(model_meta.get("layerCount"))
+    layer_count = render_bounds.layer_count
     prompt_count = _prompt_count(artifact, rows)
     batch_count = _batch_count(rows)
     mode = _default_visualization_mode(data_mode, prompt_count, visualization_mode)
@@ -840,7 +1055,7 @@ def build_activation_map(
         warnings.append(_unavailable_reason(rows) or "activation trace data is unavailable")
         mode = "aggregate_heatmap"
 
-    paths = _build_paths(rows, data_mode, hidden_size, top_k)
+    paths = _build_paths(rows, data_mode, hidden_size, top_k, render_bounds.layer_ids)
     if selected_prompt is not None and mode == "single_prompt":
         paths = [path for path in paths if _string_id(path.prompt_id) == _string_id(selected_prompt)]
     if selected_token is not None and mode in {"single_prompt", "batch_overlay"}:
@@ -860,6 +1075,9 @@ def build_activation_map(
     if mode in {"aggregate_heatmap", "compare_prompts"}:
         paths = []
 
+    path_incomplete_warnings = _path_completeness_warnings(paths, render_bounds.last_layer)
+    warnings.extend(path_incomplete_warnings)
+
     selected_prompt_id = selected_prompt if selected_prompt is not None else (paths[0].prompt_id if paths else None)
     selected_token_id = selected_token if selected_token is not None else (paths[0].token_id if paths else None)
     selected_batch_id = paths[0].batch_id if paths else None
@@ -875,7 +1093,7 @@ def build_activation_map(
 
     diagnostics = inspect_trace_artifact(artifact, summary, local_model_context)
     diagnostics.update({
-        "warnings": warnings,
+        "warnings": [*warnings, *[warning for warning in render_bounds.warnings if warning not in warnings]],
         "dataMode": data_mode,
         "renderer_mode": mode,
         "rendererMode": mode,
@@ -889,6 +1107,18 @@ def build_activation_map(
         "selectedTokenId": selected_token_id,
         "comparePromptId": compare_prompt,
         "modelMeta": model_meta,
+        "renderLayerSource": render_bounds.source,
+        "renderLayerCount": render_bounds.layer_count,
+        "renderFirstLayer": render_bounds.first_layer,
+        "renderLastLayer": render_bounds.last_layer,
+        "renderLayerIds": render_bounds.layer_ids,
+        "traceLayerCount": len(trace_layer_ids),
+        "traceMinLayer": min(trace_layer_ids) if trace_layer_ids else None,
+        "traceMaxLayer": max(trace_layer_ids) if trace_layer_ids else None,
+        "backendInfoLayerCount": _layer_count_from_backend_info(resolved_backend_info),
+        "modelMetaLayerCount": model_meta_layer_count,
+        "layerMismatchWarning": " | ".join(render_bounds.warnings),
+        "pathCompletenessWarning": " | ".join(path_incomplete_warnings),
     })
 
     return ActivationMap(
@@ -905,20 +1135,25 @@ def build_activation_map(
         heatmap=heatmap,
         diagnostics=diagnostics,
         nodes=aggregate_nodes,
+        render_bounds=render_bounds,
     )
 
 
-def _layer_rows(layer_count: int, nodes: list[ActivationNode], data_mode: str) -> list[dict[str, Any]]:
+def _layer_rows(render_bounds: RenderLayerBounds, nodes: list[ActivationNode], data_mode: str) -> list[dict[str, Any]]:
     by_layer: dict[int, list[ActivationNode]] = {}
     for node in nodes:
         by_layer.setdefault(node.layer, []).append(node)
+    layer_ordinals = {layer: idx for idx, layer in enumerate(render_bounds.layer_ids)}
     rows = []
-    for layer_index in range(max(layer_count, 0)):
+    for ordinal, layer_index in enumerate(render_bounds.layer_ids):
         layer_nodes = by_layer.get(layer_index, [])
         active = [node for node in layer_nodes if node.activation > 0]
         rows.append({
             "layerId": f"L{layer_index}",
             "index": layer_index,
+            "ordinal": ordinal,
+            "renderIndex": ordinal,
+            "x": _layer_x(layer_index, layer_ordinals, render_bounds.layer_count),
             "name": f"L{layer_index}",
             "layerType": "llm_block",
             "nodeCount": len(layer_nodes),
@@ -1124,10 +1359,31 @@ def _edge_rows(paths: list[ActivationPath], prompt_styles: dict[str, dict[str, A
     return rows
 
 
-def _path_rows(paths: list[ActivationPath], layer_count: int, prompt_styles: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+def _layer_x(layer: int, layer_ordinals: dict[int, int], layer_count: int) -> float:
+    ordinal = layer_ordinals.get(layer)
+    if ordinal is None:
+        ordinal = min(max(layer, 0), max(layer_count - 1, 0))
+    if layer_count <= 1:
+        return 0.5
+    return ordinal / (layer_count - 1)
+
+
+def _nearest_render_layer(target: int | None, layer_ids: list[int]) -> int | None:
+    if not layer_ids:
+        return None
+    if target is None:
+        return layer_ids[0]
+    return min(layer_ids, key=lambda layer: (abs(layer - target), layer))
+
+
+def _path_rows(
+    paths: list[ActivationPath],
+    render_bounds: RenderLayerBounds,
+    prompt_styles: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     prompt_styles = prompt_styles or {}
     path_rows = []
-    max_layer = max(layer_count - 1, 1)
+    layer_ordinals = {layer: index for index, layer in enumerate(render_bounds.layer_ids)}
     for path in paths:
         path_style = _style_for_prompt(prompt_styles, path.prompt_id)
         points = [
@@ -1137,7 +1393,7 @@ def _path_rows(paths: list[ActivationPath], layer_count: int, prompt_styles: dic
                 "groupId": node.node_id,
                 "nodeId": node.node_id,
                 "groupIndex": node.cluster_id if isinstance(node.cluster_id, int) else 0,
-                "x": node.layer / max_layer,
+                "x": _layer_x(node.layer, layer_ordinals, render_bounds.layer_count),
                 "y": node.y,
                 "activationValue": node.activation,
                 "normalizedActivation": node.normalized_activation,
@@ -1165,7 +1421,7 @@ def _path_rows(paths: list[ActivationPath], layer_count: int, prompt_styles: dic
                 "layerIndex": node.layer,
                 "groupId": node.node_id,
                 "nodeId": node.node_id,
-                "x": node.layer / max_layer,
+                "x": _layer_x(node.layer, layer_ordinals, render_bounds.layer_count),
                 "y": node.y,
                 "activationValue": node.activation,
                 "normalizedActivation": node.normalized_activation,
@@ -1264,6 +1520,7 @@ def build_activation_map_payload(
     selected_group: str | None = None,
     selected_batch: str | None = None,
     *,
+    backend_info: dict[str, Any] | None = None,
     visualization_mode: str | None = None,
     selected_prompt: Any = None,
     selected_token: int | None = None,
@@ -1282,6 +1539,7 @@ def build_activation_map_payload(
         artifact,
         summary,
         local_model_context,
+        backend_info=backend_info,
         visualization_mode=visualization_mode,
         selected_prompt=selected_prompt,
         selected_token=selected_token,
@@ -1289,14 +1547,14 @@ def build_activation_map_payload(
         top_k=top_k,
     )
     data_mode = activation_map.diagnostics.get("dataMode", "unavailable")
-    model_meta["layerCount"] = activation_map.layer_count
+    render_bounds = activation_map.render_bounds or resolve_render_layers(artifact, backend_info, model_meta)
     model_meta["visualizationMode"] = activation_map.mode
     model_meta["dataMode"] = data_mode
 
     batches = _batch_rows(artifact)
-    layers = _layer_rows(activation_map.layer_count, activation_map.nodes, data_mode)
+    layers = _layer_rows(render_bounds, activation_map.nodes, data_mode)
     if layers:
-        valid_selected_layer = selected_layer if selected_layer is not None and 0 <= selected_layer < len(layers) else 0
+        valid_selected_layer = _nearest_render_layer(selected_layer, render_bounds.layer_ids)
         for layer in layers:
             layer["selected"] = layer["index"] == valid_selected_layer
     prompt_color_plan = _build_prompt_color_plan(activation_map.mode, [path.prompt_id for path in activation_map.paths])
@@ -1305,7 +1563,7 @@ def build_activation_map_payload(
     annotations = load_annotations(annotations_path)
     _apply_annotation_matches(model_meta, node_groups, activation_map.heatmap, annotations)
     edge_rows = [edge for edge in _edge_rows(activation_map.paths, prompt_styles) if edge.get("weight", 0.0) >= edge_threshold]
-    activation_paths = _path_rows(activation_map.paths, activation_map.layer_count, prompt_styles)
+    activation_paths = _path_rows(activation_map.paths, render_bounds, prompt_styles)
 
     selected_layer_row = next((layer for layer in layers if layer.get("selected")), layers[0] if layers else None)
     selected_group_row = next((group for group in node_groups if group["groupId"] == selected_group), None)

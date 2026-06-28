@@ -18,7 +18,7 @@ from glass_skull.activation_patch import (
 from glass_skull.behavior_profiles import get_behavior_profile, list_behavior_profiles
 from glass_skull.behavior_scoring import behavior_timeline_df, score_run_artifact
 from glass_skull.chat_store import list_chats, load_chat, save_chat
-from glass_skull.config import DEFAULT_GGUF_MODEL_PATH, ensure_dirs
+from glass_skull.config import DEFAULT_BATCH_MESSAGES, DEFAULT_GGUF_MODEL_PATH, ensure_dirs, seed_missing_defaults
 from glass_skull.experiment_store import (
     create_experiment_dir,
     latest_run_artifacts,
@@ -161,6 +161,7 @@ def init_state() -> None:
         "last_behavior_scores": pd.DataFrame(),
         "behavior_run_history": [],
         "behavior_profile": "concise_helpfulness",
+        "batch_pasted_prompts": DEFAULT_BATCH_MESSAGES,
         "batch_running": False,
         "batch_status": "",
         "chat_cancel_requested": False,
@@ -185,9 +186,7 @@ def init_state() -> None:
         "map_annotation_note": "",
         "map_annotation_status": "",
     }
-    for key, value in defaults.items():
-        if key not in st.session_state or (key == "llama_model_path" and not st.session_state.get(key)):
-            st.session_state[key] = value
+    seed_missing_defaults(st.session_state, defaults)
 
 
 def plot_if_present(fig, key_hint: str = "plot") -> None:
@@ -478,6 +477,8 @@ def apply_known_tab_state(tab_name: str, state: dict | None) -> None:
         return
     if tab_name == "Run" and state.get("active_run_mode") in {"Single message", "Batch run"}:
         st.session_state.active_run_mode = state["active_run_mode"]
+    if tab_name == "Run" and "batch_pasted_prompts" in state:
+        st.session_state.batch_pasted_prompts = state["batch_pasted_prompts"]
     if tab_name == "Map":
         mapping = {
             "visualization_mode": "map_visualization_mode",
@@ -611,6 +612,7 @@ def single_trace_artifact_from_llama(
             "trace_rows": trace_rows,
             "metadata": {"run_id": run_id, "mode": "Single message", "trace_error": trace_error},
         }],
+        summary={"backend_info": dash_meta.get("backend_info")} if isinstance(dash_meta.get("backend_info"), dict) else None,
     )
 
 
@@ -1083,9 +1085,10 @@ def run_app() -> None:
             if uploaded is not None:
                 uploaded_items = load_prompt_file_bytes(uploaded.name, uploaded.getvalue())
                 st.caption(f"Loaded {len(uploaded_items)} prompts.")
-            pasted = st.text_area("Pasted prompts", height=120)
+            pasted = st.text_area("Pasted prompts", height=120, key="batch_pasted_prompts")
             repeat = st.text_input("Repeat current prompt", value="")
             repeat_count = st.number_input("Repeat count", 1, 1000, 1)
+            _tab_state("Run")["batch_pasted_prompts"] = st.session_state.batch_pasted_prompts
         else:
             uploaded_items = []
             pasted = ""
@@ -1164,6 +1167,7 @@ def run_app() -> None:
             st.session_state.chat_messages.append({"role": "assistant", "content": output, "ts": datetime.now().strftime("%H:%M:%S")})
             save_chat(st.session_state.chat_messages)
             dash_meta = st.session_state.get("local_dashboard_trace_meta", {}) or {"prompt": prompt, "backend": chat_backend, "trace_model": active_model_label(), "run_id": run_id}
+            dash_meta["backend_info"] = local_glass_info
             artifact = single_trace_artifact_from_llama(trace_payload or {}, dash_meta, output=output, error=error, trace_error=trace_error)
             store_behavior_artifact(artifact)
             persist_single_run_artifact(artifact)
@@ -1205,6 +1209,7 @@ def run_app() -> None:
                         streams=["resid_pre"],
                         top_k=32,
                         include_vectors=include_trace_vectors,
+                        backend_info=local_glass_info,
                         run_id=run_id,
                         mode="Batch run",
                         progress_callback=cb,
@@ -1318,6 +1323,7 @@ def run_app() -> None:
                 artifact,
                 summary,
                 local_model_context=local_context,
+                backend_info=local_glass_info,
                 visualization_mode=None if st.session_state.map_visualization_mode == "auto" else st.session_state.map_visualization_mode,
                 selected_prompt=st.session_state.map_selected_prompt,
                 selected_token=int(st.session_state.map_selected_token) if st.session_state.map_selected_token is not None else None,

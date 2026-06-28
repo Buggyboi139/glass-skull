@@ -10,15 +10,28 @@ from typing import Any
 
 import pandas as pd
 
-from glass_skull.activation_map import build_activation_map_payload, build_model_meta, inspect_trace_artifact
+from glass_skull.activation_map import (
+    build_activation_map_payload,
+    build_model_meta,
+    inspect_trace_artifact,
+    resolve_render_layers,
+)
 from glass_skull.activation_map_view import activation_map_html
 from glass_skull.behavior_profiles import get_behavior_profile, list_behavior_profiles
 from glass_skull.behavior_scoring import behavior_timeline_df, score_behavior_output, score_run_artifact
 from glass_skull.chat_store import load_chat, save_chat
-from glass_skull.config import CONTROL_SET_DIR, CONTROL_VECTOR_DIR, DEFAULT_GGUF_MODEL_PATH, ensure_dirs
+from glass_skull.config import (
+    CONTROL_SET_DIR,
+    CONTROL_VECTOR_DIR,
+    DEFAULT_BATCH_MESSAGES,
+    DEFAULT_GGUF_MODEL_PATH,
+    ensure_dirs,
+    seed_missing_defaults,
+)
 from glass_skull.experiment_store import safe_slug
 from glass_skull.fuzzing import run_fuzz_experiment
 from glass_skull import activation_map_view
+from glass_skull.activation_map_view import _legend_panel_html
 from glass_skull.node_annotations import (
     add_tag,
     delete_annotation,
@@ -70,6 +83,7 @@ from glass_skull.visuals import (
     path_rank_bar_fig,
 )
 from glass_skull.workspaces import (
+    apply_workspace_state,
     clear_tab_state,
     clear_workspace,
     load_tab_state,
@@ -433,6 +447,7 @@ def _assert_workspace_round_trip() -> None:
         "llama_model_alias": "local",
         "llama_model_path": str(DEFAULT_GGUF_MODEL_PATH),
         "active_run_mode": "Batch run",
+        "batch_pasted_prompts": "edited\nbatch\nprompts",
         "behavior_profile": "concise_helpfulness",
         "map_visualization_mode": "batch_overlay",
         "map_selected_prompt": 2,
@@ -452,6 +467,7 @@ def _assert_workspace_round_trip() -> None:
     data = json.loads(saved.path.read_text(encoding="utf-8"))
     assert data["scope"] == "global"
     assert data["state"]["active_run_id"] == "run-a"
+    assert data["state"]["batch_pasted_prompts"] == "edited\nbatch\nprompts"
     assert data["state"]["model"]["alias"] == "local"
     assert data["state"]["map"]["selected_prompt"] == 2
     assert data["state"]["tab_state"]["Map"]["selected_group"] == "L0-N1"
@@ -463,6 +479,7 @@ def _assert_workspace_round_trip() -> None:
     assert renamed.name == "smoke_global_as"
     loaded = load_workspace("smoke_global")
     assert loaded.state["active_run_id"] == "run-a"
+    assert loaded.state["batch_pasted_prompts"] == "edited\nbatch\nprompts"
     assert loaded.error is None
     assert load_workspace("missing-workspace").warning
 
@@ -484,9 +501,11 @@ def _assert_workspace_round_trip() -> None:
     assert tab_data["scope"] == "tab"
     assert tab_data["tab_name"] == "Map"
     assert tab_data["state"] == {"selected_group": "L1-N2", "zoom": 2}
-    run_tab_saved = save_tab_state_as("Run", {"draft": "run-only"}, "smoke_run")
+    run_tab_saved = save_tab_state_as("Run", {"draft": "run-only", "batch_pasted_prompts": ""}, "smoke_run")
     loaded_tab = load_tab_state("Map", "smoke_map")
     assert loaded_tab.state == {"selected_group": "L1-N2", "zoom": 2}
+    loaded_run_tab = load_tab_state("Run", "smoke_run")
+    assert loaded_run_tab.state["batch_pasted_prompts"] == ""
     tab_state["tab_state"]["Map"] = loaded_tab.state
     assert tab_state["tab_state"]["Run"] == {"draft": "keep"}
     clear_tab_state(tab_state, "Map")
@@ -628,6 +647,41 @@ def _path_fixture_artifact(prompt_count: int, *, vector: bool = False, scalar_on
     )
 
 
+def _layer_count_fixture_artifact(layer_ids: list[int], *, prompt_id: int = 0, vector: bool = False) -> dict[str, Any]:
+    trace_rows = []
+    for index, layer in enumerate(layer_ids):
+        row: dict[str, Any] = {
+            "layer": layer,
+            "stream": "resid_pre",
+            "token_index": 0,
+            "token": "tok",
+            "activation_norm": 1.0 + index * 0.05,
+        }
+        if vector:
+            row["vector"] = [1.0, 0.0, 0.0, 0.0]
+        else:
+            row["top_dims"] = [{"dimension": layer % 24, "activation": 1.0}]
+        trace_rows.append(row)
+    return build_run_artifact(
+        run_id=f"layers_{len(layer_ids)}",
+        mode="local",
+        backend="llama.cpp",
+        model="local",
+        prompts=[{
+            "prompt_id": prompt_id,
+            "label": "layers",
+            "prompt": "trace layers",
+            "output": "ok",
+            "trace_rows": normalize_llama_trace(
+                {"layer_inputs": trace_rows, "activations": {"vectors": vector, "n_embd": 4 if vector else 24}},
+                prompt_id=prompt_id,
+                label="layers",
+                metadata={"run_id": f"layers_{len(layer_ids)}"},
+            ),
+        }],
+    )
+
+
 def _overlap_path_fixture_artifact() -> dict[str, Any]:
     prompts = []
     for prompt_id, prompt_text in [(0, "shared alpha prompt"), (1, "shared beta prompt")]:
@@ -741,7 +795,32 @@ def main() -> None:
     _assert_managed_llama_defaults()
     assert DEFAULT_GGUF_MODEL_PATH == Path("/home/dsmason321/models/Best/Qwen3.6-35B-heretic-MTP-Q4_K_S.gguf")
     main_source = Path("main.py").read_text()
-    assert 'key == "llama_model_path" and not st.session_state.get(key)' in main_source
+    default_batch_lines = DEFAULT_BATCH_MESSAGES.splitlines()
+    assert len(default_batch_lines) == 15
+    assert default_batch_lines == [
+        "What is the capital of Mongolia?",
+        "Name one mammal that can glide without powered flight.",
+        "Why do leaves change color in autumn?",
+        "Convert 98.6°F to Celsius.",
+        "What is the primary purpose of DNS?",
+        "Who painted the ceiling of the Sistine Chapel?",
+        "What does the acronym SQL stand for?",
+        "How many moons does Mars have?",
+        "What is the largest organ in the human body?",
+        'Define the term "opportunity cost" in one sentence.',
+        "Which programming language introduced the `async` and `await` keywords first?",
+        "What causes a rainbow to appear?",
+        "Name one advantage of using a hash table.",
+        "What year did the first human land on the Moon?",
+        "Explain the difference between RAM and SSD in one sentence.",
+    ]
+    assert "98.6°F" in DEFAULT_BATCH_MESSAGES
+    assert "`async` and `await`" in DEFAULT_BATCH_MESSAGES
+    assert '"opportunity cost"' in DEFAULT_BATCH_MESSAGES
+    assert '"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES' in main_source
+    assert 'key="batch_pasted_prompts"' in main_source
+    assert '"batch_pasted_prompts"' in Path("glass_skull/workspaces.py").read_text()
+    assert "seed_missing_defaults(st.session_state, defaults)" in main_source
     assert "persist_single_run_artifact(artifact)" in main_source
     assert "latest_saved_behavior_artifact()" in main_source
     assert 'DEFAULT_CHAT_INPUT = "hi"' in main_source
@@ -765,6 +844,17 @@ def main() -> None:
     assert [p.label for p in labeled] == ["x", "unlabeled"]
     batch = batch_items_from_inputs(pasted_payload="pasted", repeat_prompt="again", repeat_count=2, uploaded_items=labeled)
     assert len(batch) == 5
+    user_batch_state = {"batch_pasted_prompts": "custom\ncontent"}
+    original_user_batch = dict(user_batch_state)
+    seed_missing_defaults(user_batch_state, {"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES})
+    assert user_batch_state == original_user_batch
+    cleared_batch_state = {"batch_pasted_prompts": ""}
+    seed_missing_defaults(cleared_batch_state, {"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES})
+    assert cleared_batch_state["batch_pasted_prompts"] == ""
+    saved_batch_state = {"batch_pasted_prompts": "loaded workspace prompt"}
+    target_batch_state = {"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES}
+    apply_workspace_state(target_batch_state, saved_batch_state)
+    assert target_batch_state["batch_pasted_prompts"] == "loaded workspace prompt"
     assert dashboard_context("Batch run", "abc") == {"mode": "Batch run", "run_id": "abc"}
     assert new_run_id("unit").startswith("unit_")
     _assert_workspace_round_trip()
@@ -890,12 +980,30 @@ def main() -> None:
     assert payload["diagnostics"]["vectorsPresent"] is False
     assert payload["diagnostics"]["includeVectorsResponse"] is False
     assert payload["diagnostics"]["warnings"]
+    assert payload["diagnostics"]["renderLayerSource"] == "trace_rows"
+    assert payload["diagnostics"]["renderLayerCount"] == 2
+    assert payload["diagnostics"]["renderFirstLayer"] == 0
+    assert payload["diagnostics"]["renderLastLayer"] == 1
+    assert payload["diagnostics"]["traceLayerCount"] == 2
+    assert payload["diagnostics"]["traceMinLayer"] == 0
+    assert payload["diagnostics"]["traceMaxLayer"] == 1
+    assert payload["diagnostics"]["backendInfoLayerCount"] is None
+    assert payload["diagnostics"]["modelMetaLayerCount"] == 2
     layer0_groups = [group for group in payload["nodeGroups"] if group["layerId"] == "L0" and group["activationValue"] > 0]
     assert len(layer0_groups) > 1
     assert all(edge["method"] != "cosine_similarity" for edge in payload["activationEdges"])
     assert all(edge["tokenIndex"] == payload["activationPaths"][0]["tokenIndex"] for edge in payload["activationEdges"])
     html = activation_map_html(payload)
     assert "canvas" in html and "selectedDiagnostics" in html and "Activation path unavailable" not in html
+    assert "function clamp(" in html
+    assert "function withPanelClip(" in html
+    assert "clampedPoint(" in html
+    assert "function nearestValidLayerId" in html
+    assert "function layerOrdinal" in html
+    assert "layerX(`L${cell.layer}`" in html
+    assert "groupIndexOffset" in html
+    assert "drawSelectedTarget(x + w / 2, y + h / 2 + 6, selected.groupId, drilldownBounds);" in html
+    assert "drawSelectedTarget(x + w / 2, y + h / 2 + 6, selected.groupId);" not in html
     assert "Real activation vectors were not returned" in html
     assert "identities.has" in html
     assert "rendererOptions.visualizationMode === 'aggregate_heatmap' ? null : pathByBatchId" in html
@@ -913,6 +1021,7 @@ def main() -> None:
     assert "function box2Alpha" in html
     assert "selectedGroupOutline" in html
     assert "box2NodeRenderDiagnostics" in html
+    assert "const selectedEdge = edgeById(selected.edgeId) || null;" in html
 
     vector_artifact = build_run_artifact(
         run_id="vector1",
@@ -947,6 +1056,68 @@ def main() -> None:
     assert len([group for group in vector_payload["nodeGroups"] if group["layerId"] == "L0"]) >= 2
     assert vector_payload["activationEdges"]
     assert {edge["method"] for edge in vector_payload["activationEdges"]} == {"cosine_similarity"}
+
+    qwen_layers = list(range(40))
+    qwen_artifact = _layer_count_fixture_artifact(qwen_layers)
+    qwen_meta = {**local_meta, "block_count": 40}
+    qwen_summary = {**summary, "layers": 40}
+    qwen_bounds = resolve_render_layers(qwen_artifact, {"layers": 40}, build_model_meta(qwen_summary, qwen_meta, "llama.cpp"))
+    assert qwen_bounds.layer_ids == qwen_layers
+    qwen_payload = build_activation_map_payload(qwen_artifact, qwen_summary, local_model_context=qwen_meta, backend_info={"layers": 40})
+    assert len(qwen_payload["layers"]) == 40
+    assert qwen_payload["layers"][0]["layerId"] == "L0"
+    assert qwen_payload["layers"][-1]["layerId"] == "L39"
+    assert qwen_payload["diagnostics"]["renderLayerSource"] == "trace_rows"
+    assert qwen_payload["diagnostics"]["renderLayerCount"] == 40
+    assert qwen_payload["diagnostics"]["traceMaxLayer"] == 39
+
+    gemma_layers = list(range(31))
+    gemma_artifact = _layer_count_fixture_artifact(gemma_layers)
+    gemma_meta = {**local_meta, "display_name": "gemma-4-31b", "architecture": "gemma", "block_count": 63}
+    gemma_summary = {**summary, "model_name": "gemma-4-31b", "layers": 63}
+    gemma_payload = build_activation_map_payload(gemma_artifact, gemma_summary, local_model_context=gemma_meta, backend_info={"layers": 63})
+    assert len(gemma_payload["layers"]) == 31
+    assert [layer["index"] for layer in gemma_payload["layers"]] == gemma_layers
+    assert gemma_payload["layers"][-1]["layerId"] == "L30"
+    assert all(group["layer"] <= 30 for group in gemma_payload["nodeGroups"])
+    assert all(point["layerIndex"] <= 30 and point["x"] <= 1.0 for path in gemma_payload["activationPaths"] for point in path["points"])
+    assert gemma_payload["activationPaths"][0]["points"][-1]["layerId"] == "L30"
+    assert gemma_payload["diagnostics"]["renderLayerCount"] == 31
+    assert gemma_payload["diagnostics"]["backendInfoLayerCount"] == 63
+    assert gemma_payload["diagnostics"]["modelMetaLayerCount"] == 63
+    assert gemma_payload["diagnostics"]["layerMismatchWarning"]
+    assert "trace layers 31" in gemma_payload["diagnostics"]["layerMismatchWarning"]
+
+    incomplete_artifact = _layer_count_fixture_artifact([0, 1, 2])
+    incomplete_artifact["prompts"][0]["trace_rows"] = [
+        row for row in incomplete_artifact["prompts"][0]["trace_rows"] if row.get("layer") != 2
+    ] + [{
+        "run_id": incomplete_artifact["run_id"],
+        "prompt_id": 99,
+        "batch_id": "batch-other",
+        "label": "other",
+        "prompt_text": "other",
+        "layer": 2,
+        "stream": "resid_pre",
+        "token_index": 0,
+        "token": "tok",
+        "activation_norm": 1.0,
+        "trace_available": True,
+        "trace_source": "llama.cpp",
+        "top_dims": [{"dimension": 3, "activation": 1.0}],
+    }]
+    incomplete_payload = build_activation_map_payload(incomplete_artifact, summary, local_model_context={**local_meta, "block_count": 3}, selected_prompt=0)
+    assert incomplete_payload["diagnostics"]["renderLastLayer"] == 2
+    assert incomplete_payload["diagnostics"]["pathCompletenessWarning"]
+
+    sparse_artifact = _layer_count_fixture_artifact([0, 2, 4])
+    sparse_payload = build_activation_map_payload(sparse_artifact, {**summary, "layers": 9}, local_model_context={**local_meta, "block_count": 9})
+    assert [layer["index"] for layer in sparse_payload["layers"]] == [0, 2, 4]
+    assert sparse_payload["diagnostics"]["renderLayerCount"] == 3
+    assert sparse_payload["diagnostics"]["layerMismatchWarning"]
+
+    selected_clamp_payload = build_activation_map_payload(gemma_artifact, gemma_summary, local_model_context=gemma_meta, selected_layer=62)
+    assert selected_clamp_payload["diagnostics"]["selectedLayer"]["layerId"] == "L30"
 
     batch_path_artifact = build_run_artifact(
         run_id="batch_paths",
@@ -1010,6 +1181,12 @@ def main() -> None:
         path["promptId"]: path["promptColor"] for path in rerendered_batch_payload["activationPaths"]
     } == {path["promptId"]: path["promptColor"] for path in batch_paths}
     batch_html = activation_map_html(batch_path_payload)
+    legend_html = _legend_panel_html(batch_path_payload)
+    assert "gs-prompt-legend-panel" in legend_html
+    assert "width: 10px;" in legend_html
+    legend_source = inspect.getsource(activation_map_view._legend_panel_html)
+    assert '""" %' not in legend_source
+    assert "% (" not in legend_source
     assert "drawPromptLegend" not in batch_html
     assert "drawPromptLegend(rect)" not in batch_html
     assert batch_path_payload["promptLegendPanel"]["placement"] == "external_below_graph"

@@ -314,6 +314,32 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     return (payload.layers || []).find((layer) => layer.layerId === layerId) || null;
   }}
 
+  function validLayerIds() {{
+    return (payload.layers || []).map((layer) => layer.layerId);
+  }}
+
+  function layerOrdinal(layerId) {{
+    const layer = layerById(layerId);
+    if (layer && Number.isFinite(Number(layer.renderIndex))) return Number(layer.renderIndex);
+    if (layer && Number.isFinite(Number(layer.ordinal))) return Number(layer.ordinal);
+    return validLayerIds().indexOf(layerId);
+  }}
+
+  function nearestValidLayerId(layerId) {{
+    const layers = payload.layers || [];
+    if (!layers.length) return null;
+    if (layerById(layerId)) return layerId;
+    const target = Number(String(layerId || '').replace('L', ''));
+    if (!Number.isFinite(target)) return layers[0].layerId;
+    return layers
+      .slice()
+      .sort((left, right) => {{
+        const leftIndex = Number(left.index ?? String(left.layerId || '').replace('L', ''));
+        const rightIndex = Number(right.index ?? String(right.layerId || '').replace('L', ''));
+        return Math.abs(leftIndex - target) - Math.abs(rightIndex - target) || leftIndex - rightIndex;
+      }})[0]?.layerId || layers[0].layerId;
+  }}
+
   function groupsForLayer(layerId) {{
     return (payload.nodeGroups || []).filter((group) => group.layerId === layerId);
   }}
@@ -336,7 +362,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
 
   function syncSelection() {{
     if (!layerById(selected.layerId) && payload.layers?.length) {{
-      selected.layerId = payload.layers[0].layerId;
+      selected.layerId = nearestValidLayerId(selected.layerId);
     }}
     const layerGroups = groupsForLayer(selected.layerId);
     if (!groupById(selected.groupId) || (groupById(selected.groupId) && groupById(selected.groupId).layerId !== selected.layerId)) {{
@@ -438,6 +464,28 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     const sx = x1 + t * dx;
     const sy = y1 + t * dy;
     return Math.hypot(px - sx, py - sy);
+  }}
+
+  function clamp(value, min, max) {{
+    const number = Number(value);
+    if (!Number.isFinite(number)) return min;
+    return Math.max(min, Math.min(max, number));
+  }}
+
+  function clampedPoint(x, y, bounds) {{
+    return {{
+      x: clamp(x, bounds.left, bounds.right),
+      y: clamp(y, bounds.top, bounds.bottom),
+    }};
+  }}
+
+  function withPanelClip(bounds, draw) {{
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top);
+    ctx.clip();
+    draw();
+    ctx.restore();
   }}
 
   function panel(x, y, w, h) {{
@@ -595,10 +643,9 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   }}
 
   function layerX(layerId, left, right) {{
-    const layer = layerById(layerId);
     const layers = payload.layers || [];
-    const parsedIndex = Number(String(layerId || '').replace('L', ''));
-    const index = layer?.index ?? (Number.isFinite(parsedIndex) ? parsedIndex : 0);
+    const ordinal = layerOrdinal(layerId);
+    const index = ordinal >= 0 ? ordinal : 0;
     return layers.length > 1 ? left + (index / (layers.length - 1)) * (right - left) : left + (right - left) / 2;
   }}
 
@@ -666,10 +713,8 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
 
   function drawHeatmapCloud(left, right, top, bottom) {{
     const cells = payload.heatmap || [];
-    const layers = payload.layers || [];
-    const maxLayer = Math.max(1, (layers.length || payload.modelMeta?.layerCount || 1) - 1);
     cells.forEach((cell) => {{
-      const x = left + (Number(cell.layer || 0) / maxLayer) * (right - left);
+      const x = layerX(`L${{cell.layer}}`, left, right);
       const y = top + Number(cell.y ?? 0.5) * (bottom - top);
       const intensity = Math.max(0, Math.min(1, Number(cell.normalizedActivation || 0)));
       const r = 3 + Math.sqrt(Math.max(1, Number(cell.count || 1))) * 1.8 + intensity * 6;
@@ -969,7 +1014,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     );
   }}
 
-  function drawSelectedTarget(x, y, groupId) {{
+  function drawSelectedTarget(x, y, groupId, bounds = null) {{
     const selectedGroup = groupById(groupId);
     const selectedLayer = layerById(selected.layerId);
     const selectedPath = rendererOptions.visualizationMode === 'aggregate_heatmap' ? null : pathByBatchId(selected.batchId);
@@ -981,22 +1026,30 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
       : points.slice(0, 3);
 
     if (rendererOptions.visualizationMode !== 'aggregate_heatmap' && previewPoints.length > 1) {{
-      const startX = x - 120;
-      const span = 240;
-      ctx.save();
-      ctx.beginPath();
-      previewPoints.forEach((point, index) => {{
-        const px = startX + (previewPoints.length === 1 ? span / 2 : (index / (previewPoints.length - 1)) * span);
-        const py = y + (point.groupIndex - (previewPoints[0].groupIndex || 0)) * 18;
-        if (index === 0) ctx.moveTo(px, py);
-        else ctx.lineTo(px, py);
+      const previewBounds = bounds || {{ left: x - 150, right: x + 150, top: y - 58, bottom: y + 58 }};
+      const startX = clamp(x - 120, previewBounds.left, previewBounds.right);
+      const span = Math.min(240, previewBounds.right - previewBounds.left);
+      const baseGroupIndex = Number(previewPoints[0]?.groupIndex);
+      const groupIndexBase = Number.isFinite(baseGroupIndex) ? baseGroupIndex : 0;
+      withPanelClip(previewBounds, () => {{
+        ctx.save();
+        ctx.beginPath();
+        previewPoints.forEach((point, index) => {{
+          const rawGroupIndex = Number(point?.groupIndex);
+          const groupIndexOffset = Number.isFinite(rawGroupIndex) ? rawGroupIndex - groupIndexBase : 0;
+          const px = startX + (previewPoints.length === 1 ? span / 2 : (index / (previewPoints.length - 1)) * span);
+          const py = y + groupIndexOffset * 18;
+          const local = clampedPoint(px, py, previewBounds);
+          if (index === 0) ctx.moveTo(local.x, local.y);
+          else ctx.lineTo(local.x, local.y);
+        }});
+        ctx.strokeStyle = 'rgba(98, 228, 255, 0.65)';
+        ctx.lineWidth = 3;
+        ctx.shadowColor = 'rgba(79, 214, 255, 0.30)';
+        ctx.shadowBlur = 12;
+        ctx.stroke();
+        ctx.restore();
       }});
-      ctx.strokeStyle = 'rgba(98, 228, 255, 0.65)';
-      ctx.lineWidth = 3;
-      ctx.shadowColor = 'rgba(79, 214, 255, 0.30)';
-      ctx.shadowBlur = 12;
-      ctx.stroke();
-      ctx.restore();
     }}
 
     ctx.save();
@@ -1025,6 +1078,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     const selectedGroup = groupById(selected.groupId) || base.selectedGroup || null;
     const selectedBatch = batchById(selected.batchId) || base.selectedBatch || null;
     const selectedPath = pathByBatchId(selected.batchId) || null;
+    const selectedEdge = edgeById(selected.edgeId) || null;
     const pathPoints = selectedPath?.points || [];
     const selectedPoint = pathPoints.find((point) => point.groupId === selected.groupId)
       || pathPoints.find((point) => point.layerId === selected.layerId)
@@ -1118,15 +1172,18 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     }}
     ctx.restore();
 
-    if (shouldDrawHeatmap()) {{
-      drawHeatmapCloud(left, right, top, bottom);
-    }}
-    if (rendererOptions.visualizationMode !== 'aggregate_heatmap') {{
-      edges.forEach((edge) => drawEdge(edge, left, right, top, bottom));
-      paths.forEach((path, index) => drawPath(path, left, right, top, bottom, index));
-    }}
+    const overviewBounds = {{ left, right, top, bottom }};
+    withPanelClip(overviewBounds, () => {{
+      if (shouldDrawHeatmap()) {{
+        drawHeatmapCloud(left, right, top, bottom);
+      }}
+      if (rendererOptions.visualizationMode !== 'aggregate_heatmap') {{
+        edges.forEach((edge) => drawEdge(edge, left, right, top, bottom));
+        paths.forEach((path, index) => drawPath(path, left, right, top, bottom, index));
+      }}
+      groups.forEach((group) => drawOverviewNode(group, left, right, top, bottom));
+    }});
     layers.forEach((layer, index) => drawFret(layer, index, layers.length, left, right, top, bottom));
-    groups.forEach((group) => drawOverviewNode(group, left, right, top, bottom));
   }}
 
   function drawLayerPane(rect) {{
@@ -1134,7 +1191,10 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     panel(x, y, w, h);
     const layer = layerById(selected.layerId) || payload.layers?.[0] || null;
     const groups = (payload.nodeGroups || []).filter((g) => g.layerId === selected.layerId);
-    groups.forEach((group, index) => drawGroupDot(group, index, groups.length, x + 76, y + 46, w - 132, h - 70, groups));
+    const layerBounds = {{ left: x + 76, right: x + w - 56, top: y + 46, bottom: y + h - 24 }};
+    withPanelClip(layerBounds, () => {{
+      groups.forEach((group, index) => drawGroupDot(group, index, groups.length, x + 76, y + 46, w - 132, h - 70, groups));
+    }});
     if (layer) {{
       drawLabel(layer.name || layer.layerId, x + 18, y + 19, 'left', 'rgba(141, 228, 255, 0.82)', 11, 700);
     }}
@@ -1146,7 +1206,10 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   function drawDrilldownPane(rect) {{
     const x = 62, y = Math.max(530, rect.height * 0.64), w = rect.width - 124, h = 150;
     panel(x, y, w, h);
-    drawSelectedTarget(x + w / 2, y + h / 2 + 6, selected.groupId);
+    const drilldownBounds = {{ left: x + 18, right: x + w - 18, top: y + 42, bottom: y + h - 18 }};
+    withPanelClip(drilldownBounds, () => {{
+      drawSelectedTarget(x + w / 2, y + h / 2 + 6, selected.groupId, drilldownBounds);
+    }});
   }}
 
   function drawDiagnostics(rect) {{
@@ -1254,12 +1317,11 @@ def _legend_panel_html(payload: dict) -> str:
         label = html.escape(str(entry.get("label") or entry.get("promptPreview") or f"prompt {prompt_id}"))
         selected = str(entry.get("promptId")) == str(selected_prompt) if selected_prompt is not None else False
         rows.append(
-            "<div class='gs-prompt-legend-row%s' data-prompt-id='%s'>"
-            "<span class='gs-prompt-legend-swatch' style='background:%s'></span>"
-            "<span class='gs-prompt-legend-id'>%s</span>"
-            "<span class='gs-prompt-legend-label'>%s</span>"
+            f"<div class='gs-prompt-legend-row{' is-selected' if selected else ''}' data-prompt-id='{prompt_id}'>"
+            f"<span class='gs-prompt-legend-swatch' style='background:{color}'></span>"
+            f"<span class='gs-prompt-legend-id'>{prompt_id}</span>"
+            f"<span class='gs-prompt-legend-label'>{label}</span>"
             "</div>"
-            % (" is-selected" if selected else "", prompt_id, color, prompt_id, label)
         )
     more_count = int(panel.get("moreCount") or 0)
     if more_count:
@@ -1332,11 +1394,11 @@ def _legend_panel_html(payload: dict) -> str:
 <div class="gs-prompt-legend-panel">
   <div class="gs-prompt-legend-title">Prompt paths</div>
   <div class="gs-prompt-legend-list">
-    %s
+    """ + "\n".join(rows) + """
   </div>
-  %s
+  """ + warning + """
 </div>
-""" % ("\n".join(rows), warning)
+"""
 
 
 def render_activation_map(payload: dict, key: str = "activation_map_canvas", height: int = 960) -> None:

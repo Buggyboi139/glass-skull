@@ -34,6 +34,7 @@ def run_fuzz_experiment(
     streams: list[str] | None = None,
     top_k: int = 32,
     include_vectors: bool = True,
+    backend_info: dict[str, Any] | None = None,
     run_id: str | None = None,
     mode: str = "fuzz",
     progress_callback: Callable[[int, int, str], None] | None = None,
@@ -59,6 +60,7 @@ def run_fuzz_experiment(
         "streams": streams,
         "top_k": top_k,
         "include_vectors": include_vectors,
+        "backend_info": backend_info,
         "prompt_count": len(prompts),
         "run_id": run_id,
         "mode": mode,
@@ -158,6 +160,7 @@ def run_fuzz_experiment(
             "trace_enabled": trace_enabled,
             "layers": layers,
             "streams": streams,
+            **({"backend_info": backend_info} if isinstance(backend_info, dict) else {}),
         },
     )
     write_run_artifact(exp_dir, artifact)

@@ -22,6 +22,7 @@ GLOBAL_STATE_KEYS = [
     "llama_server_bin",
     "llama_cvector_generator",
     "behavior_profile",
+    "batch_pasted_prompts",
     "map_visualization_mode",
     "map_selected_prompt",
     "map_selected_batch",
