@@ -19,6 +19,17 @@ from glass_skull.config import CONTROL_SET_DIR, CONTROL_VECTOR_DIR, DEFAULT_GGUF
 from glass_skull.experiment_store import safe_slug
 from glass_skull.fuzzing import run_fuzz_experiment
 from glass_skull import activation_map_view
+from glass_skull.node_annotations import (
+    add_tag,
+    delete_annotation,
+    delete_note,
+    delete_tag,
+    get_annotations_for_node,
+    load_annotations,
+    save_annotations,
+    upsert_annotation,
+    update_note,
+)
 from glass_skull.llama_client import (
     build_steering_metadata,
     chat_completion,
@@ -57,6 +68,16 @@ from glass_skull.visuals import (
     gguf_tensor_shape_scatter_fig,
     label_activation_heatmap,
     path_rank_bar_fig,
+)
+from glass_skull.workspaces import (
+    clear_tab_state,
+    clear_workspace,
+    load_tab_state,
+    load_workspace,
+    save_tab_state,
+    save_tab_state_as,
+    save_workspace,
+    save_workspace_as,
 )
 
 
@@ -405,6 +426,163 @@ def _assert_managed_llama_defaults() -> None:
     assert "verify_glass_trace_activation_support" in launcher_source
 
 
+def _assert_workspace_round_trip() -> None:
+    state = {
+        "active_run_id": "run-a",
+        "chat_backend_label": "Local GGUF normal (llama.cpp)",
+        "llama_model_alias": "local",
+        "llama_model_path": str(DEFAULT_GGUF_MODEL_PATH),
+        "active_run_mode": "Batch run",
+        "behavior_profile": "concise_helpfulness",
+        "map_visualization_mode": "batch_overlay",
+        "map_selected_prompt": 2,
+        "map_selected_batch": "batch-2",
+        "map_selected_token": 0,
+        "map_top_k": 8,
+        "map_background_opacity": 0.24,
+        "map_edge_threshold": 0.0,
+        "llama_control_vector": "vec-a",
+        "llama_control_strength": 1.25,
+        "loaded_activation_patch_recipe": {"name": "patch-a"},
+        "tab_state": {"Map": {"selected_group": "L0-N1"}, "Run": {"draft": "hello"}},
+    }
+    saved = save_workspace(state, name="smoke_global")
+    assert saved.path.name == "smoke_global.json"
+    assert saved.path.exists()
+    data = json.loads(saved.path.read_text(encoding="utf-8"))
+    assert data["scope"] == "global"
+    assert data["state"]["active_run_id"] == "run-a"
+    assert data["state"]["model"]["alias"] == "local"
+    assert data["state"]["map"]["selected_prompt"] == 2
+    assert data["state"]["tab_state"]["Map"]["selected_group"] == "L0-N1"
+    assert data["state"]["annotations"]["path"].endswith("data/node_annotations/annotations.json")
+    assert "annotations" not in data["state"]["annotations"]
+
+    state["active_run_id"] = "run-b"
+    renamed = save_workspace_as(state, "smoke_global_as")
+    assert renamed.name == "smoke_global_as"
+    loaded = load_workspace("smoke_global")
+    assert loaded.state["active_run_id"] == "run-a"
+    assert loaded.error is None
+    assert load_workspace("missing-workspace").warning
+
+    corrupt_path = saved.path.parent / "smoke_corrupt.json"
+    corrupt_path.write_text("{not-json", encoding="utf-8")
+    corrupt = load_workspace("smoke_corrupt")
+    assert corrupt.error and "Invalid workspace JSON" in corrupt.error
+
+    clear_workspace(state)
+    assert state["active_run_id"] is None
+    assert state["last_behavior_artifact"] is None
+    assert state["tab_state"] == {}
+    assert saved.path.exists()
+
+    tab_state = {"global_marker": "keep", "tab_state": {"Map": {"selected_group": "old"}, "Run": {"draft": "keep"}}}
+    tab_saved = save_tab_state("Map", {"selected_group": "L1-N2", "zoom": 2}, name="smoke_map")
+    assert "tabs/Map" in tab_saved.path.as_posix()
+    tab_data = json.loads(tab_saved.path.read_text(encoding="utf-8"))
+    assert tab_data["scope"] == "tab"
+    assert tab_data["tab_name"] == "Map"
+    assert tab_data["state"] == {"selected_group": "L1-N2", "zoom": 2}
+    run_tab_saved = save_tab_state_as("Run", {"draft": "run-only"}, "smoke_run")
+    loaded_tab = load_tab_state("Map", "smoke_map")
+    assert loaded_tab.state == {"selected_group": "L1-N2", "zoom": 2}
+    tab_state["tab_state"]["Map"] = loaded_tab.state
+    assert tab_state["tab_state"]["Run"] == {"draft": "keep"}
+    clear_tab_state(tab_state, "Map")
+    assert tab_state["global_marker"] == "keep"
+    assert tab_state["tab_state"]["Map"] == {}
+    assert tab_state["tab_state"]["Run"] == {"draft": "keep"}
+    for path in [saved.path, renamed.path, corrupt_path, tab_saved.path, run_tab_saved.path]:
+        path.unlink(missing_ok=True)
+
+
+def _assert_node_annotation_round_trip() -> None:
+    path = Path("data/node_annotations/smoke_annotations.json")
+    path.unlink(missing_ok=True)
+    model_meta = {
+        "modelFingerprint": "model-fp-a",
+        "modelName": "local-a",
+        "backend": "llama.cpp",
+    }
+    other_model_meta = {
+        "modelFingerprint": "model-fp-b",
+        "modelName": "local-b",
+        "backend": "llama.cpp",
+    }
+
+    empty = load_annotations(path)
+    assert empty["version"] == 1
+    assert empty["annotations"] == []
+
+    created = upsert_annotation(
+        model_meta,
+        layer=5,
+        cluster_id="L5-C12",
+        node_id="L5-N1294",
+        node_range=[1024, 1199],
+        tags=[" Comedy ", "sarcasm", "comedy"],
+        note="Comedy prompts consistently light this cluster.",
+        created_from={"run_id": "run-a", "prompt_id": "p1", "prompt_excerpt": "tell me a joke"},
+        path=path,
+    )
+    assert created["id"]
+    assert created["tags"] == ["comedy", "sarcasm"]
+    assert created["note"] == "Comedy prompts consistently light this cluster."
+    assert path.exists()
+
+    saved_payload = load_annotations(path)
+    assert len(saved_payload["annotations"]) == 1
+    updated = update_note(created["id"], "Sarcastic jokes are strongest.", path=path)
+    assert updated["note"] == "Sarcastic jokes are strongest."
+    tagged = add_tag(created["id"], " Sarcasm ", path=path)
+    assert tagged["tags"] == ["comedy", "sarcasm"]
+    tagged = add_tag(created["id"], "refusal", path=path)
+    assert tagged["tags"] == ["comedy", "sarcasm", "refusal"]
+    after_delete_tag = delete_tag(created["id"], "sarcasm", path=path)
+    assert after_delete_tag["tags"] == ["comedy", "refusal"]
+    after_delete_note = delete_note(created["id"], path=path)
+    assert after_delete_note["note"] == ""
+
+    exact = get_annotations_for_node(
+        model_meta,
+        layer=5,
+        cluster_id="L5-C12",
+        node_id="L5-N1294",
+        node_range=[1024, 1199],
+        annotations=load_annotations(path),
+    )
+    assert exact["match_type"] == "exact"
+    assert exact["annotations"][0]["tags"] == ["comedy", "refusal"]
+
+    approximate = get_annotations_for_node(
+        model_meta,
+        layer=5,
+        cluster_id="L5-C99",
+        node_id="L5-N1400",
+        node_range=[1024, 1199],
+        annotations=load_annotations(path),
+    )
+    assert approximate["match_type"] == "approximate"
+    assert approximate["annotations"][0]["id"] == created["id"]
+
+    wrong_model = get_annotations_for_node(
+        other_model_meta,
+        layer=5,
+        cluster_id="L5-C12",
+        node_id="L5-N1294",
+        node_range=[1024, 1199],
+        annotations=load_annotations(path),
+    )
+    assert wrong_model["match_type"] == "none"
+    assert wrong_model["annotations"] == []
+
+    deleted = delete_annotation(created["id"], path=path)
+    assert deleted is True
+    assert load_annotations(path)["annotations"] == []
+    path.unlink(missing_ok=True)
+
+
 def _path_fixture_artifact(prompt_count: int, *, vector: bool = False, scalar_only: bool = False) -> dict[str, Any]:
     prompts = []
     for prompt_id in range(prompt_count):
@@ -444,6 +622,44 @@ def _path_fixture_artifact(prompt_count: int, *, vector: bool = False, scalar_on
     return build_run_artifact(
         run_id="path_fixture",
         mode="Batch run" if prompt_count > 1 else "Single message",
+        backend="llama.cpp",
+        model="local",
+        prompts=prompts,
+    )
+
+
+def _overlap_path_fixture_artifact() -> dict[str, Any]:
+    prompts = []
+    for prompt_id, prompt_text in [(0, "shared alpha prompt"), (1, "shared beta prompt")]:
+        trace_rows = []
+        for layer in range(3):
+            shared_dim = 5 if layer == 0 else 8 + prompt_id + layer
+            trace_rows.append({
+                "layer": layer,
+                "stream": "resid_pre",
+                "token_index": 0,
+                "token": f"shared-{prompt_id}",
+                "activation_norm": 1.0 + prompt_id * 0.2 + layer * 0.1,
+                "top_dims": [{"dimension": shared_dim, "activation": 1.0 + prompt_id * 0.2 + layer * 0.1}],
+            })
+        prompts.append({
+            "prompt_id": prompt_id,
+            "label": f"shared-{prompt_id}",
+            "prompt": prompt_text,
+            "output": f"shared output {prompt_id}",
+            "trace_rows": normalize_llama_trace(
+                {
+                    "activations": {"supported": True, "vectors": False, "n_embd": 24},
+                    "layer_inputs": trace_rows,
+                },
+                prompt_id=prompt_id,
+                label=f"shared-{prompt_id}",
+                metadata={"run_id": "overlap_fixture"},
+            ),
+        })
+    return build_run_artifact(
+        run_id="overlap_fixture",
+        mode="Batch run",
         backend="llama.cpp",
         model="local",
         prompts=prompts,
@@ -551,6 +767,8 @@ def main() -> None:
     assert len(batch) == 5
     assert dashboard_context("Batch run", "abc") == {"mode": "Batch run", "run_id": "abc"}
     assert new_run_id("unit").startswith("unit_")
+    _assert_workspace_round_trip()
+    _assert_node_annotation_round_trip()
 
     dummy_backend_patch = {"recipe": {"name": "smoke patch", "target_run_id": "run1", "patches": []}, "source_vectors": []}
     captured: list[dict[str, Any]] = []
@@ -690,6 +908,11 @@ def main() -> None:
     assert "show-aggregate" in html
     assert "show-secondary" in html
     assert "developer-diagnostics" in html
+    assert "function groupActivation" in html
+    assert "function box2Radius" in html
+    assert "function box2Alpha" in html
+    assert "selectedGroupOutline" in html
+    assert "box2NodeRenderDiagnostics" in html
 
     vector_artifact = build_run_artifact(
         run_id="vector1",
@@ -767,27 +990,142 @@ def main() -> None:
     batch_paths = batch_path_payload["activationPaths"]
     assert batch_path_payload["visualizationMode"] == "batch_overlay"
     assert batch_path_payload["diagnostics"]["rendererMode"] == "batch_overlay"
+    assert batch_path_payload["diagnostics"]["promptColorMode"] == "prompt_palette"
+    assert batch_path_payload["diagnostics"]["promptColorCount"] == 2
+    assert batch_path_payload["diagnostics"]["colorsReused"] is False
     assert len(batch_paths) == 2
     assert {path["pathMethod"] for path in batch_paths} == {"top_activation_per_layer"}
     assert [point["groupId"] for point in batch_paths[0]["points"]] != [point["groupId"] for point in batch_paths[1]["points"]]
     assert all(point["promptId"] == path["promptId"] for path in batch_paths for point in path["points"])
     assert all(point["tokenIndex"] == 0 for path in batch_paths for point in path["points"])
     assert all(edge["promptId"] == path["promptId"] for path in batch_paths for edge in path["edges"])
-    assert "Prompt path" in activation_map_html(batch_path_payload)
+    assert len({path["promptColor"] for path in batch_paths}) == 2
+    assert all(point["promptColor"] == path["promptColor"] for path in batch_paths for point in path["points"])
+    assert all(edge["promptColor"] == path["promptColor"] for path in batch_paths for edge in path["edges"])
+    assert [path["promptText"] for path in batch_paths] == ["alpha", "beta"]
+    assert all(point["promptText"] == path["promptText"] for path in batch_paths for point in path["points"])
+    assert all(edge["promptText"] == path["promptText"] for path in batch_paths for edge in path["edges"])
+    rerendered_batch_payload = build_activation_map_payload(batch_path_artifact, summary, local_model_context=local_meta)
+    assert {
+        path["promptId"]: path["promptColor"] for path in rerendered_batch_payload["activationPaths"]
+    } == {path["promptId"]: path["promptColor"] for path in batch_paths}
+    batch_html = activation_map_html(batch_path_payload)
+    assert "drawPromptLegend" not in batch_html
+    assert "drawPromptLegend(rect)" not in batch_html
+    assert batch_path_payload["promptLegendPanel"]["placement"] == "external_below_graph"
+    assert batch_path_payload["promptLegendPanel"]["entries"]
+    assert batch_path_payload["promptLegendPanel"]["entries"][0]["promptId"] == 0
+    assert "promptStyle(path)" in batch_html
+    assert "promptRows(path)" in batch_html
+    assert "promptPreviewList" in batch_html
+    assert "Prompt path" in batch_html
+    assert "box2ColorStyle(group" in batch_html
+    assert "drawPromptOverlapMarkers" in batch_html
+    assert "promptActivations" in batch_html
+    assert "prompt_id(s)" in batch_html
+    assert "batch_id(s)" in batch_html
+    assert "token_id(s)" in batch_html
+    box2 = batch_path_payload["diagnostics"]["box2"]
+    assert box2["selectedLayer"] == "L0"
+    assert box2["visibleNodeCount"] >= 2
+    assert box2["activeNodeCount"] >= 2
+    assert box2["activationScaling"] == "normalized"
+    assert box2["promptColorMode"] == "prompt_palette"
+    assert box2["overlappingPromptNodes"] == 0
+    assert box2["aggregateMode"] is False
+    box2_groups = [group for group in batch_path_payload["nodeGroups"] if group["layerId"] == "L0"]
+    assert len(box2_groups) >= 2
+    assert any(group["normalizedActivation"] > 0 for group in box2_groups)
+    assert all(group.get("promptActivations") for group in box2_groups)
+    assert all(group.get("box2Opacity", 0) > 0 for group in box2_groups)
+    assert all(group["box2Radius"] > 2.8 for group in box2_groups)
+    assert max(group["box2Radius"] for group in layer0_groups) > min(group["box2Radius"] for group in layer0_groups)
+
+    overlap_payload = build_activation_map_payload(_overlap_path_fixture_artifact(), summary, local_model_context=local_meta)
+    overlap_group = next(group for group in overlap_payload["nodeGroups"] if group["groupId"] == "L0-N5")
+    assert overlap_payload["diagnostics"]["box2"]["overlappingPromptNodes"] == 1
+    assert overlap_group["promptOverlapCount"] == 2
+    assert overlap_group["promptColorStrategy"] == "multi_prompt_overlap"
+    assert {item["promptId"] for item in overlap_group["promptActivations"]} == {0, 1}
+    assert {item["promptText"] for item in overlap_group["promptActivations"]} == {"shared alpha prompt", "shared beta prompt"}
+    assert set(overlap_group["promptIds"]) == {0, 1}
+    assert set(overlap_group["batchIds"]) == {"batch-0", "batch-1"}
+    assert overlap_group["promptPreviewMoreCount"] == 0
+
+    annotation_payload_path = Path("data/node_annotations/smoke_payload_annotations.json")
+    annotation_payload_path.unlink(missing_ok=True)
+    annotation_model_meta = build_model_meta(summary, local_meta, "llama.cpp")
+    upsert_annotation(
+        annotation_model_meta,
+        layer=0,
+        cluster_id=1,
+        node_id="L0-N1",
+        node_range=[1, 1],
+        tags=["comedy"],
+        note="Comedy prompt marker.",
+        created_from={"run_id": "batch_paths", "prompt_id": 0, "batch_id": "batch-0", "prompt_excerpt": "alpha"},
+        path=annotation_payload_path,
+    )
+    annotated_payload = build_activation_map_payload(
+        batch_path_artifact,
+        summary,
+        local_model_context=local_meta,
+        annotations_path=annotation_payload_path,
+    )
+    annotated_group = next(group for group in annotated_payload["nodeGroups"] if group["groupId"] == "L0-N1")
+    assert annotated_group["annotationMatchType"] == "exact"
+    assert annotated_group["annotationTags"] == ["comedy"]
+    assert annotated_group["annotationNote"] == "Comedy prompt marker."
+    annotated_html = activation_map_html(annotated_payload)
+    assert "annotationRows(group)" in annotated_html
+    assert "annotation match" in annotated_html
+    assert "Comedy prompt marker." in annotated_html
+    annotation_payload_path.unlink(missing_ok=True)
 
     single_fixture_payload = build_activation_map_payload(_path_fixture_artifact(1), summary, local_model_context=local_meta)
     assert single_fixture_payload["visualizationMode"] == "single_prompt"
+    assert single_fixture_payload["diagnostics"]["promptColorMode"] == "single"
+    assert single_fixture_payload["diagnostics"]["promptColorCount"] == 1
+    assert single_fixture_payload["activationPaths"][0]["promptColor"] == "#62E4FF"
     assert len(single_fixture_payload["activationPaths"]) == 1
     assert single_fixture_payload["activationPaths"][0]["promptId"] == 0
 
     fifteen_payload = build_activation_map_payload(_path_fixture_artifact(15), summary, local_model_context=local_meta)
     assert fifteen_payload["visualizationMode"] == "batch_overlay"
+    assert fifteen_payload["diagnostics"]["promptColorMode"] == "prompt_palette"
+    assert fifteen_payload["diagnostics"]["promptColorCount"] == 15
+    assert fifteen_payload["diagnostics"]["paletteSize"] == 10
+    assert fifteen_payload["diagnostics"]["colorsReused"] is True
     assert len(fifteen_payload["activationPaths"]) == 15
     assert len({path["promptId"] for path in fifteen_payload["activationPaths"]}) == 15
+    sorted_palette_paths = sorted(fifteen_payload["activationPaths"], key=lambda item: int(item["promptId"]))
+    assert len({path["promptColor"] for path in sorted_palette_paths[:10]}) == 10
+    assert sorted_palette_paths[10]["promptColor"] == sorted_palette_paths[0]["promptColor"]
+    assert sorted_palette_paths[10]["promptColorCycle"] == 1
+    assert sorted_palette_paths[10]["promptOpacity"] < sorted_palette_paths[0]["promptOpacity"]
+    assert fifteen_payload["promptColorLegend"][0]["promptId"] == 0
+    assert fifteen_payload["promptColorLegendMoreCount"] == 5
+    assert fifteen_payload["promptLegendPanel"]["colorsReused"] is True
+    assert fifteen_payload["promptLegendPanel"]["moreCount"] == 5
+    assert {path["batchId"]: path["promptText"] for path in fifteen_payload["activationPaths"]} == {
+        f"batch-{index}": f"prompt {index}" for index in range(15)
+    }
+    assert all(point["promptText"] == f"prompt {point['promptId']}" for path in fifteen_payload["activationPaths"] for point in path["points"])
     assert "aggregate_heatmap" not in {fifteen_payload["visualizationMode"], fifteen_payload["diagnostics"]["rendererMode"]}
+
+    scalar_multi_payload = build_activation_map_payload(_path_fixture_artifact(7, scalar_only=True), summary, local_model_context=local_meta)
+    heatmap_prompt_list = next(cell["promptPreviewList"] for cell in scalar_multi_payload["heatmap"] if len(cell.get("promptPreviewList", [])) > 5)
+    assert len(heatmap_prompt_list) == 7
+    assert heatmap_prompt_list[:5] == ["prompt 0", "prompt 1", "prompt 2", "prompt 3", "prompt 4"]
 
     aggregate_payload = build_activation_map_payload(_aggregate_only_artifact(), summary, local_model_context=local_meta)
     assert aggregate_payload["visualizationMode"] == "aggregate_heatmap"
+    assert aggregate_payload["diagnostics"]["promptColorMode"] == "aggregate"
+    assert aggregate_payload["diagnostics"]["promptColorCount"] == 0
+    assert aggregate_payload["promptColorLegend"] == []
+    assert aggregate_payload["promptLegendPanel"]["entries"] == []
+    assert aggregate_payload["diagnostics"]["box2"]["aggregateMode"] is True
+    assert aggregate_payload["diagnostics"]["box2"]["promptColorMode"] == "aggregate"
     assert aggregate_payload["activationPaths"] == []
     assert aggregate_payload["heatmap"]
     assert "Backend trace is already aggregated. Per-prompt paths unavailable." in aggregate_payload["diagnostics"]["warnings"]
@@ -818,6 +1156,8 @@ def main() -> None:
     assert compare_payload["visualizationMode"] == "compare_prompts"
     assert compare_payload["activationPaths"] == []
     assert compare_payload["comparePrompts"]["deltas"]
+    assert compare_payload["diagnostics"]["promptColorMode"] == "prompt_palette"
+    assert compare_payload["comparePrompts"]["selectedPromptColor"] != compare_payload["comparePrompts"]["comparePromptColor"]
     _assert_main_layer_resolver_and_trace_mock(summary, local_meta)
     _assert_single_trace_failure_preserves_reason()
     _assert_patched_baseline_visible_to_app(rows)

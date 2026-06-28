@@ -42,6 +42,7 @@ from glass_skull.llama_client import (
     trace_glass_prompt,
     trace_vectors_supported,
 )
+from glass_skull.node_annotations import add_tag, delete_annotation, delete_note, delete_tag, update_note, upsert_annotation
 from glass_skull.llama_control import (
     DEFAULT_CVECTOR_GENERATOR,
     DEFAULT_LLAMA_SERVER,
@@ -79,6 +80,19 @@ from glass_skull.visuals import (
     gguf_tensor_shape_scatter_fig,
     label_activation_heatmap,
     path_rank_bar_fig,
+)
+from glass_skull.workspaces import (
+    apply_workspace_state,
+    clear_tab_state,
+    clear_workspace,
+    list_tab_states,
+    list_workspaces,
+    load_tab_state,
+    load_workspace,
+    save_tab_state,
+    save_tab_state_as,
+    save_workspace,
+    save_workspace_as,
 )
 
 
@@ -150,6 +164,26 @@ def init_state() -> None:
         "batch_running": False,
         "batch_status": "",
         "chat_cancel_requested": False,
+        "workspace_name": "default",
+        "workspace_save_as_name": "",
+        "workspace_error": "",
+        "workspace_warning": "",
+        "tab_state": {},
+        "tab_save_as_names": {},
+        "tab_workspace_errors": {},
+        "map_visualization_mode": "",
+        "map_selected_prompt": None,
+        "map_selected_batch": None,
+        "map_selected_token": None,
+        "map_top_k": 8,
+        "map_background_opacity": 0.24,
+        "map_edge_threshold": 0.0,
+        "map_show_aggregate_heatmap": False,
+        "map_show_secondary_branches": True,
+        "map_annotation_selected_group": "",
+        "map_annotation_new_tag": "",
+        "map_annotation_note": "",
+        "map_annotation_status": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state or (key == "llama_model_path" and not st.session_state.get(key)):
@@ -170,6 +204,300 @@ def plot_if_present(fig, key_hint: str = "plot") -> None:
 
 def active_model_label() -> str:
     return st.session_state.get("llama_model_alias") or Path(st.session_state.get("llama_model_path", "")).name or "local"
+
+
+def _annotation_prompt_excerpt(group: dict) -> str:
+    previews = group.get("promptPreviewList") if isinstance(group.get("promptPreviewList"), list) else []
+    text = previews[0] if previews else group.get("promptPreview") or group.get("promptText") or ""
+    return str(text).replace("\n", " ").strip()[:220]
+
+
+def _split_tag_input(value: str) -> list[str]:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def render_node_annotation_inspector(payload: dict) -> None:
+    groups = payload.get("nodeGroups") if isinstance(payload.get("nodeGroups"), list) else []
+    if not groups:
+        return
+    st.subheader("Node annotation inspector")
+    labels = {
+        str(group.get("groupId")): f"{group.get('layerId')} | {group.get('groupId')} | activation {float(group.get('activationValue') or 0):.2f}"
+        for group in groups
+        if group.get("groupId")
+    }
+    if not labels:
+        return
+    selected_key = st.session_state.get("map_annotation_selected_group") or str((payload.get("diagnostics", {}).get("selectedGroup") or {}).get("groupId") or "")
+    if selected_key not in labels:
+        selected_key = next(iter(labels))
+    selected_group_id = st.selectbox(
+        "Node/cluster",
+        list(labels),
+        format_func=lambda value: labels.get(value, str(value)),
+        index=list(labels).index(selected_key),
+        key="map_annotation_selected_group",
+    )
+    group = next((item for item in groups if str(item.get("groupId")) == str(selected_group_id)), groups[0])
+    annotation_ids = [item for item in group.get("annotationIds", []) if item]
+    match_type = str(group.get("annotationMatchType") or "none")
+    tags = list(group.get("annotationTags") or [])
+    note = str(group.get("annotationNote") or "")
+
+    st.caption(f"annotation match: {match_type}")
+    if tags:
+        st.write("Tags: " + ", ".join(tags))
+    else:
+        st.caption("Tags: none")
+    if note:
+        st.text_area("Saved note", value=note, height=100, disabled=True, key=f"annotation_saved_note_{selected_group_id}")
+    else:
+        st.caption("Note: none")
+
+    annotation_id = annotation_ids[0] if annotation_ids else ""
+    if annotation_id and match_type == "approximate":
+        st.warning("Editing this annotation updates an approximate match.")
+
+    edit_cols = st.columns([1, 2])
+    with edit_cols[0]:
+        new_tag = st.text_input("Add tag", key="map_annotation_new_tag", placeholder="comedy")
+        if st.button("Save tag", key="map_annotation_save_tag", width="stretch"):
+            try:
+                if annotation_id:
+                    add_tag(annotation_id, new_tag)
+                else:
+                    upsert_annotation(
+                        payload.get("modelMeta"),
+                        layer=int(group.get("layer") or str(group.get("layerId") or "L0").replace("L", "") or 0),
+                        cluster_id=group.get("clusterId"),
+                        node_id=group.get("nodeId") or group.get("groupId"),
+                        node_range=group.get("nodeRange"),
+                        tags=_split_tag_input(new_tag),
+                        note=note,
+                        created_from={
+                            "run_id": payload.get("diagnostics", {}).get("runId"),
+                            "prompt_id": group.get("promptId"),
+                            "batch_id": group.get("batchId"),
+                            "token_id": group.get("tokenIndex"),
+                            "prompt_excerpt": _annotation_prompt_excerpt(group),
+                        },
+                    )
+                st.session_state.map_annotation_status = "Saved tag."
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save tag: {exc}")
+        if tags:
+            tag_to_delete = st.selectbox("Delete tag", tags, key="map_annotation_delete_tag_choice")
+            if st.button("Delete tag", key="map_annotation_delete_tag", width="stretch", disabled=not annotation_id):
+                try:
+                    delete_tag(annotation_id, tag_to_delete)
+                    st.session_state.map_annotation_status = "Deleted tag."
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not delete tag: {exc}")
+    with edit_cols[1]:
+        note_value = st.text_area("Edit note", value=note, height=128, key=f"map_annotation_note_{selected_group_id}")
+        note_cols = st.columns(3)
+        with note_cols[0]:
+            if st.button("Save note", key="map_annotation_save_note", width="stretch"):
+                try:
+                    if annotation_id:
+                        update_note(annotation_id, note_value)
+                    else:
+                        upsert_annotation(
+                            payload.get("modelMeta"),
+                            layer=int(group.get("layer") or str(group.get("layerId") or "L0").replace("L", "") or 0),
+                            cluster_id=group.get("clusterId"),
+                            node_id=group.get("nodeId") or group.get("groupId"),
+                            node_range=group.get("nodeRange"),
+                            tags=tags,
+                            note=note_value,
+                            created_from={
+                                "run_id": payload.get("diagnostics", {}).get("runId"),
+                                "prompt_id": group.get("promptId"),
+                                "batch_id": group.get("batchId"),
+                                "token_id": group.get("tokenIndex"),
+                                "prompt_excerpt": _annotation_prompt_excerpt(group),
+                            },
+                        )
+                    st.session_state.map_annotation_status = "Saved note."
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not save note: {exc}")
+        with note_cols[1]:
+            if st.button("Delete note", key="map_annotation_delete_note", width="stretch", disabled=not annotation_id):
+                try:
+                    delete_note(annotation_id)
+                    st.session_state.map_annotation_status = "Deleted note."
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not delete note: {exc}")
+        with note_cols[2]:
+            if st.button("Delete annotation", key="map_annotation_delete_annotation", width="stretch", disabled=not annotation_id):
+                try:
+                    delete_annotation(annotation_id)
+                    st.session_state.map_annotation_status = "Deleted annotation."
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not delete annotation: {exc}")
+    if st.session_state.get("map_annotation_status"):
+        st.success(st.session_state.map_annotation_status)
+
+
+def _tab_state(tab_name: str) -> dict:
+    tabs = st.session_state.setdefault("tab_state", {})
+    if not isinstance(tabs, dict):
+        tabs = {}
+        st.session_state.tab_state = tabs
+    current = tabs.setdefault(tab_name, {})
+    if not isinstance(current, dict):
+        current = {}
+        tabs[tab_name] = current
+    return current
+
+
+def _set_status(result, *, scope: str) -> None:
+    if result.error:
+        st.session_state[f"{scope}_error"] = result.error
+        st.session_state[f"{scope}_warning"] = ""
+    elif result.warning:
+        st.session_state[f"{scope}_warning"] = result.warning
+        st.session_state[f"{scope}_error"] = ""
+    else:
+        st.session_state[f"{scope}_error"] = ""
+        st.session_state[f"{scope}_warning"] = ""
+
+
+def render_global_workspace_controls() -> None:
+    st.caption("Workspace")
+    workspaces = list_workspaces()
+    selected = st.selectbox(
+        "Workspace",
+        workspaces or [st.session_state.workspace_name],
+        index=0,
+        label_visibility="collapsed",
+        key="workspace_load_name",
+    )
+    cols = st.columns([1, 1, 1, 1, 1.4])
+    with cols[0]:
+        if st.button("Save", key="workspace_save", width="stretch"):
+            result = save_workspace(st.session_state)
+            _set_status(result, scope="workspace")
+            st.rerun()
+    with cols[1]:
+        if st.button("Save As", key="workspace_save_as", width="stretch"):
+            name = st.session_state.get("workspace_save_as_name", "").strip()
+            if not name:
+                st.session_state.workspace_error = "Save As requires a workspace name."
+            else:
+                result = save_workspace_as(st.session_state, name)
+                _set_status(result, scope="workspace")
+                st.rerun()
+    with cols[2]:
+        if st.button("Load", key="workspace_load", width="stretch"):
+            result = load_workspace(str(selected))
+            _set_status(result, scope="workspace")
+            if not result.error and not result.warning:
+                apply_workspace_state(st.session_state, result.state)
+                st.session_state.workspace_name = result.name
+                st.rerun()
+    with cols[3]:
+        if st.button("Clear", key="workspace_clear", width="stretch"):
+            clear_workspace(st.session_state)
+            st.rerun()
+    with cols[4]:
+        st.text_input("Save As name", key="workspace_save_as_name", label_visibility="collapsed", placeholder="workspace name")
+    if st.session_state.get("workspace_error"):
+        st.error(st.session_state.workspace_error)
+    if st.session_state.get("workspace_warning"):
+        st.warning(st.session_state.workspace_warning)
+
+
+def render_tab_workspace_controls(tab_name: str) -> None:
+    state = _tab_state(tab_name)
+    tab_key = safe_tab_key(tab_name)
+    saved = list_tab_states(tab_name)
+    load_key = f"{tab_key}_tab_load_name"
+    save_as_key = f"{tab_key}_tab_save_as_name"
+    error_key = f"{tab_key}_tab_error"
+    st.caption(f"{tab_name} state")
+    cols = st.columns([1, 1, 1, 1, 1.4])
+    with cols[0]:
+        if st.button("Save", key=f"{tab_key}_tab_save", width="stretch"):
+            result = save_tab_state(tab_name, state, name=state.get("workspace_name"))
+            state["workspace_name"] = result.name
+            st.session_state[error_key] = result.error or result.warning or ""
+            st.rerun()
+    with cols[1]:
+        if st.button("Save As", key=f"{tab_key}_tab_save_as", width="stretch"):
+            name = str(st.session_state.get(save_as_key, "")).strip()
+            if not name:
+                st.session_state[error_key] = "Save As requires a tab state name."
+            else:
+                result = save_tab_state_as(tab_name, state, name)
+                state["workspace_name"] = result.name
+                st.session_state[error_key] = result.error or result.warning or ""
+                st.rerun()
+    with cols[2]:
+        selected = st.selectbox(
+            "Load tab state",
+            saved or [state.get("workspace_name") or "default"],
+            key=load_key,
+            label_visibility="collapsed",
+        )
+        if st.button("Load", key=f"{tab_key}_tab_load", width="stretch"):
+            result = load_tab_state(tab_name, str(selected))
+            st.session_state[error_key] = result.error or result.warning or ""
+            if not result.error and not result.warning:
+                st.session_state.tab_state[tab_name] = result.state
+                st.session_state.tab_state[tab_name]["workspace_name"] = result.name
+                st.session_state[f"{tab_key}_tab_pending_state"] = result.state
+                st.rerun()
+    with cols[3]:
+        if st.button("Clear", key=f"{tab_key}_tab_clear", width="stretch"):
+            clear_tab_state(st.session_state, tab_name)
+            st.rerun()
+    with cols[4]:
+        st.text_input("Save As tab name", key=save_as_key, label_visibility="collapsed", placeholder="tab state name")
+    if st.session_state.get(error_key):
+        st.warning(st.session_state[error_key])
+
+
+def consume_loaded_tab_state(tab_name: str) -> dict | None:
+    tab_key = safe_tab_key(tab_name)
+    pending_key = f"{tab_key}_tab_pending_state"
+    pending = st.session_state.get(pending_key)
+    if isinstance(pending, dict):
+        del st.session_state[pending_key]
+        return pending
+    return None
+
+
+def apply_known_tab_state(tab_name: str, state: dict | None) -> None:
+    if not state:
+        return
+    if tab_name == "Run" and state.get("active_run_mode") in {"Single message", "Batch run"}:
+        st.session_state.active_run_mode = state["active_run_mode"]
+    if tab_name == "Map":
+        mapping = {
+            "visualization_mode": "map_visualization_mode",
+            "selected_prompt": "map_selected_prompt",
+            "selected_batch": "map_selected_batch",
+            "selected_token": "map_selected_token",
+            "top_k": "map_top_k",
+            "background_opacity": "map_background_opacity",
+            "edge_threshold": "map_edge_threshold",
+            "show_aggregate_heatmap": "map_show_aggregate_heatmap",
+            "show_secondary_branches": "map_show_secondary_branches",
+            "annotation_selected_group": "map_annotation_selected_group",
+        }
+        for source, dest in mapping.items():
+            if source in state:
+                st.session_state[dest] = state[source]
+
+
+def safe_tab_key(tab_name: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() else "_" for ch in tab_name).strip("_") or "tab"
 
 
 def local_summary(local_context: dict | None) -> dict:
@@ -714,13 +1042,17 @@ def run_app() -> None:
             ui.pill("Glass server", ui.server_status_color(st.session_state.llama_glass_status)),
         ]),
     )
+    render_global_workspace_controls()
 
     tabs = dict(zip(LOCAL_TABS, st.tabs(LOCAL_TABS)))
 
     with tabs["Run"]:
         ui.section_header("Run", "Chat with local llama.cpp and capture Glass Skull trace payloads when the server supports them.")
+        render_tab_workspace_controls("Run")
+        apply_known_tab_state("Run", consume_loaded_tab_state("Run"))
         mode = st.segmented_control("Mode", ["Single message", "Batch run"], default=st.session_state.active_run_mode)
         st.session_state.active_run_mode = mode
+        _tab_state("Run")["active_run_mode"] = mode
         c1, c2, c3 = st.columns(3)
         with c1:
             backend_label = st.selectbox("Backend", CHAT_BACKENDS, key="chat_backend_label")
@@ -890,11 +1222,89 @@ def run_app() -> None:
 
     with tabs["Map"]:
         ui.section_header("Map", "Visual representation of the latest local run artifact.")
+        render_tab_workspace_controls("Map")
+        apply_known_tab_state("Map", consume_loaded_tab_state("Map"))
         st.session_state.behavior_profile = st.selectbox("Behavior profile", list_behavior_profiles(), index=list_behavior_profiles().index(st.session_state.behavior_profile))
         artifact = latest_behavior_artifact()
         if not artifact:
             ui.empty_state("No run artifact yet", "Run a single message or batch to populate the map.")
         else:
+            prompt_options = [
+                prompt.get("prompt_id")
+                for prompt in artifact.get("prompts", [])
+                if prompt.get("prompt_id") is not None
+            ]
+            batch_options = [
+                str(prompt.get("batch_id") or f"batch-{prompt.get('prompt_id', index)}")
+                for index, prompt in enumerate(artifact.get("prompts", []))
+            ]
+            token_options = sorted({
+                row.get("token_index", row.get("token_id"))
+                for prompt in artifact.get("prompts", [])
+                for row in prompt.get("trace_rows", [])
+                if row.get("token_index", row.get("token_id")) is not None
+            })
+            map_cols = st.columns([1.2, 1, 1, 1, 1])
+            with map_cols[0]:
+                mode_options = ["auto", "single_prompt", "batch_overlay", "aggregate_heatmap", "compare_prompts"]
+                current_mode = st.session_state.get("map_visualization_mode") or "auto"
+                st.session_state.map_visualization_mode = st.selectbox(
+                    "Map mode",
+                    mode_options,
+                    index=mode_options.index(current_mode) if current_mode in mode_options else 0,
+                )
+            with map_cols[1]:
+                prompt_choices = ["auto"] + [str(item) for item in prompt_options]
+                current_prompt = "auto" if st.session_state.get("map_selected_prompt") is None else str(st.session_state.map_selected_prompt)
+                selected_prompt_text = st.selectbox(
+                    "Prompt",
+                    prompt_choices,
+                    index=prompt_choices.index(current_prompt) if current_prompt in prompt_choices else 0,
+                    key="map_selected_prompt_choice",
+                )
+                st.session_state.map_selected_prompt = None if selected_prompt_text == "auto" else selected_prompt_text
+            with map_cols[2]:
+                batch_choices = ["auto"] + batch_options
+                current_batch = st.session_state.get("map_selected_batch") or "auto"
+                st.session_state.map_selected_batch = st.selectbox(
+                    "Batch",
+                    batch_choices,
+                    index=batch_choices.index(current_batch) if current_batch in batch_choices else 0,
+                )
+                if st.session_state.map_selected_batch == "auto":
+                    st.session_state.map_selected_batch = None
+            with map_cols[3]:
+                token_choices = ["auto"] + [str(item) for item in token_options]
+                current_token = "auto" if st.session_state.get("map_selected_token") is None else str(st.session_state.map_selected_token)
+                selected_token_text = st.selectbox(
+                    "Token",
+                    token_choices,
+                    index=token_choices.index(current_token) if current_token in token_choices else 0,
+                )
+                st.session_state.map_selected_token = None if selected_token_text == "auto" else int(selected_token_text)
+            with map_cols[4]:
+                st.session_state.map_top_k = st.slider("Top K", 1, 32, int(st.session_state.get("map_top_k") or 8), 1)
+            settings_cols = st.columns([1, 1, 1, 1])
+            with settings_cols[0]:
+                st.session_state.map_background_opacity = st.slider("Background", 0.0, 1.0, float(st.session_state.map_background_opacity), 0.05)
+            with settings_cols[1]:
+                st.session_state.map_edge_threshold = st.slider("Edge threshold", 0.0, 1.0, float(st.session_state.map_edge_threshold), 0.05)
+            with settings_cols[2]:
+                st.session_state.map_show_aggregate_heatmap = st.toggle("Aggregate heatmap", value=bool(st.session_state.map_show_aggregate_heatmap))
+            with settings_cols[3]:
+                st.session_state.map_show_secondary_branches = st.toggle("Secondary branches", value=bool(st.session_state.map_show_secondary_branches))
+            _tab_state("Map").update({
+                "visualization_mode": st.session_state.map_visualization_mode,
+                "selected_prompt": st.session_state.map_selected_prompt,
+                "selected_batch": st.session_state.map_selected_batch,
+                "selected_token": st.session_state.map_selected_token,
+                "top_k": st.session_state.map_top_k,
+                "background_opacity": st.session_state.map_background_opacity,
+                "edge_threshold": st.session_state.map_edge_threshold,
+                "show_aggregate_heatmap": st.session_state.map_show_aggregate_heatmap,
+                "show_secondary_branches": st.session_state.map_show_secondary_branches,
+                "annotation_selected_group": st.session_state.map_annotation_selected_group,
+            })
             artifact_summary = artifact.get("summary", {}) if isinstance(artifact.get("summary"), dict) else {}
             st.caption(
                 " | ".join([
@@ -904,7 +1314,20 @@ def run_app() -> None:
                     f"trace supported {artifact_summary.get('trace_supported', False)}",
                 ])
             )
-            payload = build_activation_map_payload(artifact, summary, local_model_context=local_context)
+            payload = build_activation_map_payload(
+                artifact,
+                summary,
+                local_model_context=local_context,
+                visualization_mode=None if st.session_state.map_visualization_mode == "auto" else st.session_state.map_visualization_mode,
+                selected_prompt=st.session_state.map_selected_prompt,
+                selected_token=int(st.session_state.map_selected_token) if st.session_state.map_selected_token is not None else None,
+                selected_batch=st.session_state.map_selected_batch,
+                top_k=int(st.session_state.map_top_k),
+                background_opacity=float(st.session_state.map_background_opacity),
+                edge_threshold=float(st.session_state.map_edge_threshold),
+                show_aggregate_heatmap=bool(st.session_state.map_show_aggregate_heatmap),
+                show_secondary_branches=bool(st.session_state.map_show_secondary_branches),
+            )
             patch_comparison = st.session_state.get("last_activation_patch_comparison")
             if isinstance(patch_comparison, dict) and patch_comparison.get("recipe"):
                 payload["activationPatch"] = patch_comparison["recipe"]
@@ -916,6 +1339,8 @@ def run_app() -> None:
                     "error": patch_comparison.get("error"),
                 }
             render_activation_map(payload, key=f"activation_map_{artifact.get('run_id', 'latest')}", height=920)
+            render_node_annotation_inspector(payload)
+            _tab_state("Map")["annotation_selected_group"] = st.session_state.map_annotation_selected_group
             scores_df = score_run_artifact(artifact, profile=get_behavior_profile(st.session_state.behavior_profile))
             path_df = activation_path_df(artifact)
             with st.expander("Tables and diagnostics", expanded=False):
@@ -944,12 +1369,14 @@ def run_app() -> None:
                     plot_if_present(dim_frequency_fig(dimension_frequency_df(artifact)), key_hint="dims")
 
     with tabs["Steer"]:
+        render_tab_workspace_controls("Steer")
         render_control_panel(local_context)
         st.markdown("---")
         render_activation_patch_panel(chat_backend, max_new_tokens, temperature)
 
     with tabs["Timeline"]:
         ui.section_header("Timeline", "Behavior scores and saved local run history.")
+        render_tab_workspace_controls("Timeline")
         history = list(st.session_state.get("behavior_run_history", []))
         score_runs = [item["scores"].assign(run_id=str(item.get("run_id") or "")) for item in history if isinstance(item.get("scores"), pd.DataFrame) and not item["scores"].empty]
         timeline = behavior_timeline_df(score_runs)
@@ -973,6 +1400,7 @@ def run_app() -> None:
 
     with tabs["Model"]:
         ui.section_header("Model", "Local GGUF metadata and server capability checks.")
+        render_tab_workspace_controls("Model")
         if st.button("Check servers", type="primary"):
             st.session_state.llama_status = check_server(st.session_state.llama_url, model_alias=st.session_state.llama_model_alias)
             st.session_state.llama_glass_status = check_server(st.session_state.llama_glass_url, model_alias=st.session_state.llama_model_alias)
@@ -986,6 +1414,7 @@ def run_app() -> None:
 
     with tabs["Settings"]:
         ui.section_header("Settings", "Local llama.cpp paths and URLs.")
+        render_tab_workspace_controls("Settings")
         st.session_state.llama_model_alias = st.text_input("Model alias", value=st.session_state.llama_model_alias).strip()
         st.session_state.llama_model_path = st.text_input("GGUF model path", value=st.session_state.llama_model_path)
         st.session_state.llama_url = st.text_input("Normal server URL", value=st.session_state.llama_url)

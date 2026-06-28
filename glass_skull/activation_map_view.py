@@ -114,8 +114,9 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     .gs-map-tooltip .gs-tip-row {{
       display: flex;
       justify-content: space-between;
+      align-items: flex-start;
       gap: 10px;
-      white-space: nowrap;
+      white-space: normal;
     }}
     .gs-map-tooltip .gs-tip-key {{
       color: rgba(167, 180, 208, 0.80);
@@ -123,6 +124,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     .gs-map-tooltip .gs-tip-value {{
       color: rgba(244, 248, 255, 0.96);
       text-align: right;
+      overflow-wrap: anywhere;
     }}
   </style>
   <div class="gs-map-controls">
@@ -234,9 +236,78 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     return Number(value).toFixed(2);
   }}
 
+  function escapeHtml(value) {{
+    return String(value ?? '')
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
+  }}
+
   function trimText(value, limit = 28) {{
     const text = String(value || '');
-    return text.length <= limit ? text : text.slice(0, limit - 1) + '…';
+    const compact = text.replace(/\\s+/g, ' ').trim();
+    return compact.length <= limit ? compact : compact.slice(0, limit - 1) + '…';
+  }}
+
+  function promptText(detail) {{
+    const text = trimText(detail?.promptText || detail?.promptPreview || '', 260);
+    return text || 'unavailable';
+  }}
+
+  function promptPreviewList(detail) {{
+    const values = Array.isArray(detail?.promptPreviewList) ? detail.promptPreviewList : [];
+    if (values.length) return values.map((value) => trimText(value, 260)).filter(Boolean);
+    const single = promptText(detail);
+    return single === 'unavailable' ? [] : [single];
+  }}
+
+  function promptRows(detail) {{
+    const prompts = promptPreviewList(detail);
+    if (prompts.length > 1) {{
+      const rows = prompts.slice(0, 5).map((value, index) => [`prompt ${{index + 1}}`, value]);
+      if (prompts.length > 5) {{
+        rows.push(['all prompts', `click for details (${{prompts.length}} total)`]);
+      }}
+      return rows;
+    }}
+    return [['prompt', promptText(detail)]];
+  }}
+
+  function hexToRgb(hex) {{
+    const text = String(hex || '').replace('#', '').trim();
+    if (text.length !== 6) return [98, 228, 255];
+    const value = Number.parseInt(text, 16);
+    if (!Number.isFinite(value)) return [98, 228, 255];
+    return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+  }}
+
+  function rgba(rgb, alpha) {{
+    const values = Array.isArray(rgb) && rgb.length >= 3 ? rgb : [98, 228, 255];
+    return `rgba(${{values[0]}}, ${{values[1]}}, ${{values[2]}}, ${{Math.max(0, Math.min(1, alpha))}})`;
+  }}
+
+  function promptStyle(detail = null) {{
+    const rgb = Array.isArray(detail?.promptRgb) ? detail.promptRgb : hexToRgb(detail?.promptColor || '#62E4FF');
+    const opacity = Number(detail?.promptOpacity ?? 1);
+    const dash = Array.isArray(detail?.promptDash) ? detail.promptDash : [];
+    return {{
+      color: detail?.promptColor || '#62E4FF',
+      rgb,
+      opacity: Number.isFinite(opacity) ? opacity : 1,
+      dash,
+    }};
+  }}
+
+  function annotationRows(detail) {{
+    const tags = Array.isArray(detail?.annotationTags) ? detail.annotationTags.filter(Boolean) : [];
+    const note = trimText(detail?.annotationNote || '', 150);
+    const match = detail?.annotationMatchType || 'none';
+    const rows = [['annotation match', match]];
+    if (tags.length) rows.push(['tags', tags.join(', ')]);
+    if (note) rows.push(['note', note]);
+    return rows;
   }}
 
   function layerById(layerId) {{
@@ -279,9 +350,9 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   function tooltipHtml(title, rows) {{
     const body = (rows || [])
       .filter((row) => row && row[1] !== undefined && row[1] !== null && String(row[1]) !== '')
-      .map((row) => `<div class="gs-tip-row"><span class="gs-tip-key">${{row[0]}}</span><span class="gs-tip-value">${{row[1]}}</span></div>`)
+      .map((row) => `<div class="gs-tip-row"><span class="gs-tip-key">${{escapeHtml(row[0])}}</span><span class="gs-tip-value">${{escapeHtml(row[1])}}</span></div>`)
       .join('');
-    return `<div class="gs-tip-title">${{title}}</div>${{body}}`;
+    return `<div class="gs-tip-title">${{escapeHtml(title)}}</div>${{body}}`;
   }}
 
   function effectiveVisualizationState(detail = null) {{
@@ -408,12 +479,13 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   function drawPath(path, left, right, top, bottom, index) {{
     const points = path.points || [];
     if (!points.length) return;
+    const style = promptStyle(path);
     const hovered = hoverTarget?.batchId === path.batchId || hoverTarget?.pathId === path.pathId;
     const selectedPath = selected.batchId === path.batchId;
     const isApprox = path.visualizationMode === 'scalar_approx' || path.approximationReason;
     const alphaBase = Number(rendererOptions.backgroundOpacity || 0.24);
     const alpha = selectedPath ? 0.88 : hovered ? 0.72 : isApprox ? Math.max(0.12, alphaBase) : Math.max(0.18, alphaBase + 0.14);
-    const hue = 186 + ((index || 0) * 29) % 78;
+    const finalAlpha = selectedPath ? alpha : alpha * style.opacity;
     const coords = points.map((point) => ({{
       x: left + (point.x || 0) * (right - left),
       y: top + (point.y || 0.5) * (bottom - top),
@@ -430,10 +502,10 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
         ctx.bezierCurveTo(midX, prev.y, midX, coord.y, coord.x, coord.y);
       }}
     }});
-    ctx.strokeStyle = `hsla(${{hue}}, 96%, 68%, ${{alpha}})`;
+    ctx.strokeStyle = rgba(style.rgb, finalAlpha);
     ctx.lineWidth = selectedPath ? 4.6 : hovered ? 3.4 : 2.2;
-    if (isApprox) ctx.setLineDash([10, 7]);
-    ctx.shadowColor = `hsla(${{hue}}, 96%, 62%, ${{selectedPath ? 0.48 : 0.20}})`;
+    ctx.setLineDash(isApprox ? [10, 7] : style.dash);
+    ctx.shadowColor = rgba(style.rgb, selectedPath ? 0.48 : 0.20 * style.opacity);
     ctx.shadowBlur = selectedPath ? 18 : 10;
     ctx.stroke();
     ctx.restore();
@@ -447,9 +519,10 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
         coord.y,
         tooltipHtml('Path', [
           ['type', 'Prompt path'],
-          ['batch', path.batchId],
-          ['prompt', path.promptId],
-          ['token', path.tokenIndex],
+          ['batch_id', path.batchId],
+          ['prompt_id', path.promptId],
+          ['token_id', path.tokenIndex],
+          ...promptRows(path),
           ['layers', path.frequency || points.length],
           ['method', path.pathMethod || ''],
           ['tokenRange', trimText(path.tokenRange || '', 24)],
@@ -470,11 +543,12 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
 
     coords.forEach((coord) => {{
       const isFocusedPoint = coord.point.groupId === selected.groupId || coord.point.layerId === selected.layerId;
+      const pointStyle = promptStyle(coord.point);
       ctx.save();
       ctx.beginPath();
       ctx.arc(coord.x, coord.y, isFocusedPoint ? 4.8 : 3.4, 0, Math.PI * 2);
-      ctx.fillStyle = isFocusedPoint ? 'rgba(213, 250, 255, 0.95)' : 'rgba(160, 233, 255, 0.82)';
-      ctx.shadowColor = 'rgba(94, 225, 255, 0.55)';
+      ctx.fillStyle = rgba(pointStyle.rgb, isFocusedPoint ? 0.95 : 0.82 * pointStyle.opacity);
+      ctx.shadowColor = rgba(pointStyle.rgb, isFocusedPoint ? 0.58 : 0.38 * pointStyle.opacity);
       ctx.shadowBlur = isFocusedPoint ? 14 : 8;
       ctx.fill();
       ctx.restore();
@@ -485,9 +559,11 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
         20,
         tooltipHtml('Path', [
           ['type', 'Prompt path'],
-          ['batch', path.batchId],
-          ['prompt', path.promptId],
+          ['batch_id', path.batchId],
+          ['prompt_id', path.promptId],
           ['tokenIndex', coord.point.tokenIndex],
+          ['token_id', coord.point.tokenId],
+          ...promptRows(coord.point),
           ['layer', coord.point.layerId],
           ['group', coord.point.groupId],
           ['token', trimText(coord.point.token || '')],
@@ -511,7 +587,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
         ctx.save();
         ctx.beginPath();
         ctx.arc(bx, by, 2.4, 0, Math.PI * 2);
-        ctx.fillStyle = `hsla(${{hue}}, 80%, 70%, 0.34)`;
+        ctx.fillStyle = rgba(promptStyle(branch).rgb, 0.34 * style.opacity);
         ctx.fill();
         ctx.restore();
       }});
@@ -535,6 +611,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     const from = groupById(edge.fromNodeId || edge.fromGroupId);
     const to = groupById(edge.toNodeId || edge.toGroupId);
     if (!from || !to) return;
+    const style = promptStyle(edge);
     const x1 = layerX(from.layerId, left, right);
     const y1 = groupY(from, top, bottom);
     const x2 = layerX(to.layerId, left, right);
@@ -546,17 +623,18 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     const weight = Math.max(0, Math.min(1, Number(edge.weight || 0)));
     const confidence = Math.max(0, Math.min(1, Number(edge.confidence || 0)));
     const alpha = selectedEdge ? 0.92 : hovered ? 0.78 : connected ? 0.58 : Math.max(0.10, weight * (isApprox ? 0.42 : 0.72));
+    const finalAlpha = selectedEdge ? alpha : alpha * style.opacity;
     ctx.save();
     ctx.beginPath();
     ctx.moveTo(x1, y1);
     const midX = (x1 + x2) / 2;
     ctx.bezierCurveTo(midX, y1, midX, y2, x2, y2);
     ctx.strokeStyle = isApprox
-      ? `rgba(168, 190, 218, ${{alpha}})`
-      : `rgba(92, 235, 255, ${{alpha}})`;
+      ? rgba(style.rgb, Math.max(0.16, finalAlpha * 0.72))
+      : rgba(style.rgb, finalAlpha);
     ctx.lineWidth = selectedEdge ? 4.2 : Math.max(0.8, 0.8 + weight * 4.8);
     if (isApprox) ctx.setLineDash([5, 6]);
-    ctx.shadowColor = isApprox ? 'transparent' : `rgba(84, 223, 255, ${{alpha * 0.38}})`;
+    ctx.shadowColor = isApprox ? 'transparent' : rgba(style.rgb, finalAlpha * 0.38);
     ctx.shadowBlur = selectedEdge ? 16 : 8;
     ctx.stroke();
     ctx.restore();
@@ -568,8 +646,10 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
       tooltipHtml('Edge', [
         ['from', from.groupId],
         ['to', to.groupId],
-        ['prompt', edge.promptId],
-        ['token', edge.tokenIndex],
+        ['batch_id', edge.batchId],
+        ['prompt_id', edge.promptId],
+        ['token_id', edge.tokenIndex],
+        ...promptRows(edge),
         ['weight', fmtNumber(weight)],
         ['method', edge.method || ''],
         ['confidence', fmtNumber(confidence)],
@@ -611,6 +691,8 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
           ['node', cell.nodeId],
           ['count', cell.count],
           ['prompts', cell.promptCount],
+          ...promptRows(cell),
+          ...annotationRows(cell),
           ['max', fmtNumber(cell.activationMax)],
           ['mean', fmtNumber(cell.activationMean)],
           ['mode', 'aggregate_heatmap'],
@@ -623,6 +705,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   function drawOverviewNode(group, left, right, top, bottom) {{
     const cx = layerX(group.layerId, left, right);
     const cy = groupY(group, top, bottom);
+    const style = promptStyle(group);
     const selectedGroup = selected.groupId === group.groupId;
     const connectedEdge = selected.edgeId && (() => {{
       const edge = edgeById(selected.edgeId);
@@ -635,15 +718,15 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     ctx.beginPath();
     ctx.arc(cx, cy, radius, 0, Math.PI * 2);
     ctx.fillStyle = selectedGroup
-      ? 'rgba(236, 252, 255, 0.96)'
-      : `rgba(116, 225, 255, ${{0.28 + activation * 0.62}})`;
-    ctx.shadowColor = 'rgba(84, 223, 255, 0.42)';
+      ? rgba(style.rgb, 0.96)
+      : rgba(style.rgb, (0.28 + activation * 0.62) * style.opacity);
+    ctx.shadowColor = rgba(style.rgb, 0.42 * style.opacity);
     ctx.shadowBlur = selectedGroup ? 18 : 8 + activation * 10;
     ctx.fill();
     if (selectedGroup || connectedEdge) {{
       ctx.beginPath();
       ctx.arc(cx, cy, radius + 4, 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(196, 241, 255, 0.70)';
+      ctx.strokeStyle = rgba(style.rgb, 0.70);
       ctx.lineWidth = 1.3;
       ctx.stroke();
     }}
@@ -656,6 +739,11 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
       tooltipHtml('Node', [
         ['layer', group.layerId],
         ['node', group.groupId],
+        ['batch_id', group.batchId],
+        ['prompt_id', group.promptId],
+        ['token_id', group.tokenIndex],
+        ...promptRows(group),
+        ...annotationRows(group),
         ['activation', fmtNumber(group.activationValue || 0)],
         ['normalized', fmtNumber(group.normalizedActivation || 0)],
         ['tokenRange', rangeText(group.tokenRange)],
@@ -707,7 +795,111 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     );
   }}
 
-  function drawGroupDot(group, index, total, x, y, w, h) {{
+  function groupActivation(group, layerGroups = []) {{
+    if (Object.prototype.hasOwnProperty.call(group || {{}}, 'normalizedActivation')) {{
+      const normalized = Number(group.normalizedActivation);
+      if (Number.isFinite(normalized)) return Math.max(0, Math.min(1, normalized));
+    }}
+    const raw = Number(group?.activationValue ?? group?.activation);
+    if (!Number.isFinite(raw) || raw <= 0) return 0;
+    const maxRaw = Math.max(0, ...layerGroups.map((item) => Number(item?.activationValue ?? item?.activation)).filter((value) => Number.isFinite(value)));
+    return maxRaw > 0 ? Math.max(0, Math.min(1, raw / maxRaw)) : 0;
+  }}
+
+  function box2Radius(activation, selectedGroup = false, hovered = false) {{
+    const base = 2.8 + Math.sqrt(Math.max(0, activation)) * 7.4;
+    const hoverLift = hovered ? 1.2 : 0;
+    return selectedGroup ? Math.max(base + hoverLift, 6.4) : base + hoverLift;
+  }}
+
+  function box2Alpha(activation) {{
+    return 0.16 + Math.max(0, Math.min(1, activation)) * 0.72;
+  }}
+
+  function selectedGroupOutline(cx, cy, radius) {{
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius + 4.5, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(218, 249, 255, 0.78)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }}
+
+  function box2NodeRenderDiagnostics(group) {{
+    const hasNormalized = Object.prototype.hasOwnProperty.call(group || {{}}, 'normalizedActivation') && Number.isFinite(Number(group?.normalizedActivation));
+    const hasRaw = Number.isFinite(Number(group?.activationValue ?? group?.activation));
+    if (hasNormalized) return 'normalized_activation';
+    if (hasRaw) return 'raw_activation_layer_normalized';
+    return 'activation unavailable';
+  }}
+
+  function valueList(values) {{
+    const list = Array.isArray(values) ? values : [];
+    const unique = [];
+    list.forEach((value) => {{
+      if (value === null || value === undefined || value === '') return;
+      const text = String(value);
+      if (!unique.includes(text)) unique.push(text);
+    }});
+    return unique;
+  }}
+
+  function box2PromptEntries(group) {{
+    const entries = Array.isArray(group?.promptActivations) ? group.promptActivations : [];
+    if (entries.length) return entries;
+    return [{{
+      promptId: group?.promptId,
+      batchId: group?.batchId,
+      tokenIndex: group?.tokenIndex,
+      tokenId: group?.tokenIndex,
+      promptText: group?.promptText,
+      promptPreview: group?.promptPreview,
+      activationValue: group?.activationValue,
+      normalizedActivation: group?.normalizedActivation,
+      promptColor: group?.promptColor,
+      promptRgb: group?.promptRgb,
+      promptOpacity: group?.promptOpacity,
+      promptDash: group?.promptDash,
+    }}];
+  }}
+
+  function box2ColorStyle(group, activation) {{
+    if (rendererOptions.visualizationMode === 'aggregate_heatmap' || payload.diagnostics?.promptColorMode === 'aggregate') {{
+      return {{ color: '#FFB840', rgb: [255, 184, 64], opacity: 1, dash: [] }};
+    }}
+    if (rendererOptions.visualizationMode === 'batch_overlay') {{
+      const entries = box2PromptEntries(group);
+      return promptStyle(entries[0] || group);
+    }}
+    return promptStyle(group);
+  }}
+
+  function drawPromptOverlapMarkers(cx, cy, radius, group) {{
+    if (rendererOptions.visualizationMode !== 'batch_overlay') return;
+    const entries = box2PromptEntries(group);
+    const promptIds = valueList(entries.map((entry) => entry.promptId));
+    if (promptIds.length <= 1) return;
+    const limit = Math.min(entries.length, 5);
+    for (let index = 0; index < limit; index++) {{
+      const entry = entries[index];
+      const style = promptStyle(entry);
+      const angle = (-Math.PI / 2) + (index / Math.max(limit, 1)) * Math.PI * 2;
+      const mx = cx + Math.cos(angle) * (radius + 6);
+      const my = cy + Math.sin(angle) * (radius + 6);
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(mx, my, 2.4, 0, Math.PI * 2);
+      ctx.fillStyle = rgba(style.rgb, 0.94 * style.opacity);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(mx, my, 3.8, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(5, 9, 18, 0.86)';
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+      ctx.restore();
+    }}
+  }}
+
+  function drawGroupDot(group, index, total, x, y, w, h, layerGroups = []) {{
     const cols = Math.max(1, Math.min(18, Math.ceil(Math.sqrt(total * 2.2))));
     const rows = Math.max(1, Math.ceil(total / cols));
     const col = index % cols;
@@ -718,25 +910,26 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     const cy = y + row * cellH + cellH / 2;
     const selectedGroup = selected.groupId === group.groupId;
     const hovered = hoverTarget?.groupId === group.groupId;
-    const radius = selectedGroup ? 7 : hovered ? 6 : 4.8;
-    const glow = Math.min(1, Math.max(group.activationValue || 0, group.attributionScore || 0) / 4);
+    const activation = groupActivation(group, layerGroups);
+    const radius = box2Radius(activation, selectedGroup, hovered);
+    const alpha = box2Alpha(activation);
+    const style = box2ColorStyle(group, activation);
     ctx.save();
     ctx.beginPath();
     ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-    ctx.fillStyle = selectedGroup
-      ? 'rgba(218, 251, 255, 0.94)'
-      : `rgba(120, 224, 255, ${{0.30 + glow * 0.45}})`;
-    ctx.shadowColor = selectedGroup ? 'rgba(103, 234, 255, 0.65)' : 'rgba(72, 201, 255, 0.28)';
-    ctx.shadowBlur = selectedGroup ? 18 : 10;
+    ctx.fillStyle = rgba(style.rgb, alpha * style.opacity);
+    ctx.shadowColor = rgba(style.rgb, (0.16 + activation * 0.46) * style.opacity);
+    ctx.shadowBlur = 5 + activation * 18 + (selectedGroup ? 5 : 0);
     ctx.fill();
+    drawPromptOverlapMarkers(cx, cy, radius, group);
     if (selectedGroup) {{
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius + 4, 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(125, 211, 252, 0.72)';
-      ctx.lineWidth = 1.4;
-      ctx.stroke();
+      selectedGroupOutline(cx, cy, radius);
     }}
     ctx.restore();
+    const promptEntries = box2PromptEntries(group);
+    const promptIds = valueList(group.promptIds || promptEntries.map((entry) => entry.promptId));
+    const batchIds = valueList(group.batchIds || promptEntries.map((entry) => entry.batchId));
+    const tokenIds = valueList(group.tokenIds || promptEntries.map((entry) => entry.tokenIndex ?? entry.tokenId));
 
     addHitTarget(
       cx - radius - 8,
@@ -744,11 +937,23 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
       (radius + 8) * 2,
       (radius + 8) * 2,
       tooltipHtml('Group', [
+        ['node_id', group.nodeId || group.groupId],
+        ['cluster_id', group.clusterId],
         ['group', group.groupId],
         ['layer', group.layerId],
+        ['batch_id', group.batchId],
+        ['prompt_id', group.promptId],
+        ['token_id', group.tokenIndex],
+        ['prompt_id(s)', promptIds.join(', ')],
+        ['batch_id(s)', batchIds.join(', ')],
+        ['token_id(s)', tokenIds.join(', ')],
+        ['overlap prompts', group.promptOverlapCount || promptIds.length || 0],
+        ...promptRows(group),
+        ...annotationRows(group),
         ['batches', group.batchParticipation || 0],
         ['activation', fmtNumber(group.activationValue || 0)],
         ['normalized', fmtNumber(group.normalizedActivation || 0)],
+        ['box2 activation source', box2NodeRenderDiagnostics(group)],
         ['tokenRange', rangeText(group.tokenRange)],
         ['nodeRange', rangeText(group.nodeRange)],
         ['confidence', fmtNumber(group.confidence || 0)],
@@ -831,11 +1036,17 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
       selectedBatch,
       selectedLayer,
       selectedGroup,
+      selectedPath,
       activationValue: selectedPoint?.activationValue ?? selectedGroup?.activationValue ?? base.activationValue ?? 0,
       attributionScore: selectedGroup?.attributionScore ?? selectedPath?.attributionScore ?? base.attributionScore ?? 0,
       confidence: selectedPath?.confidence ?? base.confidence ?? 0,
       visualizationMode: selectedPoint?.visualizationMode || selectedGroup?.visualizationMode || selectedLayer?.visualizationMode || selectedPath?.visualizationMode || base.visualizationMode || payload.visualizationMode || '',
       selectedEdge,
+      promptText: selectedEdge?.promptText || selectedPoint?.promptText || selectedPath?.promptText || selectedGroup?.promptText || '',
+      promptPreviewList: selectedEdge?.promptPreviewList || selectedPoint?.promptPreviewList || selectedPath?.promptPreviewList || selectedGroup?.promptPreviewList || [],
+      annotationTags: selectedGroup?.annotationTags || [],
+      annotationNote: selectedGroup?.annotationNote || '',
+      annotationMatchType: selectedGroup?.annotationMatchType || 'none',
       sourceToken: selectedPoint?.token || base.sourceToken || '',
       destinationToken: selectedBatch?.outputToken || base.destinationToken || '',
     }};
@@ -846,11 +1057,19 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     const rows = [
       ['visualizationMode', state.mode || ''],
       ['dataMode', payload.dataMode || d.dataMode || ''],
+      ['promptColorMode', d.promptColorMode || ''],
+      ['promptColorCount', d.promptColorCount ?? ''],
+      ['paletteSize', d.paletteSize ?? ''],
+      ['colorsReused', d.colorsReused ?? false],
       ['selectedBatch', d.selectedBatch?.batchId || selected.batchId || ''],
       ['selectedPrompt', rendererOptions.selectedPromptId ?? d.selectedPromptId ?? ''],
       ['selectedToken', rendererOptions.selectedTokenId ?? d.selectedTokenId ?? ''],
       ['selectedLayer', d.selectedLayer?.layerId || selected.layerId || ''],
       ['selectedGroup', d.selectedGroup?.groupId || selected.groupId || ''],
+      ['promptText', trimText(d.promptText || '', 72)],
+      ['annotationMatch', d.annotationMatchType || 'none'],
+      ['annotationTags', Array.isArray(d.annotationTags) ? d.annotationTags.join(', ') : ''],
+      ['annotationNote', trimText(d.annotationNote || '', 72)],
       ['activationValue', fmtNumber(d.activationValue || 0)],
       ['attributionScore', fmtNumber(d.attributionScore || 0)],
       ['confidence', fmtNumber(d.confidence || 0)],
@@ -914,8 +1133,8 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     const x = 62, y = Math.max(360, rect.height * 0.45), w = rect.width - 124, h = 150;
     panel(x, y, w, h);
     const layer = layerById(selected.layerId) || payload.layers?.[0] || null;
-    const groups = (payload.nodeGroups || []).filter((g) => g.layerId === selected.layerId).slice(0, 120);
-    groups.forEach((group, index) => drawGroupDot(group, index, groups.length, x + 76, y + 46, w - 132, h - 70));
+    const groups = (payload.nodeGroups || []).filter((g) => g.layerId === selected.layerId);
+    groups.forEach((group, index) => drawGroupDot(group, index, groups.length, x + 76, y + 46, w - 132, h - 70, groups));
     if (layer) {{
       drawLabel(layer.name || layer.layerId, x + 18, y + 19, 'left', 'rgba(141, 228, 255, 0.82)', 11, 700);
     }}
@@ -1021,8 +1240,110 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
 """
 
 
+def _legend_panel_html(payload: dict) -> str:
+    panel = payload.get("promptLegendPanel") if isinstance(payload.get("promptLegendPanel"), dict) else {}
+    entries = panel.get("entries") if isinstance(panel.get("entries"), list) else []
+    color_mode = (payload.get("diagnostics") or {}).get("promptColorMode")
+    if color_mode != "prompt_palette" or len(entries) <= 1:
+        return ""
+    selected_prompt = panel.get("selectedPromptId")
+    rows = []
+    for entry in entries:
+        color = html.escape(str(entry.get("promptColor") or "#62E4FF"))
+        prompt_id = html.escape(str(entry.get("promptId") if entry.get("promptId") is not None else ""))
+        label = html.escape(str(entry.get("label") or entry.get("promptPreview") or f"prompt {prompt_id}"))
+        selected = str(entry.get("promptId")) == str(selected_prompt) if selected_prompt is not None else False
+        rows.append(
+            "<div class='gs-prompt-legend-row%s' data-prompt-id='%s'>"
+            "<span class='gs-prompt-legend-swatch' style='background:%s'></span>"
+            "<span class='gs-prompt-legend-id'>%s</span>"
+            "<span class='gs-prompt-legend-label'>%s</span>"
+            "</div>"
+            % (" is-selected" if selected else "", prompt_id, color, prompt_id, label)
+        )
+    more_count = int(panel.get("moreCount") or 0)
+    if more_count:
+        rows.append(f"<div class='gs-prompt-legend-more'>+ {more_count} more prompts</div>")
+    warning = ""
+    if panel.get("colorsReused"):
+        warning = "<div class='gs-prompt-legend-warning'>Palette colors are reused; prompt IDs disambiguate paths.</div>"
+    return """
+<style>
+  .gs-prompt-legend-panel {
+    margin-top: 10px;
+    border: 1px solid rgba(146, 188, 255, 0.20);
+    border-radius: 8px;
+    background: rgba(6, 10, 20, 0.78);
+    color: rgba(226, 239, 255, 0.92);
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 10px 12px;
+  }
+  .gs-prompt-legend-title {
+    font-size: 12px;
+    font-weight: 700;
+    margin-bottom: 8px;
+  }
+  .gs-prompt-legend-list {
+    display: grid;
+    gap: 6px;
+    max-height: 180px;
+    overflow-y: auto;
+  }
+  .gs-prompt-legend-row {
+    display: grid;
+    grid-template-columns: 14px minmax(32px, max-content) minmax(0, 1fr);
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding: 5px 6px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.025);
+  }
+  .gs-prompt-legend-row.is-selected {
+    outline: 1px solid rgba(141, 228, 255, 0.62);
+    background: rgba(98, 228, 255, 0.08);
+  }
+  .gs-prompt-legend-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    box-shadow: 0 0 10px currentColor;
+  }
+  .gs-prompt-legend-id {
+    font-size: 11px;
+    font-weight: 700;
+    color: rgba(244, 248, 255, 0.94);
+  }
+  .gs-prompt-legend-label,
+  .gs-prompt-legend-more,
+  .gs-prompt-legend-warning {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    color: rgba(180, 193, 222, 0.84);
+  }
+  .gs-prompt-legend-warning {
+    margin-top: 8px;
+    color: rgba(255, 226, 122, 0.90);
+  }
+</style>
+<div class="gs-prompt-legend-panel">
+  <div class="gs-prompt-legend-title">Prompt paths</div>
+  <div class="gs-prompt-legend-list">
+    %s
+  </div>
+  %s
+</div>
+""" % ("\n".join(rows), warning)
+
+
 def render_activation_map(payload: dict, key: str = "activation_map_canvas", height: int = 960) -> None:
     _ = key
     import streamlit as st
 
     st.iframe(activation_map_html(payload, height=height), height=height, width="stretch")
+    legend_html = _legend_panel_html(payload)
+    if legend_html:
+        st.markdown(legend_html, unsafe_allow_html=True)

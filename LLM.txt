@@ -73,6 +73,25 @@ In batch_overlay, each prompt gets its own path for the selected token. Fifteen
 unrelated prompts must show fifteen prompt paths, not one averaged or smeared
 trajectory.
 
+Prompt path legends are UI chrome, not graph content. Persistent prompt legends
+must render outside the activation canvas so they never obscure Box 1 paths.
+Legend data should remain structured in the payload with prompt id, color,
+prompt excerpt, selected state, overflow count, and palette-reuse diagnostics.
+
+The selected-layer detail row, or Box 2, is a heatmap view of the selected
+layer. It renders all visible nodes/clusters for that layer, not only the
+selected node. Node size and opacity must scale from normalized activation when
+available, or from selected-layer raw activation normalization as a fallback.
+Inactive nodes stay dim, while selected-node outlines must not suppress other
+active nodes.
+
+Box 2 must preserve prompt ownership metadata. In batch_overlay, nodes carry
+per-prompt activation entries and prompt colors. If multiple prompts activate
+the same node/cluster, the UI must show overlap honestly with explicit
+multi-prompt markers or equivalent metadata; it must not claim one prompt owns
+an overlapped node. In aggregate_heatmap, Box 2 uses heatmap intensity rather
+than prompt ownership colors.
+
 aggregate_heatmap is not a path mode. It shows activation density/cloud data and
 must not draw a single connected trajectory unless a future centroid feature is
 explicitly labeled as a centroid.

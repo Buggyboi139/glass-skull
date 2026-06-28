@@ -5,16 +5,33 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from math import ceil, sqrt
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from .experiment_store import latest_run_artifacts, load_run_artifact
+from .node_annotations import compact_annotation_match, get_annotations_for_node, load_annotations, model_fingerprint
 
 
 VISUALIZATION_MODES = {"single_prompt", "batch_overlay", "aggregate_heatmap", "compare_prompts"}
 DATA_MODES = {"real_vectors", "top_dims_approx", "scalar_layer_summary", "aggregated", "unavailable"}
 DEFAULT_TOP_K = 8
+PROMPT_PATH_PALETTE = (
+    {"name": "cyan", "color": "#62E4FF", "rgb": [98, 228, 255]},
+    {"name": "amber", "color": "#FFC857", "rgb": [255, 200, 87]},
+    {"name": "violet", "color": "#B7A4FF", "rgb": [183, 164, 255]},
+    {"name": "mint", "color": "#72F2B6", "rgb": [114, 242, 182]},
+    {"name": "rose", "color": "#FF8DB3", "rgb": [255, 141, 179]},
+    {"name": "sky", "color": "#7EB6FF", "rgb": [126, 182, 255]},
+    {"name": "lime", "color": "#D4F75F", "rgb": [212, 247, 95]},
+    {"name": "coral", "color": "#FF9B73", "rgb": [255, 155, 115]},
+    {"name": "indigo", "color": "#8EA0FF", "rgb": [142, 160, 255]},
+    {"name": "gold", "color": "#FFE27A", "rgb": [255, 226, 122]},
+)
+PROMPT_LEGEND_LIMIT = 10
+PROMPT_REUSE_OPACITIES = (1.0, 0.82, 0.68, 0.56)
+PROMPT_REUSE_DASHES = ([], [12, 6], [4, 5], [14, 4, 4, 4])
 
 
 @dataclass
@@ -35,6 +52,9 @@ class ActivationNode:
     mode: str
     y: float = 0.5
     prompt_label: str = ""
+    prompt_text: str = ""
+    prompt_preview_list: list[str] = field(default_factory=list)
+    prompt_observations: list[dict[str, Any]] = field(default_factory=list)
     source_row_index: int | None = None
     vector: list[float] | None = None
     real: bool = True
@@ -53,6 +73,7 @@ class ActivationEdge:
     weight: float
     method: str
     confidence: float
+    prompt_text: str = ""
 
 
 @dataclass
@@ -64,6 +85,7 @@ class ActivationPath:
     nodes: list[ActivationNode]
     edges: list[ActivationEdge]
     path_confidence: float
+    prompt_text: str = ""
     branches: list[ActivationNode] = field(default_factory=list)
 
 
@@ -107,10 +129,106 @@ def _preview(value: Any, limit: int = 72) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+def _prompt_preview(value: Any, limit: int = 260) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    if not text:
+        return ""
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
 def _string_id(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def _prompt_sort_key(value: Any) -> tuple[int, int | str]:
+    text = _string_id(value)
+    if text.lstrip("-").isdigit():
+        return (0, int(text))
+    return (1, text)
+
+
+def _prompt_style(prompt_id: Any, index: int) -> dict[str, Any]:
+    palette_index = index % len(PROMPT_PATH_PALETTE)
+    cycle = index // len(PROMPT_PATH_PALETTE)
+    palette_item = PROMPT_PATH_PALETTE[palette_index]
+    return {
+        "promptColor": palette_item["color"],
+        "promptRgb": palette_item["rgb"],
+        "promptColorName": palette_item["name"],
+        "promptColorIndex": palette_index,
+        "promptColorCycle": cycle,
+        "promptOpacity": PROMPT_REUSE_OPACITIES[min(cycle, len(PROMPT_REUSE_OPACITIES) - 1)],
+        "promptDash": PROMPT_REUSE_DASHES[min(cycle, len(PROMPT_REUSE_DASHES) - 1)],
+        "promptKey": _string_id(prompt_id),
+    }
+
+
+def _build_prompt_color_plan(mode: str, prompt_ids: list[Any]) -> dict[str, Any]:
+    unique_by_key = {
+        _string_id(prompt_id): prompt_id
+        for prompt_id in prompt_ids
+        if prompt_id is not None and _string_id(prompt_id) != ""
+    }
+    ordered_prompt_ids = [unique_by_key[key] for key in sorted(unique_by_key, key=_prompt_sort_key)]
+    if mode == "aggregate_heatmap":
+        color_mode = "aggregate"
+        color_count = 0
+        ordered_prompt_ids = []
+    elif mode in {"batch_overlay", "compare_prompts"} and len(ordered_prompt_ids) > 1:
+        color_mode = "prompt_palette"
+        color_count = len(ordered_prompt_ids)
+    else:
+        color_mode = "single"
+        color_count = len(ordered_prompt_ids)
+    styles_by_prompt = {
+        _string_id(prompt_id): _prompt_style(prompt_id, index)
+        for index, prompt_id in enumerate(ordered_prompt_ids)
+    }
+    entries = [
+        {
+            "promptId": prompt_id,
+            **styles_by_prompt[_string_id(prompt_id)],
+        }
+        for prompt_id in ordered_prompt_ids
+    ]
+    return {
+        "mode": color_mode,
+        "count": color_count,
+        "paletteSize": len(PROMPT_PATH_PALETTE),
+        "colorsReused": color_mode == "prompt_palette" and color_count > len(PROMPT_PATH_PALETTE),
+        "entries": entries,
+        "stylesByPrompt": styles_by_prompt,
+    }
+
+
+def _style_for_prompt(prompt_styles: dict[str, dict[str, Any]], prompt_id: Any) -> dict[str, Any]:
+    return dict(prompt_styles.get(_string_id(prompt_id), _prompt_style(prompt_id, 0)))
+
+
+def _legend_entries(
+    entries: list[dict[str, Any]],
+    activation_paths: list[dict[str, Any]],
+    batches: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    prompt_text: dict[str, str] = {}
+    for item in [*batches, *activation_paths]:
+        key = _string_id(item.get("promptId"))
+        if not key:
+            continue
+        text = _prompt_preview(item.get("promptText") or item.get("promptPreview"))
+        if text and key not in prompt_text:
+            prompt_text[key] = text
+    legend = []
+    for entry in entries[:PROMPT_LEGEND_LIMIT]:
+        key = entry["promptKey"]
+        label = prompt_text.get(key) or f"prompt {entry['promptId']}"
+        legend.append({
+            **entry,
+            "label": _preview(label, 38),
+        })
+    return legend, max(0, len(entries) - PROMPT_LEGEND_LIMIT)
 
 
 def build_model_meta(summary: dict, local_model_context: dict | None, backend: str) -> dict:
@@ -137,10 +255,11 @@ def build_model_meta(summary: dict, local_model_context: dict | None, backend: s
         if is_local
         else _int_or_none(summary.get("context_length") or summary.get("n_ctx"))
     )
-    return {
+    meta = {
         "source": local_model_context.get("source") if is_local else "Local GGUF",
         "backend": backend,
         "modelName": local_model_context.get("display_name") if is_local else str(summary.get("model_name", "")),
+        "modelPath": local_model_context.get("model_path") if is_local else str(summary.get("model_path", "")),
         "architecture": local_model_context.get("architecture") if is_local else str(summary.get("architecture", "local")),
         "layerCount": max(layer_count or 0, 0),
         "hiddenSize": max(hidden_size or 0, 0),
@@ -156,6 +275,8 @@ def build_model_meta(summary: dict, local_model_context: dict | None, backend: s
         "metadataErrors": list(local_model_context.get("errors") or []),
         "visualizationMode": "unavailable",
     }
+    meta["modelFingerprint"] = model_fingerprint(meta)
+    return meta
 
 
 def _batch_rows(artifact: dict) -> list[dict[str, Any]]:
@@ -166,6 +287,7 @@ def _batch_rows(artifact: dict) -> list[dict[str, Any]]:
             "batchId": str(prompt.get("batch_id") or f"batch-{prompt_id}"),
             "promptId": prompt_id,
             "label": prompt.get("label") or "unlabeled",
+            "promptText": str(prompt.get("prompt") or ""),
             "promptPreview": _preview(prompt.get("prompt")),
             "tokenRange": "",
             "outputToken": _preview(prompt.get("output"), 32),
@@ -195,6 +317,7 @@ def _artifact_trace_rows(artifact: dict) -> list[dict[str, Any]]:
             if not merged.get("batch_id"):
                 merged["batch_id"] = prompt.get("batch_id") or row.get("batch_id") or (f"batch-{prompt_id}" if prompt_id is not None else None)
             merged.setdefault("label", prompt.get("label") or "unlabeled")
+            merged.setdefault("prompt_text", prompt.get("prompt") or "")
             merged.setdefault("_source_prompt_index", prompt_index)
             merged.setdefault("_source_row_index", row_index)
             rows.append(merged)
@@ -334,6 +457,8 @@ def _node_from_dimension(
         mode=mode,
         y=_node_y(dimension, hidden_size),
         prompt_label=str(row.get("label") or ""),
+        prompt_text=str(row.get("prompt_text") or ""),
+        prompt_preview_list=[_prompt_preview(row.get("prompt_text"))] if _prompt_preview(row.get("prompt_text")) else [],
         source_row_index=_int_or_none(row.get("_source_row_index")),
         vector=vector,
         real=mode == "real_vectors",
@@ -389,18 +514,46 @@ def _row_nodes(row: dict[str, Any], data_mode: str, hidden_size: int, top_k: int
 def _aggregate_nodes(rows: list[dict[str, Any]], data_mode: str, hidden_size: int, top_k: int) -> list[ActivationNode]:
     buckets: dict[tuple[int, str], ActivationNode] = {}
     members: dict[tuple[int, str], set[str]] = {}
+    prompts: dict[tuple[int, str], dict[str, str]] = {}
+    observations: dict[tuple[int, str], list[ActivationNode]] = {}
     for row in rows:
         for node in _row_nodes(row, data_mode, hidden_size, top_k):
             key = (node.layer, node.node_id)
             if key not in buckets or node.activation > buckets[key].activation:
                 buckets[key] = node
             members.setdefault(key, set()).add(f"{node.prompt_id}:{node.token_id}")
+            if node.prompt_text:
+                prompts.setdefault(key, {})[f"{node.batch_id}:{node.prompt_id}"] = node.prompt_text
+            observations.setdefault(key, []).append(node)
     nodes = list(buckets.values())
     _normalise_nodes(nodes)
+    observation_peak = max((node.activation for bucket in observations.values() for node in bucket), default=0.0)
     for node in nodes:
         key = (node.layer, node.node_id)
+        observation_rows = sorted(observations.get(key, []), key=lambda item: item.activation, reverse=True)
         node.source_fields = sorted(set(node.source_fields + ["member_count"]))
         node.prompt_label = f"{len(members.get(key, set()))} observations"
+        node.prompt_preview_list = [_prompt_preview(text) for text in prompts.get(key, {}).values() if _prompt_preview(text)]
+        if len(node.prompt_preview_list) == 1:
+            node.prompt_text = node.prompt_preview_list[0]
+        node.prompt_observations = [
+            {
+                "promptId": item.prompt_id,
+                "batchId": item.batch_id,
+                "tokenIndex": item.token_id,
+                "tokenId": item.token_id,
+                "token": item.token_text,
+                "activationValue": item.activation,
+                "activation": item.activation,
+                "normalizedActivation": item.activation / observation_peak if observation_peak > 0 else 0.0,
+                "promptText": item.prompt_text,
+                "promptPreview": _prompt_preview(item.prompt_text),
+                "layerId": f"L{item.layer}",
+                "nodeId": item.node_id,
+                "clusterId": item.cluster_id,
+            }
+            for item in observation_rows
+        ]
     return nodes
 
 
@@ -440,6 +593,7 @@ def _edge_between(left: ActivationNode, right: ActivationNode, data_mode: str) -
         weight=weight,
         method=method,
         confidence=confidence,
+        prompt_text=left.prompt_text,
     )
 
 
@@ -489,6 +643,7 @@ def _build_paths(rows: list[dict[str, Any]], data_mode: str, hidden_size: int, t
             nodes=nodes,
             edges=edges,
             path_confidence=path_confidence,
+            prompt_text=nodes[0].prompt_text,
             branches=branches,
         ))
     return paths
@@ -522,6 +677,7 @@ def _build_heatmap(rows: list[dict[str, Any]], hidden_size: int) -> list[dict[st
                 "activationMax": 0.0,
                 "count": 0,
                 "promptIds": set(),
+                "promptTexts": {},
                 "y": _node_y(cluster_id, hidden_size),
             })
             cell["activationSum"] += activation
@@ -529,15 +685,22 @@ def _build_heatmap(rows: list[dict[str, Any]], hidden_size: int) -> list[dict[st
             cell["count"] += 1
             if row.get("prompt_id") is not None:
                 cell["promptIds"].add(row.get("prompt_id"))
+            prompt_text = _prompt_preview(row.get("prompt_text"))
+            if prompt_text:
+                cell["promptTexts"][f"{row.get('batch_id')}:{row.get('prompt_id')}"] = prompt_text
     peak = max((cell["activationMax"] for cell in heat.values()), default=0.0)
     result = []
     for cell in sorted(heat.values(), key=lambda item: (item["layer"], str(item["clusterId"]))):
+        prompt_previews = list(cell["promptTexts"].values())
         result.append({
-            **{key: value for key, value in cell.items() if key != "promptIds"},
+            **{key: value for key, value in cell.items() if key not in {"promptIds", "promptTexts"}},
             "activationMean": cell["activationSum"] / cell["count"] if cell["count"] else 0.0,
             "normalizedActivation": cell["activationMax"] / peak if peak > 0 else 0.0,
             "promptCount": len(cell["promptIds"]),
             "promptIds": sorted(cell["promptIds"], key=lambda value: str(value)),
+            "promptPreviewList": prompt_previews,
+            "promptPreviewTop": prompt_previews[:5],
+            "promptPreviewMoreCount": max(0, len(prompt_previews) - 5),
         })
     return result
 
@@ -580,6 +743,27 @@ def _default_visualization_mode(data_mode: str, prompt_count: int, requested: st
     if prompt_count <= 1:
         return "single_prompt"
     return "batch_overlay"
+
+
+def _filter_rows_for_renderer(
+    rows: list[dict[str, Any]],
+    *,
+    mode: str,
+    selected_prompt: Any,
+    selected_token: int | None,
+) -> list[dict[str, Any]]:
+    if mode in {"aggregate_heatmap", "compare_prompts"}:
+        return rows
+    filtered = rows
+    if mode == "single_prompt" and selected_prompt is not None:
+        filtered = [row for row in filtered if _string_id(row.get("prompt_id")) == _string_id(selected_prompt)]
+    if selected_token is not None and mode in {"single_prompt", "batch_overlay"}:
+        filtered = [
+            row
+            for row in filtered
+            if _int_or_none(row.get("token_index", row.get("token_id"))) == selected_token
+        ]
+    return filtered
 
 
 def inspect_trace_artifact(artifact: dict, summary: dict | None = None, local_model_context: dict | None = None) -> dict[str, Any]:
@@ -676,11 +860,18 @@ def build_activation_map(
     if mode in {"aggregate_heatmap", "compare_prompts"}:
         paths = []
 
-    aggregate_nodes = _aggregate_nodes(rows, data_mode, hidden_size, top_k) if data_mode in {"real_vectors", "top_dims_approx"} else []
-    heatmap = _build_heatmap(rows, hidden_size)
     selected_prompt_id = selected_prompt if selected_prompt is not None else (paths[0].prompt_id if paths else None)
     selected_token_id = selected_token if selected_token is not None else (paths[0].token_id if paths else None)
     selected_batch_id = paths[0].batch_id if paths else None
+    renderer_rows = _filter_rows_for_renderer(
+        rows,
+        mode=mode,
+        selected_prompt=selected_prompt_id,
+        selected_token=selected_token_id,
+    )
+    aggregate_nodes = _aggregate_nodes(renderer_rows, data_mode, hidden_size, top_k) if data_mode in {"real_vectors", "top_dims_approx"} else []
+    heatmap_rows = rows if mode == "aggregate_heatmap" else renderer_rows
+    heatmap = _build_heatmap(heatmap_rows, hidden_size)
 
     diagnostics = inspect_trace_artifact(artifact, summary, local_model_context)
     diagnostics.update({
@@ -740,9 +931,49 @@ def _layer_rows(layer_count: int, nodes: list[ActivationNode], data_mode: str) -
     return rows
 
 
-def _node_group_rows(nodes: list[ActivationNode]) -> list[dict[str, Any]]:
-    return [
-        {
+def _node_group_rows(nodes: list[ActivationNode], prompt_styles: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    prompt_styles = prompt_styles or {}
+    rows = []
+    for node in nodes:
+        observations = node.prompt_observations or [{
+            "promptId": node.prompt_id,
+            "batchId": node.batch_id,
+            "tokenIndex": node.token_id,
+            "tokenId": node.token_id,
+            "token": node.token_text,
+            "activationValue": node.activation,
+            "activation": node.activation,
+            "normalizedActivation": node.normalized_activation,
+            "promptText": node.prompt_text,
+            "promptPreview": _prompt_preview(node.prompt_text),
+            "layerId": f"L{node.layer}",
+            "nodeId": node.node_id,
+            "clusterId": node.cluster_id,
+        }]
+        styled_observations = [
+            {
+                **item,
+                **_style_for_prompt(prompt_styles, item.get("promptId")),
+            }
+            for item in observations
+        ]
+        prompt_ids = sorted(
+            {item.get("promptId") for item in styled_observations if item.get("promptId") is not None},
+            key=_prompt_sort_key,
+        )
+        batch_ids = sorted({str(item.get("batchId")) for item in styled_observations if item.get("batchId")})
+        token_ids = sorted(
+            {item.get("tokenIndex") for item in styled_observations if item.get("tokenIndex") is not None},
+            key=lambda value: int(value) if str(value).lstrip("-").isdigit() else str(value),
+        )
+        prompt_previews = []
+        for item in styled_observations:
+            preview = _prompt_preview(item.get("promptText") or item.get("promptPreview"))
+            if preview and preview not in prompt_previews:
+                prompt_previews.append(preview)
+        prompt_overlap_count = len(prompt_ids)
+        color_strategy = "multi_prompt_overlap" if prompt_overlap_count > 1 else "prompt_color"
+        rows.append({
             "groupId": node.node_id,
             "nodeId": node.node_id,
             "layerId": f"L{node.layer}",
@@ -758,7 +989,17 @@ def _node_group_rows(nodes: list[ActivationNode]) -> list[dict[str, Any]]:
             "activation": node.activation,
             "normalizedActivation": node.normalized_activation,
             "attributionScore": node.normalized_activation,
-            "batchParticipation": 1,
+            "batchParticipation": len(batch_ids) or 1,
+            "observationCount": len(styled_observations),
+            "promptCount": prompt_overlap_count,
+            "promptOverlapCount": prompt_overlap_count,
+            "promptIds": prompt_ids,
+            "batchIds": batch_ids,
+            "tokenIds": token_ids,
+            "promptActivations": styled_observations,
+            "promptColorStrategy": color_strategy,
+            "box2Radius": 2.8 + sqrt(max(0.0, min(1.0, node.normalized_activation))) * 7.4,
+            "box2Opacity": 0.16 + max(0.0, min(1.0, node.normalized_activation)) * 0.72,
             "confidence": node.confidence,
             "sourceFields": node.source_fields,
             "approximationReason": "" if node.real else "top-k dimension node approximates a cluster because full vectors were unavailable",
@@ -768,13 +1009,91 @@ def _node_group_rows(nodes: list[ActivationNode]) -> list[dict[str, Any]]:
             "batchId": node.batch_id,
             "tokenIndex": node.token_id,
             "token": node.token_text,
+            "promptText": node.prompt_text,
+            "promptPreview": _prompt_preview(node.prompt_text),
+            "promptPreviewList": prompt_previews,
+            "promptPreviewTop": prompt_previews[:5],
+            "promptPreviewMoreCount": max(0, len(prompt_previews) - 5),
             "real": node.real,
-        }
-        for node in nodes
-    ]
+            **_style_for_prompt(prompt_styles, node.prompt_id),
+        })
+    return rows
 
 
-def _edge_rows(paths: list[ActivationPath]) -> list[dict[str, Any]]:
+def _box2_diagnostics(
+    selected_layer_row: dict[str, Any] | None,
+    node_groups: list[dict[str, Any]],
+    *,
+    mode: str,
+    prompt_color_mode: str,
+) -> dict[str, Any]:
+    selected_layer_id = (selected_layer_row or {}).get("layerId")
+    visible_groups = [group for group in node_groups if group.get("layerId") == selected_layer_id] if selected_layer_id else []
+    has_normalized = any(
+        group.get("normalizedActivation") is not None and pd.notna(group.get("normalizedActivation"))
+        for group in visible_groups
+    )
+    has_raw = any(
+        group.get("activationValue") is not None and pd.notna(group.get("activationValue"))
+        for group in visible_groups
+    )
+    if has_normalized:
+        scaling = "normalized"
+    elif has_raw:
+        scaling = "layer_normalized"
+    else:
+        scaling = "unavailable"
+    return {
+        "selectedLayer": selected_layer_id,
+        "visibleNodeCount": len(visible_groups),
+        "activeNodeCount": sum(1 for group in visible_groups if float(group.get("activationValue") or 0.0) > 0.0),
+        "activationScaling": scaling,
+        "promptColorMode": prompt_color_mode,
+        "overlappingPromptNodes": sum(1 for group in visible_groups if int(group.get("promptOverlapCount") or 0) > 1),
+        "aggregateMode": mode == "aggregate_heatmap",
+    }
+
+
+def _empty_annotation_fields() -> dict[str, Any]:
+    return {
+        "annotationIds": [],
+        "annotationMatchType": "none",
+        "annotationMatchConfidence": "none",
+        "annotationTags": [],
+        "annotationNote": "",
+    }
+
+
+def _apply_annotation_matches(
+    model_meta: dict[str, Any],
+    node_groups: list[dict[str, Any]],
+    heatmap: list[dict[str, Any]],
+    annotations: dict[str, Any],
+) -> None:
+    for group in node_groups:
+        match = get_annotations_for_node(
+            model_meta,
+            int(group.get("layer") or 0),
+            group.get("clusterId"),
+            group.get("nodeId") or group.get("groupId"),
+            group.get("nodeRange"),
+            annotations=annotations,
+        )
+        group.update(compact_annotation_match(match) if match.get("annotations") else _empty_annotation_fields())
+    for cell in heatmap:
+        match = get_annotations_for_node(
+            model_meta,
+            int(cell.get("layer") or 0),
+            cell.get("clusterId"),
+            cell.get("nodeId"),
+            cell.get("nodeRange"),
+            annotations=annotations,
+        )
+        cell.update(compact_annotation_match(match) if match.get("annotations") else _empty_annotation_fields())
+
+
+def _edge_rows(paths: list[ActivationPath], prompt_styles: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    prompt_styles = prompt_styles or {}
     rows: list[dict[str, Any]] = []
     for path in paths:
         for edge in path.edges:
@@ -792,19 +1111,25 @@ def _edge_rows(paths: list[ActivationPath]) -> list[dict[str, Any]]:
                 "batchId": edge.batch_id,
                 "tokenId": edge.token_id,
                 "tokenIndex": edge.token_id,
+                "promptText": edge.prompt_text,
+                "promptPreview": _prompt_preview(edge.prompt_text),
+                "promptPreviewList": [_prompt_preview(edge.prompt_text)] if _prompt_preview(edge.prompt_text) else [],
                 "weight": edge.weight,
                 "confidence": edge.confidence,
                 "method": edge.method,
                 "approximationReason": "" if edge.method == "cosine_similarity" else "edge is approximated from nearest projected node position; prompt/token identity is preserved",
                 "visualizationMode": edge.method,
+                **_style_for_prompt(prompt_styles, edge.prompt_id),
             })
     return rows
 
 
-def _path_rows(paths: list[ActivationPath], layer_count: int) -> list[dict[str, Any]]:
+def _path_rows(paths: list[ActivationPath], layer_count: int, prompt_styles: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    prompt_styles = prompt_styles or {}
     path_rows = []
     max_layer = max(layer_count - 1, 1)
     for path in paths:
+        path_style = _style_for_prompt(prompt_styles, path.prompt_id)
         points = [
             {
                 "layerId": f"L{node.layer}",
@@ -819,6 +1144,8 @@ def _path_rows(paths: list[ActivationPath], layer_count: int) -> list[dict[str, 
                 "visualizationMode": node.mode,
                 "promptId": node.prompt_id,
                 "batchId": node.batch_id,
+                "promptText": node.prompt_text,
+                "promptPreview": _prompt_preview(node.prompt_text),
                 "token": node.token_text,
                 "tokenText": node.token_text,
                 "tokenIndex": node.token_id,
@@ -828,6 +1155,7 @@ def _path_rows(paths: list[ActivationPath], layer_count: int) -> list[dict[str, 
                 "sourceFields": node.source_fields,
                 "confidence": node.confidence,
                 "real": node.real,
+                **_style_for_prompt(prompt_styles, node.prompt_id),
             }
             for node in path.nodes
         ]
@@ -843,9 +1171,12 @@ def _path_rows(paths: list[ActivationPath], layer_count: int) -> list[dict[str, 
                 "normalizedActivation": node.normalized_activation,
                 "promptId": node.prompt_id,
                 "batchId": node.batch_id,
+                "promptText": node.prompt_text,
+                "promptPreview": _prompt_preview(node.prompt_text),
                 "tokenIndex": node.token_id,
                 "token": node.token_text,
                 "confidence": node.confidence,
+                **_style_for_prompt(prompt_styles, node.prompt_id),
             }
             for node in path.branches
         ]
@@ -853,6 +1184,9 @@ def _path_rows(paths: list[ActivationPath], layer_count: int) -> list[dict[str, 
             "pathId": f"{path.batch_id}-{path.prompt_id}-{path.token_id}-path",
             "batchId": path.batch_id,
             "promptId": path.prompt_id,
+            "promptText": path.prompt_text,
+            "promptPreview": _prompt_preview(path.prompt_text),
+            "promptPreviewList": [_prompt_preview(path.prompt_text)] if _prompt_preview(path.prompt_text) else [],
             "tokenId": path.token_id,
             "tokenIndex": path.token_id,
             "points": points,
@@ -864,6 +1198,8 @@ def _path_rows(paths: list[ActivationPath], layer_count: int) -> list[dict[str, 
                     "promptId": edge.prompt_id,
                     "tokenId": edge.token_id,
                     "tokenIndex": edge.token_id,
+                    "promptText": edge.prompt_text,
+                    "promptPreview": _prompt_preview(edge.prompt_text),
                     "fromLayer": edge.from_layer,
                     "toLayer": edge.to_layer,
                     "fromNodeId": edge.from_node_id,
@@ -871,6 +1207,7 @@ def _path_rows(paths: list[ActivationPath], layer_count: int) -> list[dict[str, 
                     "weight": edge.weight,
                     "method": edge.method,
                     "confidence": edge.confidence,
+                    **_style_for_prompt(prompt_styles, edge.prompt_id),
                 }
                 for edge in path.edges
             ],
@@ -885,6 +1222,7 @@ def _path_rows(paths: list[ActivationPath], layer_count: int) -> list[dict[str, 
             "pathMethod": "top_activation_per_layer",
             "visualizationMode": points[0]["visualizationMode"] if points else "unavailable",
             "approximationReason": "" if points and points[0]["real"] else "dominant path is approximated from top-k dimensions; prompt/token identity is preserved",
+            **path_style,
         })
     return path_rows
 
@@ -936,6 +1274,7 @@ def build_activation_map_payload(
     show_aggregate_heatmap: bool = False,
     show_secondary_branches: bool = True,
     developer_diagnostics: bool = False,
+    annotations_path: str | Path | None = None,
 ) -> dict:
     backend = str(artifact.get("backend") or summary.get("backend") or "llama.cpp")
     model_meta = build_model_meta(summary, local_model_context, backend)
@@ -960,9 +1299,13 @@ def build_activation_map_payload(
         valid_selected_layer = selected_layer if selected_layer is not None and 0 <= selected_layer < len(layers) else 0
         for layer in layers:
             layer["selected"] = layer["index"] == valid_selected_layer
-    node_groups = _node_group_rows(activation_map.nodes)
-    edge_rows = [edge for edge in _edge_rows(activation_map.paths) if edge.get("weight", 0.0) >= edge_threshold]
-    activation_paths = _path_rows(activation_map.paths, activation_map.layer_count)
+    prompt_color_plan = _build_prompt_color_plan(activation_map.mode, [path.prompt_id for path in activation_map.paths])
+    prompt_styles = prompt_color_plan["stylesByPrompt"]
+    node_groups = _node_group_rows(activation_map.nodes, prompt_styles)
+    annotations = load_annotations(annotations_path)
+    _apply_annotation_matches(model_meta, node_groups, activation_map.heatmap, annotations)
+    edge_rows = [edge for edge in _edge_rows(activation_map.paths, prompt_styles) if edge.get("weight", 0.0) >= edge_threshold]
+    activation_paths = _path_rows(activation_map.paths, activation_map.layer_count, prompt_styles)
 
     selected_layer_row = next((layer for layer in layers if layer.get("selected")), layers[0] if layers else None)
     selected_group_row = next((group for group in node_groups if group["groupId"] == selected_group), None)
@@ -973,6 +1316,12 @@ def build_activation_map_payload(
     batch_lookup = {batch["batchId"]: batch for batch in batches}
     selected_batch_id = selected_batch if selected_batch in batch_lookup else (activation_map.selected_batch_id or (batches[0]["batchId"] if batches else None))
     selected_batch_row = batch_lookup.get(selected_batch_id) if selected_batch_id else None
+    box2_diagnostics = _box2_diagnostics(
+        selected_layer_row,
+        node_groups,
+        mode=activation_map.mode,
+        prompt_color_mode=prompt_color_plan["mode"],
+    )
 
     heatmap_stats = {
         "layers": [
@@ -1000,6 +1349,27 @@ def build_activation_map_payload(
         ],
     }
 
+    compare_data = _compare_prompts(_available_rows(_artifact_trace_rows(artifact)), selected_prompt, compare_prompt) if activation_map.mode == "compare_prompts" else {"deltas": []}
+    if activation_map.mode == "compare_prompts":
+        compare_prompt_ids = [
+            compare_data.get("selectedPromptId"),
+            compare_data.get("comparePromptId"),
+        ]
+        prompt_color_plan = _build_prompt_color_plan(activation_map.mode, compare_prompt_ids)
+        compare_styles = prompt_color_plan["stylesByPrompt"]
+        selected_style = _style_for_prompt(compare_styles, compare_data.get("selectedPromptId"))
+        compare_style = _style_for_prompt(compare_styles, compare_data.get("comparePromptId"))
+        compare_data = {
+            **compare_data,
+            "selectedPromptColor": selected_style["promptColor"],
+            "comparePromptColor": compare_style["promptColor"],
+            "promptColors": {
+                selected_style["promptKey"]: selected_style,
+                compare_style["promptKey"]: compare_style,
+            },
+        }
+    legend_entries, legend_more_count = _legend_entries(prompt_color_plan["entries"], activation_paths, batches)
+
     diagnostics = {
         **activation_map.diagnostics,
         "selectedBatch": selected_batch_row,
@@ -1022,7 +1392,16 @@ def build_activation_map_payload(
         "layerCount": activation_map.layer_count,
         "edgeCount": len(edge_rows),
         "nodeCount": len(node_groups),
+        "promptColorMode": prompt_color_plan["mode"],
+        "promptColorCount": prompt_color_plan["count"],
+        "paletteSize": prompt_color_plan["paletteSize"],
+        "colorsReused": prompt_color_plan["colorsReused"],
+        "box2": box2_diagnostics,
     }
+    if prompt_color_plan["colorsReused"]:
+        reuse_warning = f"Prompt path palette reused after {prompt_color_plan['paletteSize']} colors; tooltips identify exact prompts."
+        if reuse_warning not in diagnostics.get("warnings", []):
+            diagnostics["warnings"] = [*diagnostics.get("warnings", []), reuse_warning]
     diagnostics.update({
         "rows": diagnostics.get("rows", 0),
         "maxLayer": max((int(layer) for layer in diagnostics.get("rows_per_layer", {}) if str(layer).isdigit()), default=None),
@@ -1039,7 +1418,6 @@ def build_activation_map_payload(
     if isinstance(patch_meta, dict):
         diagnostics["activationPatch"] = patch_meta
 
-    compare_data = _compare_prompts(_available_rows(_artifact_trace_rows(artifact)), selected_prompt, compare_prompt) if activation_map.mode == "compare_prompts" else {"deltas": []}
     payload = {
         "mode": activation_map.mode,
         "dataMode": data_mode,
@@ -1052,6 +1430,18 @@ def build_activation_map_payload(
         "heatmap": activation_map.heatmap,
         "heatmapStats": heatmap_stats,
         "comparePrompts": compare_data,
+        "promptColorLegend": legend_entries,
+        "promptColorLegendMoreCount": legend_more_count,
+        "promptLegendPanel": {
+            "title": "Prompt paths",
+            "placement": "external_below_graph",
+            "entries": legend_entries,
+            "moreCount": legend_more_count,
+            "colorsReused": prompt_color_plan["colorsReused"],
+            "selectedPromptId": activation_map.selected_prompt_id,
+            "supportsClickSelection": False,
+            "clickSelectionReason": "Streamlit iframe renderer does not expose prompt click events to session state.",
+        },
         "diagnostics": diagnostics,
         "rendererOptions": {
             "visualizationMode": activation_map.mode,
