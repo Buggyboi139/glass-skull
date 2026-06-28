@@ -10,17 +10,26 @@ import pandas as pd
 SCHEMA_VERSION = 1
 TRACE_COLUMNS = [
     "run_id",
+    "batch_id",
     "prompt_id",
     "label",
     "layer",
     "stream",
     "component",
     "token_index",
+    "token_id",
     "token",
     "activation_norm",
     "trace_available",
     "trace_source",
     "unavailable_reason",
+    "top_dims",
+    "vector",
+    "nodes",
+    "token_range",
+    "node_range",
+    "include_vectors_response",
+    "n_embd",
 ]
 
 
@@ -100,20 +109,29 @@ def normalize_llama_trace(
         return []
 
     tokens = _llama_tokens(payload)
+    activations = payload.get("activations") if isinstance(payload.get("activations"), dict) else {}
+    n_embd = _int_or_none(payload.get("n_embd") or activations.get("n_embd"))
+    include_vectors_response = bool(activations.get("vectors") is True)
     rows: list[dict[str, Any]] = []
     for row in trace_points:
         if not isinstance(row, dict):
             continue
-        token_index = _int_or_none(row.get("token_index"))
+        token_index = _int_or_none(row.get("token_index", row.get("token_id")))
+        batch_id = row.get("batch_id")
+        prompt_index = _int_or_none(row.get("prompt_index"))
+        if batch_id is None and prompt_index is not None:
+            batch_id = f"batch-{prompt_index}"
         stream = str(row.get("stream") or row.get("component") or default_stream)
         rows.append({
             "run_id": run_id,
+            "batch_id": batch_id,
             "prompt_id": prompt_id,
             "label": label or "unlabeled",
             "layer": _int_or_none(row.get("layer")),
             "stream": stream,
             "component": stream,
             "token_index": token_index,
+            "token_id": token_index,
             "token": _token_from_trace(tokens, token_index, row.get("token")),
             "activation_norm": _finite_float(row.get("activation_norm", row.get("norm", row.get("l2_norm")))),
             "trace_available": True,
@@ -121,6 +139,11 @@ def normalize_llama_trace(
             "unavailable_reason": "",
             "top_dims": row.get("top_dims", []),
             "vector": row.get("vector") or row.get("activation_vector"),
+            "nodes": row.get("nodes", []),
+            "token_range": row.get("token_range") or row.get("tokenRange"),
+            "node_range": row.get("node_range") or row.get("nodeRange"),
+            "include_vectors_response": include_vectors_response,
+            "n_embd": n_embd,
         })
     return rows
 
@@ -134,18 +157,26 @@ def trace_unavailable_row(
 ) -> dict[str, Any]:
     return {
         "run_id": run_id,
+        "batch_id": None,
         "prompt_id": prompt_id,
         "label": label or "unlabeled",
         "layer": None,
         "stream": "",
         "component": "",
         "token_index": None,
+        "token_id": None,
         "token": "",
         "activation_norm": None,
         "trace_available": False,
         "trace_source": source,
         "unavailable_reason": reason,
         "top_dims": [],
+        "vector": None,
+        "nodes": [],
+        "token_range": None,
+        "node_range": None,
+        "include_vectors_response": False,
+        "n_embd": None,
     }
 
 
@@ -181,6 +212,7 @@ def build_run_artifact(
         if prompt.get("elapsed_ms") is not None:
             latencies.append(_finite_float(prompt.get("elapsed_ms")))
         prompt_runs.append({
+            "batch_id": prompt.get("batch_id", f"batch-{prompt.get('prompt_id', idx)}"),
             "prompt_id": prompt.get("prompt_id", idx),
             "label": prompt.get("label") or "unlabeled",
             "prompt": prompt.get("prompt", ""),

@@ -33,6 +33,7 @@ def run_fuzz_experiment(
     layers: list[int] | None = None,
     streams: list[str] | None = None,
     top_k: int = 32,
+    include_vectors: bool = True,
     run_id: str | None = None,
     mode: str = "fuzz",
     progress_callback: Callable[[int, int, str], None] | None = None,
@@ -57,6 +58,7 @@ def run_fuzz_experiment(
         "layers": layers,
         "streams": streams,
         "top_k": top_k,
+        "include_vectors": include_vectors,
         "prompt_count": len(prompts),
         "run_id": run_id,
         "mode": mode,
@@ -99,6 +101,7 @@ def run_fuzz_experiment(
                     max_new_tokens=max_new_tokens,
                     top_k=top_k,
                     with_pieces=True,
+                    include_vectors=include_vectors,
                 )
                 trace_rows = normalize_llama_trace(
                     payload,

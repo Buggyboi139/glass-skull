@@ -10,7 +10,7 @@ from typing import Any
 
 import pandas as pd
 
-from glass_skull.activation_map import build_activation_map_payload, build_model_meta
+from glass_skull.activation_map import build_activation_map_payload, build_model_meta, inspect_trace_artifact
 from glass_skull.activation_map_view import activation_map_html
 from glass_skull.behavior_profiles import get_behavior_profile, list_behavior_profiles
 from glass_skull.behavior_scoring import behavior_timeline_df, score_behavior_output, score_run_artifact
@@ -39,6 +39,7 @@ from glass_skull.llama_control import (
 from glass_skull.path_mapping import rank_activation_paths, recommended_steering_targets
 from glass_skull.prompt_loader import load_jsonl, load_txt
 from glass_skull.run_artifacts import (
+    TRACE_COLUMNS,
     activation_path_df,
     batch_heatmap_df,
     build_run_artifact,
@@ -105,8 +106,16 @@ def _fake_llama_request(captured: list[dict[str, Any]]):
                 "model": "local",
                 "prompt": {"traces": [{"tokens": [10, 20], "pieces": [{"piece": "hi"}, {"piece": " there"}]}]},
                 "layer_inputs": [
-                    {"layer": 0, "stream": "resid_pre", "token_index": 0, "l2_norm": 1.25, "top_dims": [{"dimension": 3, "activation": 0.5}]},
-                    {"layer": 1, "stream": "resid_pre", "token_index": 1, "l2_norm": 2.5, "top_dims": [{"dimension": 7, "activation": -1.0}]},
+                    {"layer": 0, "stream": "resid_pre", "token_index": 0, "l2_norm": 1.25, "top_dims": [
+                        {"dimension": 3, "activation": 0.5},
+                        {"dimension": 7, "activation": -0.4},
+                        {"dimension": 12, "activation": 0.3},
+                    ]},
+                    {"layer": 1, "stream": "resid_pre", "token_index": 1, "l2_norm": 2.5, "top_dims": [
+                        {"dimension": 4, "activation": -1.0},
+                        {"dimension": 8, "activation": 0.7},
+                        {"dimension": 13, "activation": -0.2},
+                    ]},
                 ],
                 "logits": {"supported": False, "reason": "not requested"},
             }
@@ -396,6 +405,120 @@ def _assert_managed_llama_defaults() -> None:
     assert "verify_glass_trace_activation_support" in launcher_source
 
 
+def _path_fixture_artifact(prompt_count: int, *, vector: bool = False, scalar_only: bool = False) -> dict[str, Any]:
+    prompts = []
+    for prompt_id in range(prompt_count):
+        trace_rows = []
+        for layer in range(3):
+            base_dim = (prompt_id * 7 + layer * 2) % 24
+            row: dict[str, Any] = {
+                "layer": layer,
+                "stream": "resid_pre",
+                "token_index": 0,
+                "token": f"tok-{prompt_id}",
+                "activation_norm": 1.0 + prompt_id * 0.03 + layer * 0.1,
+            }
+            if vector:
+                width = 24
+                values = [0.0] * width
+                values[base_dim] = 1.0 + layer * 0.1
+                row["vector"] = values
+            elif not scalar_only:
+                row["top_dims"] = [{"dimension": base_dim, "activation": 1.0 + layer * 0.1}]
+            trace_rows.append(row)
+        prompts.append({
+            "prompt_id": prompt_id,
+            "label": f"p{prompt_id}",
+            "prompt": f"prompt {prompt_id}",
+            "output": f"output {prompt_id}",
+            "trace_rows": normalize_llama_trace(
+                {
+                    "activations": {"supported": True, "vectors": vector, "n_embd": 24},
+                    "layer_inputs": trace_rows,
+                },
+                prompt_id=prompt_id,
+                label=f"p{prompt_id}",
+                metadata={"run_id": "path_fixture"},
+            ),
+        })
+    return build_run_artifact(
+        run_id="path_fixture",
+        mode="Batch run" if prompt_count > 1 else "Single message",
+        backend="llama.cpp",
+        model="local",
+        prompts=prompts,
+    )
+
+
+def _aggregate_only_artifact() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "run_id": "aggregate_only",
+        "mode": "Batch run",
+        "backend": "llama.cpp",
+        "model": "local",
+        "created_at": "2026-06-28T00:00:00+00:00",
+        "summary": {"prompt_count": 15, "trace_row_count": 3, "layers": 3, "d_model": 24},
+        "prompts": [{
+            "prompt_id": None,
+            "label": "aggregate",
+            "prompt": "",
+            "output": "",
+            "trace_rows": [
+                {
+                    "run_id": "aggregate_only",
+                    "prompt_id": None,
+                    "batch_id": None,
+                    "layer": layer,
+                    "stream": "resid_pre",
+                    "token_index": None,
+                    "token": "",
+                    "activation_norm": 1.0 + layer,
+                    "trace_available": True,
+                    "trace_source": "llama.cpp",
+                    "aggregation": "all_prompts_layer_mean",
+                    "top_dims": [{"dimension": layer * 3, "activation": 1.0}],
+                }
+                for layer in range(3)
+            ],
+        }],
+    }
+
+
+def _tokenless_prompt_artifact() -> dict[str, Any]:
+    return build_run_artifact(
+        run_id="tokenless_prompt",
+        mode="Batch run",
+        backend="llama.cpp",
+        model="local",
+        prompts=[
+            {
+                "prompt_id": 0,
+                "batch_id": "batch-0",
+                "label": "p0",
+                "prompt": "tokenless prompt",
+                "output": "ok",
+                "trace_rows": [
+                    {
+                        "run_id": "tokenless_prompt",
+                        "batch_id": "batch-0",
+                        "prompt_id": 0,
+                        "layer": 0,
+                        "stream": "resid_pre",
+                        "token_index": None,
+                        "token_id": None,
+                        "token": "",
+                        "activation_norm": 1.0,
+                        "trace_available": True,
+                        "trace_source": "llama.cpp",
+                        "top_dims": [{"dimension": 4, "activation": 1.0}],
+                    }
+                ],
+            }
+        ],
+    )
+
+
 def main() -> None:
     ensure_dirs()
     assert LOCAL_TABS == ["Run", "Map", "Steer", "Timeline", "Model", "Settings"]
@@ -464,13 +587,23 @@ def main() -> None:
     assert trace_request["payload"]["capture"]["prompt_tokens"] is True
     assert trace_request["payload"]["capture"]["layer_inputs"] is True
     assert trace_request["payload"]["max_tokens"] == 8
-    assert trace_request["payload"]["include_vectors"] is False
+    assert trace_request["payload"]["include_vectors"] is True
     assert per_request_steering_supported({"capabilities": {"steering": {"per_request": {"supported": True}}}}) is True
     assert build_steering_metadata("vec.gguf", 1.25, 1, 4)["layer_end"] == 4
 
     rows = normalize_llama_trace(trace, prompt_id=0, label="single", metadata={"run_id": "run1"})
     assert rows[0]["token"] == "hi"
+    assert rows[0]["batch_id"] is None
+    assert rows[0]["token_id"] == rows[0]["token_index"]
     assert rows[1]["activation_norm"] == 2.5
+    token_id_rows = normalize_llama_trace(
+        {"layer_inputs": [{"layer": 0, "stream": "resid_pre", "token_id": 3, "activation_norm": 1.0, "top_dims": [{"dimension": 2, "activation": 1.0}]}]},
+        prompt_id=7,
+        label="token-id",
+        metadata={"run_id": "token_id_run"},
+    )
+    assert token_id_rows[0]["token_index"] == 3
+    assert token_id_rows[0]["token_id"] == 3
     vector_rows = normalize_llama_trace(
         {
             "layer_inputs": [{
@@ -500,7 +633,14 @@ def main() -> None:
     )
     path_df = activation_path_df(artifact)
     assert len(path_df) == 3
+    assert "batch_id" in TRACE_COLUMNS
+    assert "token_id" in TRACE_COLUMNS
+    assert "batch_id" in path_df.columns
+    assert "token_id" in path_df.columns
+    assert "top_dims" in path_df.columns
+    assert path_df[path_df["trace_available"] != False].iloc[0]["top_dims"]
     assert artifact["prompts"][0]["trace_rows"] == rows
+    assert artifact["prompts"][0]["batch_id"] == "batch-0"
     assert artifact["summary"]["trace_row_count"] == 2
     assert artifact["summary"]["trace_unavailable_count"] == 1
     assert batch_heatmap_df(artifact, group_by="label").iloc[0]["activation_norm"] > 0
@@ -527,8 +667,157 @@ def main() -> None:
     payload = build_activation_map_payload(artifact, summary, local_model_context=local_meta)
     assert payload["modelMeta"]["metadataSource"] == "gguf"
     assert payload["activationPaths"]
+    assert payload["visualizationMode"] == "single_prompt"
+    assert payload["dataMode"] == "top_dims_approx"
+    assert payload["diagnostics"]["vectorsPresent"] is False
+    assert payload["diagnostics"]["includeVectorsResponse"] is False
+    assert payload["diagnostics"]["warnings"]
+    layer0_groups = [group for group in payload["nodeGroups"] if group["layerId"] == "L0" and group["activationValue"] > 0]
+    assert len(layer0_groups) > 1
+    assert all(edge["method"] != "cosine_similarity" for edge in payload["activationEdges"])
+    assert all(edge["tokenIndex"] == payload["activationPaths"][0]["tokenIndex"] for edge in payload["activationEdges"])
     html = activation_map_html(payload)
     assert "canvas" in html and "selectedDiagnostics" in html and "Activation path unavailable" not in html
+    assert "Real activation vectors were not returned" in html
+    assert "identities.has" in html
+    assert "rendererOptions.visualizationMode === 'aggregate_heatmap' ? null : pathByBatchId" in html
+    assert "visualization-mode" in html
+    assert "selected-prompt" in html
+    assert "selected-token" in html
+    assert "top-k" in html
+    assert "background-opacity" in html
+    assert "edge-threshold" in html
+    assert "show-aggregate" in html
+    assert "show-secondary" in html
+    assert "developer-diagnostics" in html
+
+    vector_artifact = build_run_artifact(
+        run_id="vector1",
+        mode="local",
+        backend="llama.cpp",
+        model="local",
+        prompts=[{
+            "prompt_id": 0,
+            "label": "single",
+            "prompt": "hello",
+            "output": "ok",
+            "trace_rows": normalize_llama_trace(
+                {
+                    "activations": {"supported": True, "vectors": True, "n_embd": 4},
+                    "layer_inputs": [
+                        {"layer": 0, "stream": "resid_pre", "token_index": 0, "activation_norm": 1.0, "vector": [1.0, 0.0, 0.0, 0.0]},
+                        {"layer": 0, "stream": "resid_pre", "token_index": 1, "activation_norm": 0.8, "vector": [0.0, 1.0, 0.0, 0.0]},
+                        {"layer": 1, "stream": "resid_pre", "token_index": 0, "activation_norm": 1.2, "vector": [0.9, 0.1, 0.0, 0.0]},
+                        {"layer": 1, "stream": "resid_pre", "token_index": 1, "activation_norm": 0.9, "vector": [0.1, 0.9, 0.0, 0.0]},
+                    ],
+                },
+                prompt_id=0,
+                label="single",
+                metadata={"run_id": "vector1"},
+            ),
+        }],
+    )
+    vector_payload = build_activation_map_payload(vector_artifact, summary, local_model_context=local_meta)
+    assert vector_payload["visualizationMode"] == "single_prompt"
+    assert vector_payload["dataMode"] == "real_vectors"
+    assert vector_payload["diagnostics"]["vectorsPresent"] is True
+    assert len([group for group in vector_payload["nodeGroups"] if group["layerId"] == "L0"]) >= 2
+    assert vector_payload["activationEdges"]
+    assert {edge["method"] for edge in vector_payload["activationEdges"]} == {"cosine_similarity"}
+
+    batch_path_artifact = build_run_artifact(
+        run_id="batch_paths",
+        mode="Batch run",
+        backend="llama.cpp",
+        model="local",
+        prompts=[
+            {
+                "prompt_id": 0,
+                "label": "a",
+                "prompt": "alpha",
+                "output": "ok",
+                "trace_rows": normalize_llama_trace(
+                    {"layer_inputs": [
+                        {"layer": 0, "stream": "resid_pre", "token_index": 0, "activation_norm": 1.0, "top_dims": [{"dimension": 1, "activation": 1.0}]},
+                        {"layer": 1, "stream": "resid_pre", "token_index": 0, "activation_norm": 1.0, "top_dims": [{"dimension": 2, "activation": 1.0}]},
+                    ]},
+                    prompt_id=0,
+                    label="a",
+                    metadata={"run_id": "batch_paths"},
+                ),
+            },
+            {
+                "prompt_id": 1,
+                "label": "b",
+                "prompt": "beta",
+                "output": "ok",
+                "trace_rows": normalize_llama_trace(
+                    {"layer_inputs": [
+                        {"layer": 0, "stream": "resid_pre", "token_index": 0, "activation_norm": 1.0, "top_dims": [{"dimension": 14, "activation": 1.0}]},
+                        {"layer": 1, "stream": "resid_pre", "token_index": 0, "activation_norm": 1.0, "top_dims": [{"dimension": 3, "activation": 1.0}]},
+                    ]},
+                    prompt_id=1,
+                    label="b",
+                    metadata={"run_id": "batch_paths"},
+                ),
+            },
+        ],
+    )
+    batch_path_payload = build_activation_map_payload(batch_path_artifact, summary, local_model_context=local_meta)
+    batch_paths = batch_path_payload["activationPaths"]
+    assert batch_path_payload["visualizationMode"] == "batch_overlay"
+    assert batch_path_payload["diagnostics"]["rendererMode"] == "batch_overlay"
+    assert len(batch_paths) == 2
+    assert {path["pathMethod"] for path in batch_paths} == {"top_activation_per_layer"}
+    assert [point["groupId"] for point in batch_paths[0]["points"]] != [point["groupId"] for point in batch_paths[1]["points"]]
+    assert all(point["promptId"] == path["promptId"] for path in batch_paths for point in path["points"])
+    assert all(point["tokenIndex"] == 0 for path in batch_paths for point in path["points"])
+    assert all(edge["promptId"] == path["promptId"] for path in batch_paths for edge in path["edges"])
+    assert "Prompt path" in activation_map_html(batch_path_payload)
+
+    single_fixture_payload = build_activation_map_payload(_path_fixture_artifact(1), summary, local_model_context=local_meta)
+    assert single_fixture_payload["visualizationMode"] == "single_prompt"
+    assert len(single_fixture_payload["activationPaths"]) == 1
+    assert single_fixture_payload["activationPaths"][0]["promptId"] == 0
+
+    fifteen_payload = build_activation_map_payload(_path_fixture_artifact(15), summary, local_model_context=local_meta)
+    assert fifteen_payload["visualizationMode"] == "batch_overlay"
+    assert len(fifteen_payload["activationPaths"]) == 15
+    assert len({path["promptId"] for path in fifteen_payload["activationPaths"]}) == 15
+    assert "aggregate_heatmap" not in {fifteen_payload["visualizationMode"], fifteen_payload["diagnostics"]["rendererMode"]}
+
+    aggregate_payload = build_activation_map_payload(_aggregate_only_artifact(), summary, local_model_context=local_meta)
+    assert aggregate_payload["visualizationMode"] == "aggregate_heatmap"
+    assert aggregate_payload["activationPaths"] == []
+    assert aggregate_payload["heatmap"]
+    assert "Backend trace is already aggregated. Per-prompt paths unavailable." in aggregate_payload["diagnostics"]["warnings"]
+    aggregate_report = inspect_trace_artifact(_aggregate_only_artifact(), summary, local_model_context=local_meta)
+    assert aggregate_report["prompt_count"] == 15
+    assert aggregate_report["batch_count"] == 0
+    assert aggregate_report["data_granularity"] == "aggregated"
+
+    scalar_only_payload = build_activation_map_payload(_path_fixture_artifact(1, scalar_only=True), summary, local_model_context=local_meta)
+    assert scalar_only_payload["dataMode"] == "scalar_layer_summary"
+    assert scalar_only_payload["activationPaths"] == []
+    assert scalar_only_payload["visualizationMode"] == "aggregate_heatmap"
+    assert scalar_only_payload["heatmap"]
+
+    tokenless_payload = build_activation_map_payload(_tokenless_prompt_artifact(), summary, local_model_context=local_meta)
+    assert tokenless_payload["dataMode"] == "top_dims_approx"
+    assert tokenless_payload["diagnostics"]["data_granularity"] == "raw"
+    assert tokenless_payload["visualizationMode"] == "single_prompt"
+
+    compare_payload = build_activation_map_payload(
+        _path_fixture_artifact(2),
+        summary,
+        local_model_context=local_meta,
+        visualization_mode="compare_prompts",
+        selected_prompt=0,
+        compare_prompt=1,
+    )
+    assert compare_payload["visualizationMode"] == "compare_prompts"
+    assert compare_payload["activationPaths"] == []
+    assert compare_payload["comparePrompts"]["deltas"]
     _assert_main_layer_resolver_and_trace_mock(summary, local_meta)
     _assert_single_trace_failure_preserves_reason()
     _assert_patched_baseline_visible_to_app(rows)

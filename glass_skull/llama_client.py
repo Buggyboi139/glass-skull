@@ -288,6 +288,22 @@ def activation_patch_supported(glass_info: dict[str, Any] | None) -> bool:
     return False
 
 
+def trace_vectors_supported(glass_info: dict[str, Any] | None) -> bool:
+    if not isinstance(glass_info, dict):
+        return False
+    capabilities = glass_info.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return False
+    trace = capabilities.get("trace")
+    if not isinstance(trace, dict):
+        return False
+    for key in ("layer_inputs", "activations"):
+        section = trace.get(key)
+        if isinstance(section, dict) and section.get("supported") is True and section.get("vectors") is True:
+            return True
+    return False
+
+
 def activation_patch_diagnostic(glass_info: dict[str, Any] | None) -> str:
     if activation_patch_supported(glass_info):
         return "This llama.cpp server advertises per-request activation patch support."
@@ -349,7 +365,7 @@ def _glass_trace_payload(
     max_new_tokens: int | None = None,
     top_k: int | None = None,
     with_pieces: bool | None = None,
-    include_vectors: bool | None = False,
+    include_vectors: bool | None = True,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {"prompt": prompt}
 
@@ -530,7 +546,7 @@ def trace_glass_prompt(
     max_new_tokens: int | None = None,
     top_k: int | None = None,
     with_pieces: bool | None = None,
-    include_vectors: bool | None = False,
+    include_vectors: bool | None = True,
     timeout: float = 300.0,
 ) -> dict[str, Any]:
     """Request a local llama.cpp trace payload.

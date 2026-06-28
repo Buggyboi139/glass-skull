@@ -40,6 +40,7 @@ from glass_skull.llama_client import (
     activation_patch_supported,
     per_request_steering_supported,
     trace_glass_prompt,
+    trace_vectors_supported,
 )
 from glass_skull.llama_control import (
     DEFAULT_CVECTOR_GENERATOR,
@@ -730,10 +731,14 @@ def run_app() -> None:
             temperature = st.slider("Temperature", 0.01, 1.5, 0.8, 0.05)
 
         auto_trace = st.toggle("Trace prompt", value=True, help="Calls the patched /glass-skull/trace endpoint before generation.")
-        local_steering_supported = per_request_steering_supported(
+        local_glass_info = (
             st.session_state.llama_status.glass_info if chat_backend == "llama.cpp normal" and st.session_state.llama_status else
             st.session_state.llama_glass_status.glass_info if st.session_state.llama_glass_status else {}
         )
+        local_steering_supported = per_request_steering_supported(
+            local_glass_info
+        )
+        include_trace_vectors = trace_vectors_supported(local_glass_info)
         startup_steered = chat_backend == "llama.cpp glass"
         use_steering = False if startup_steered else st.toggle("Use per-request steering", value=False, disabled=not local_steering_supported)
         steering_payload, steering_error = selected_control_vector_payload() if use_steering else (None, None)
@@ -802,7 +807,7 @@ def run_app() -> None:
                         max_new_tokens=max_new_tokens,
                         top_k=32,
                         with_pieces=True,
-                        include_vectors=False,
+                        include_vectors=include_trace_vectors,
                     )
                     set_local_dashboard_trace(trace_payload, prompt, chat_backend, active_model_label())
                 except Exception as exc:
@@ -867,6 +872,7 @@ def run_app() -> None:
                         layers=trace_layers,
                         streams=["resid_pre"],
                         top_k=32,
+                        include_vectors=include_trace_vectors,
                         run_id=run_id,
                         mode="Batch run",
                         progress_callback=cb,

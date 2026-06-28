@@ -39,6 +39,53 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
       background:
         linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0.00));
     }}
+    .gs-map-controls {{
+      position: absolute;
+      z-index: 4;
+      left: 12px;
+      right: 12px;
+      top: 10px;
+      display: grid;
+      grid-template-columns: repeat(5, minmax(112px, 1fr));
+      gap: 8px;
+      padding: 8px;
+      border: 1px solid rgba(146, 188, 255, 0.20);
+      border-radius: 8px;
+      background: rgba(6, 10, 20, 0.76);
+      backdrop-filter: blur(14px);
+      color: rgba(228, 238, 255, 0.92);
+      font-size: 11px;
+    }}
+    .gs-map-controls label {{
+      display: grid;
+      gap: 3px;
+      min-width: 0;
+    }}
+    .gs-map-controls span {{
+      color: rgba(169, 185, 214, 0.82);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+    .gs-map-controls select,
+    .gs-map-controls input {{
+      min-width: 0;
+      height: 24px;
+      border: 1px solid rgba(146, 188, 255, 0.28);
+      border-radius: 6px;
+      background: rgba(10, 16, 29, 0.92);
+      color: rgba(241, 246, 255, 0.96);
+      font: inherit;
+    }}
+    .gs-map-controls .gs-check {{
+      grid-template-columns: 18px minmax(0, 1fr);
+      align-items: center;
+      gap: 6px;
+    }}
+    .gs-map-controls .gs-check input {{
+      width: 16px;
+      height: 16px;
+    }}
     .gs-map-tooltip {{
       position: absolute;
       z-index: 5;
@@ -78,6 +125,17 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
       text-align: right;
     }}
   </style>
+  <div class="gs-map-controls">
+    <label><span>Mode</span><select id="visualization-mode"></select></label>
+    <label><span>Prompt</span><select id="selected-prompt"></select></label>
+    <label><span>Token</span><select id="selected-token"></select></label>
+    <label><span>Top K</span><input id="top-k" type="range" min="1" max="32" step="1"></label>
+    <label><span>Background</span><input id="background-opacity" type="range" min="0" max="1" step="0.05"></label>
+    <label><span>Edge Threshold</span><input id="edge-threshold" type="range" min="0" max="1" step="0.05"></label>
+    <label class="gs-check"><input id="show-aggregate" type="checkbox"><span>Show aggregate heatmap</span></label>
+    <label class="gs-check"><input id="show-secondary" type="checkbox"><span>Show secondary branches</span></label>
+    <label class="gs-check"><input id="developer-diagnostics" type="checkbox"><span>Developer diagnostics</span></label>
+  </div>
   <canvas id="gs-activation-map"></canvas>
   <div id="gs-map-tooltip" class="gs-map-tooltip"></div>
   <script id="gs-map-data" type="application/json">{data}</script>
@@ -87,13 +145,74 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   const tooltip = document.getElementById('gs-map-tooltip');
   const ctx = canvas.getContext('2d');
   const shell = canvas.parentElement;
+  const controls = {{
+    mode: document.getElementById('visualization-mode'),
+    prompt: document.getElementById('selected-prompt'),
+    token: document.getElementById('selected-token'),
+    topK: document.getElementById('top-k'),
+    backgroundOpacity: document.getElementById('background-opacity'),
+    edgeThreshold: document.getElementById('edge-threshold'),
+    showAggregate: document.getElementById('show-aggregate'),
+    showSecondary: document.getElementById('show-secondary'),
+    developerDiagnostics: document.getElementById('developer-diagnostics'),
+  }};
+  const rendererOptions = {{
+    visualizationMode: payload.rendererOptions?.visualizationMode || payload.visualizationMode || 'aggregate_heatmap',
+    selectedPromptId: payload.rendererOptions?.selectedPromptId ?? null,
+    selectedTokenId: payload.rendererOptions?.selectedTokenId ?? null,
+    topK: Number(payload.rendererOptions?.topK ?? 8),
+    backgroundOpacity: Number(payload.rendererOptions?.backgroundOpacity ?? 0.24),
+    edgeThreshold: Number(payload.rendererOptions?.edgeThreshold ?? 0),
+    showAggregateHeatmap: Boolean(payload.rendererOptions?.showAggregateHeatmap),
+    showSecondaryBranches: payload.rendererOptions?.showSecondaryBranches !== false,
+    developerDiagnostics: Boolean(payload.rendererOptions?.developerDiagnostics),
+  }};
   let hoverTarget = null;
   let selected = {{
     layerId: payload.diagnostics?.selectedLayer?.layerId || payload.layers?.[0]?.layerId || null,
     groupId: payload.diagnostics?.selectedGroup?.groupId || payload.nodeGroups?.[0]?.groupId || null,
-    batchId: payload.diagnostics?.selectedBatch?.batchId || payload.activationPaths?.[0]?.batchId || payload.batches?.[0]?.batchId || null
+    batchId: payload.diagnostics?.selectedBatch?.batchId || payload.activationPaths?.[0]?.batchId || payload.batches?.[0]?.batchId || null,
+    edgeId: null
   }};
   let hitTargets = [];
+
+  function option(select, value, label) {{
+    const node = document.createElement('option');
+    node.value = String(value ?? '');
+    node.textContent = String(label ?? value ?? '');
+    select.appendChild(node);
+  }}
+
+  function initControls() {{
+    ['single_prompt', 'batch_overlay', 'aggregate_heatmap', 'compare_prompts'].forEach((mode) => option(controls.mode, mode, mode));
+    controls.mode.value = rendererOptions.visualizationMode;
+    const promptIds = [...new Set((payload.activationPaths || []).map((path) => path.promptId).filter((value) => value !== null && value !== undefined))];
+    if (!promptIds.length) option(controls.prompt, '', 'unavailable');
+    promptIds.forEach((promptId) => option(controls.prompt, promptId, promptId));
+    controls.prompt.value = rendererOptions.selectedPromptId ?? promptIds[0] ?? '';
+    const tokenIds = [...new Set((payload.activationPaths || []).map((path) => path.tokenIndex).filter((value) => value !== null && value !== undefined))];
+    if (!tokenIds.length) option(controls.token, '', 'unavailable');
+    tokenIds.forEach((tokenId) => option(controls.token, tokenId, tokenId));
+    controls.token.value = rendererOptions.selectedTokenId ?? tokenIds[0] ?? '';
+    controls.topK.value = rendererOptions.topK;
+    controls.backgroundOpacity.value = rendererOptions.backgroundOpacity;
+    controls.edgeThreshold.value = rendererOptions.edgeThreshold;
+    controls.showAggregate.checked = rendererOptions.showAggregateHeatmap;
+    controls.showSecondary.checked = rendererOptions.showSecondaryBranches;
+    controls.developerDiagnostics.checked = rendererOptions.developerDiagnostics;
+    Object.values(controls).forEach((control) => control.addEventListener('input', () => {{
+      rendererOptions.visualizationMode = controls.mode.value;
+      rendererOptions.selectedPromptId = controls.prompt.value;
+      rendererOptions.selectedTokenId = controls.token.value === '' ? null : Number(controls.token.value);
+      rendererOptions.topK = Number(controls.topK.value);
+      rendererOptions.backgroundOpacity = Number(controls.backgroundOpacity.value);
+      rendererOptions.edgeThreshold = Number(controls.edgeThreshold.value);
+      rendererOptions.showAggregateHeatmap = controls.showAggregate.checked;
+      rendererOptions.showSecondaryBranches = controls.showSecondary.checked;
+      rendererOptions.developerDiagnostics = controls.developerDiagnostics.checked;
+      requestAnimationFrame(drawAll);
+    }}));
+  }}
 
   function roundedPath(x, y, w, h, r) {{
     const radius = Math.min(r, w / 2, h / 2);
@@ -137,7 +256,11 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   }}
 
   function pathByBatchId(batchId) {{
-    return (payload.activationPaths || []).find((path) => path.batchId === batchId) || null;
+    return filteredPaths().find((path) => path.batchId === batchId) || null;
+  }}
+
+  function edgeById(edgeId) {{
+    return (payload.activationEdges || []).find((edge) => edge.edgeId === edgeId) || null;
   }}
 
   function syncSelection() {{
@@ -187,6 +310,11 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     return rows;
   }}
 
+  function rangeText(value) {{
+    if (!Array.isArray(value) || value.length < 2) return '';
+    return `${{value[0]}}..${{value[1]}}`;
+  }}
+
   function addHitTarget(x, y, w, h, tooltipHtmlValue, meta = {{}}) {{
     hitTargets.push({{ x, y, w, h, tooltip: tooltipHtmlValue, ...meta }});
   }}
@@ -202,6 +330,31 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
       tooltip: tooltipHtmlValue,
       ...meta,
     }});
+  }}
+
+  function filteredPaths() {{
+    let paths = payload.activationPaths || [];
+    if (rendererOptions.visualizationMode === 'single_prompt') {{
+      paths = paths.filter((path) => String(path.promptId) === String(rendererOptions.selectedPromptId));
+    }}
+    if (rendererOptions.selectedTokenId !== null && rendererOptions.selectedTokenId !== undefined && rendererOptions.selectedTokenId !== '') {{
+      paths = paths.filter((path) => Number(path.tokenIndex) === Number(rendererOptions.selectedTokenId));
+    }}
+    return paths;
+  }}
+
+  function filteredEdges() {{
+    const visiblePaths = filteredPaths();
+    const identities = new Set(visiblePaths.map((path) => `${{path.promptId}}:${{path.tokenIndex}}`));
+    return (payload.activationEdges || []).filter((edge) => {{
+      if (Number(edge.weight || 0) < Number(rendererOptions.edgeThreshold || 0)) return false;
+      if (rendererOptions.visualizationMode === 'batch_overlay' && rendererOptions.selectedTokenId === null) return true;
+      return identities.has(`${{edge.promptId}}:${{edge.tokenIndex}}`);
+    }});
+  }}
+
+  function shouldDrawHeatmap() {{
+    return rendererOptions.visualizationMode === 'aggregate_heatmap' || rendererOptions.showAggregateHeatmap;
   }}
 
   function distanceToSegment(px, py, x1, y1, x2, y2) {{
@@ -257,7 +410,10 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     if (!points.length) return;
     const hovered = hoverTarget?.batchId === path.batchId || hoverTarget?.pathId === path.pathId;
     const selectedPath = selected.batchId === path.batchId;
-    const alpha = selectedPath ? 0.92 : hovered ? 0.80 : 0.34;
+    const isApprox = path.visualizationMode === 'scalar_approx' || path.approximationReason;
+    const alphaBase = Number(rendererOptions.backgroundOpacity || 0.24);
+    const alpha = selectedPath ? 0.88 : hovered ? 0.72 : isApprox ? Math.max(0.12, alphaBase) : Math.max(0.18, alphaBase + 0.14);
+    const hue = 186 + ((index || 0) * 29) % 78;
     const coords = points.map((point) => ({{
       x: left + (point.x || 0) * (right - left),
       y: top + (point.y || 0.5) * (bottom - top),
@@ -274,9 +430,10 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
         ctx.bezierCurveTo(midX, prev.y, midX, coord.y, coord.x, coord.y);
       }}
     }});
-    ctx.strokeStyle = `rgba(92, 235, 255, ${{alpha}})`;
-    ctx.lineWidth = selectedPath ? 4.2 : hovered ? 3.0 : 2.0;
-    ctx.shadowColor = `rgba(84, 223, 255, ${{selectedPath ? 0.55 : 0.25}})`;
+    ctx.strokeStyle = `hsla(${{hue}}, 96%, 68%, ${{alpha}})`;
+    ctx.lineWidth = selectedPath ? 4.6 : hovered ? 3.4 : 2.2;
+    if (isApprox) ctx.setLineDash([10, 7]);
+    ctx.shadowColor = `hsla(${{hue}}, 96%, 62%, ${{selectedPath ? 0.48 : 0.20}})`;
     ctx.shadowBlur = selectedPath ? 18 : 10;
     ctx.stroke();
     ctx.restore();
@@ -289,15 +446,19 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
         coord.x,
         coord.y,
         tooltipHtml('Path', [
+          ['type', 'Prompt path'],
           ['batch', path.batchId],
           ['prompt', path.promptId],
+          ['token', path.tokenIndex],
           ['layers', path.frequency || points.length],
+          ['method', path.pathMethod || ''],
           ['tokenRange', trimText(path.tokenRange || '', 24)],
           ['output', trimText(path.outputToken || '', 24)],
           ['summary', trimText(path.activationSummary || '', 24)],
           ['strength', fmtNumber(path.strength)],
           ['attr', fmtNumber(path.attributionScore)],
           ['confidence', fmtNumber(path.confidence)],
+          ['reason', trimText(path.approximationReason || '', 36)],
           ...visualizationRows(path),
         ]),
         {{
@@ -323,12 +484,15 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
         20,
         20,
         tooltipHtml('Path', [
+          ['type', 'Prompt path'],
           ['batch', path.batchId],
           ['prompt', path.promptId],
+          ['tokenIndex', coord.point.tokenIndex],
           ['layer', coord.point.layerId],
           ['group', coord.point.groupId],
           ['token', trimText(coord.point.token || '')],
           ['strength', fmtNumber(path.strength)],
+          ['method', path.pathMethod || ''],
           ...visualizationRows(path),
         ]),
         {{
@@ -339,6 +503,173 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
         }},
       );
     }});
+
+    if (rendererOptions.showSecondaryBranches) {{
+      (path.branches || []).slice(0, rendererOptions.topK * 4).forEach((branch) => {{
+        const bx = left + (branch.x || 0) * (right - left);
+        const by = top + (branch.y || 0.5) * (bottom - top);
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(bx, by, 2.4, 0, Math.PI * 2);
+        ctx.fillStyle = `hsla(${{hue}}, 80%, 70%, 0.34)`;
+        ctx.fill();
+        ctx.restore();
+      }});
+    }}
+  }}
+
+  function layerX(layerId, left, right) {{
+    const layer = layerById(layerId);
+    const layers = payload.layers || [];
+    const parsedIndex = Number(String(layerId || '').replace('L', ''));
+    const index = layer?.index ?? (Number.isFinite(parsedIndex) ? parsedIndex : 0);
+    return layers.length > 1 ? left + (index / (layers.length - 1)) * (right - left) : left + (right - left) / 2;
+  }}
+
+  function groupY(group, top, bottom) {{
+    const y = Number(group?.yPosition);
+    return top + (Number.isFinite(y) ? y : 0.5) * (bottom - top);
+  }}
+
+  function drawEdge(edge, left, right, top, bottom) {{
+    const from = groupById(edge.fromNodeId || edge.fromGroupId);
+    const to = groupById(edge.toNodeId || edge.toGroupId);
+    if (!from || !to) return;
+    const x1 = layerX(from.layerId, left, right);
+    const y1 = groupY(from, top, bottom);
+    const x2 = layerX(to.layerId, left, right);
+    const y2 = groupY(to, top, bottom);
+    const selectedEdge = selected.edgeId === edge.edgeId;
+    const connected = selected.groupId && (selected.groupId === from.groupId || selected.groupId === to.groupId);
+    const hovered = hoverTarget?.edgeId === edge.edgeId;
+    const isApprox = edge.visualizationMode === 'scalar_approx' || edge.approximationReason;
+    const weight = Math.max(0, Math.min(1, Number(edge.weight || 0)));
+    const confidence = Math.max(0, Math.min(1, Number(edge.confidence || 0)));
+    const alpha = selectedEdge ? 0.92 : hovered ? 0.78 : connected ? 0.58 : Math.max(0.10, weight * (isApprox ? 0.42 : 0.72));
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    const midX = (x1 + x2) / 2;
+    ctx.bezierCurveTo(midX, y1, midX, y2, x2, y2);
+    ctx.strokeStyle = isApprox
+      ? `rgba(168, 190, 218, ${{alpha}})`
+      : `rgba(92, 235, 255, ${{alpha}})`;
+    ctx.lineWidth = selectedEdge ? 4.2 : Math.max(0.8, 0.8 + weight * 4.8);
+    if (isApprox) ctx.setLineDash([5, 6]);
+    ctx.shadowColor = isApprox ? 'transparent' : `rgba(84, 223, 255, ${{alpha * 0.38}})`;
+    ctx.shadowBlur = selectedEdge ? 16 : 8;
+    ctx.stroke();
+    ctx.restore();
+    addPathSegmentHitTarget(
+      x1,
+      y1,
+      x2,
+      y2,
+      tooltipHtml('Edge', [
+        ['from', from.groupId],
+        ['to', to.groupId],
+        ['prompt', edge.promptId],
+        ['token', edge.tokenIndex],
+        ['weight', fmtNumber(weight)],
+        ['method', edge.method || ''],
+        ['confidence', fmtNumber(confidence)],
+        ['reason', trimText(edge.approximationReason || '', 36)],
+        ...visualizationRows(edge),
+      ]),
+      {{
+        edgeId: edge.edgeId,
+        groupId: from.groupId,
+        layerId: from.layerId,
+      }},
+    );
+  }}
+
+  function drawHeatmapCloud(left, right, top, bottom) {{
+    const cells = payload.heatmap || [];
+    const layers = payload.layers || [];
+    const maxLayer = Math.max(1, (layers.length || payload.modelMeta?.layerCount || 1) - 1);
+    cells.forEach((cell) => {{
+      const x = left + (Number(cell.layer || 0) / maxLayer) * (right - left);
+      const y = top + Number(cell.y ?? 0.5) * (bottom - top);
+      const intensity = Math.max(0, Math.min(1, Number(cell.normalizedActivation || 0)));
+      const r = 3 + Math.sqrt(Math.max(1, Number(cell.count || 1))) * 1.8 + intensity * 6;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(255, 184, 64, ${{0.08 + intensity * 0.42}})`;
+      ctx.shadowColor = `rgba(255, 184, 64, ${{0.18 + intensity * 0.28}})`;
+      ctx.shadowBlur = 10 + intensity * 18;
+      ctx.fill();
+      ctx.restore();
+      addHitTarget(
+        x - r - 4,
+        y - r - 4,
+        (r + 4) * 2,
+        (r + 4) * 2,
+        tooltipHtml('Aggregate heatmap', [
+          ['layer', `L${{cell.layer}}`],
+          ['node', cell.nodeId],
+          ['count', cell.count],
+          ['prompts', cell.promptCount],
+          ['max', fmtNumber(cell.activationMax)],
+          ['mean', fmtNumber(cell.activationMean)],
+          ['mode', 'aggregate_heatmap'],
+        ]),
+        {{ layerId: `L${{cell.layer}}`, groupId: cell.nodeId }},
+      );
+    }});
+  }}
+
+  function drawOverviewNode(group, left, right, top, bottom) {{
+    const cx = layerX(group.layerId, left, right);
+    const cy = groupY(group, top, bottom);
+    const selectedGroup = selected.groupId === group.groupId;
+    const connectedEdge = selected.edgeId && (() => {{
+      const edge = edgeById(selected.edgeId);
+      return edge && (edge.fromNodeId === group.groupId || edge.toNodeId === group.groupId);
+    }})();
+    const hovered = hoverTarget?.groupId === group.groupId;
+    const activation = Math.max(0, Math.min(1, Number(group.normalizedActivation ?? group.activationValue ?? 0)));
+    const radius = selectedGroup ? 6.8 : hovered || connectedEdge ? 5.8 : 3.2 + activation * 4.2;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.fillStyle = selectedGroup
+      ? 'rgba(236, 252, 255, 0.96)'
+      : `rgba(116, 225, 255, ${{0.28 + activation * 0.62}})`;
+    ctx.shadowColor = 'rgba(84, 223, 255, 0.42)';
+    ctx.shadowBlur = selectedGroup ? 18 : 8 + activation * 10;
+    ctx.fill();
+    if (selectedGroup || connectedEdge) {{
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius + 4, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(196, 241, 255, 0.70)';
+      ctx.lineWidth = 1.3;
+      ctx.stroke();
+    }}
+    ctx.restore();
+    addHitTarget(
+      cx - radius - 8,
+      cy - radius - 8,
+      (radius + 8) * 2,
+      (radius + 8) * 2,
+      tooltipHtml('Node', [
+        ['layer', group.layerId],
+        ['node', group.groupId],
+        ['activation', fmtNumber(group.activationValue || 0)],
+        ['normalized', fmtNumber(group.normalizedActivation || 0)],
+        ['tokenRange', rangeText(group.tokenRange)],
+        ['nodeRange', rangeText(group.nodeRange)],
+        ['confidence', fmtNumber(group.confidence || 0)],
+        ['source', (group.sourceFields || []).join(', ')],
+        ['reason', trimText(group.approximationReason || '', 38)],
+        ...visualizationRows(group),
+      ]),
+      {{
+        groupId: group.groupId,
+        layerId: group.layerId,
+      }},
+    );
   }}
 
   function drawFret(layer, index, total, left, right, top, bottom) {{
@@ -360,25 +691,6 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     ctx.stroke();
     ctx.restore();
 
-    const dotCount = Math.max(1, Math.min(layer.groupCount || 1, 42));
-    for (let dotIndex = 0; dotIndex < dotCount; dotIndex++) {{
-      const y = top + ((dotIndex + 0.5) / dotCount) * (bottom - top);
-      const isTopActive = (layer.topActiveGroups || []).some((groupId) => {{
-        const suffix = `-G${{dotIndex}}`;
-        return groupId.endsWith(suffix);
-      }});
-      ctx.save();
-      ctx.beginPath();
-      ctx.arc(x, y, isTopActive ? 2.8 : 1.7, 0, Math.PI * 2);
-      ctx.fillStyle = isTopActive
-        ? 'rgba(171, 247, 255, 0.84)'
-        : 'rgba(168, 179, 212, 0.22)';
-      ctx.shadowColor = isTopActive ? 'rgba(91, 232, 255, 0.42)' : 'transparent';
-      ctx.shadowBlur = isTopActive ? 9 : 0;
-      ctx.fill();
-      ctx.restore();
-    }}
-
     drawLabel(layer.name || layer.layerId || `L${{index}}`, x, bottom + 28, 'center', selectedLayer ? 'rgba(234, 247, 255, 0.98)' : 'rgba(179, 190, 221, 0.80)', 11, 700);
     addHitTarget(
       x - 22,
@@ -387,7 +699,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
       bottom - top + 50,
       tooltipHtml('Layer', [
         ['layer', layer.layerId],
-        ['groups', layer.groupCount || 0],
+        ['nodes', layer.groupCount || 0],
         ['density', fmtNumber(layer.activationDensity || 0)],
         ...visualizationRows(layer),
       ]),
@@ -436,6 +748,12 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
         ['layer', group.layerId],
         ['batches', group.batchParticipation || 0],
         ['activation', fmtNumber(group.activationValue || 0)],
+        ['normalized', fmtNumber(group.normalizedActivation || 0)],
+        ['tokenRange', rangeText(group.tokenRange)],
+        ['nodeRange', rangeText(group.nodeRange)],
+        ['confidence', fmtNumber(group.confidence || 0)],
+        ['source', (group.sourceFields || []).join(', ')],
+        ['reason', trimText(group.approximationReason || '', 38)],
         ['attr', fmtNumber(group.attributionScore || 0)],
         ...visualizationRows(group),
       ]),
@@ -449,14 +767,15 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   function drawSelectedTarget(x, y, groupId) {{
     const selectedGroup = groupById(groupId);
     const selectedLayer = layerById(selected.layerId);
-    const selectedPath = pathByBatchId(selected.batchId);
+    const selectedPath = rendererOptions.visualizationMode === 'aggregate_heatmap' ? null : pathByBatchId(selected.batchId);
+    const selectedEdge = edgeById(selected.edgeId);
     const points = selectedPath?.points || [];
     const currentIndex = points.findIndex((point) => point.layerId === selected.layerId);
     const previewPoints = currentIndex >= 0
       ? points.slice(Math.max(0, currentIndex - 1), currentIndex + 2)
       : points.slice(0, 3);
 
-    if (previewPoints.length > 1) {{
+    if (rendererOptions.visualizationMode !== 'aggregate_heatmap' && previewPoints.length > 1) {{
       const startX = x - 120;
       const span = 240;
       ctx.save();
@@ -516,6 +835,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
       attributionScore: selectedGroup?.attributionScore ?? selectedPath?.attributionScore ?? base.attributionScore ?? 0,
       confidence: selectedPath?.confidence ?? base.confidence ?? 0,
       visualizationMode: selectedPoint?.visualizationMode || selectedGroup?.visualizationMode || selectedLayer?.visualizationMode || selectedPath?.visualizationMode || base.visualizationMode || payload.visualizationMode || '',
+      selectedEdge,
       sourceToken: selectedPoint?.token || base.sourceToken || '',
       destinationToken: selectedBatch?.outputToken || base.destinationToken || '',
     }};
@@ -525,16 +845,25 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     const state = effectiveVisualizationState(d);
     const rows = [
       ['visualizationMode', state.mode || ''],
+      ['dataMode', payload.dataMode || d.dataMode || ''],
       ['selectedBatch', d.selectedBatch?.batchId || selected.batchId || ''],
+      ['selectedPrompt', rendererOptions.selectedPromptId ?? d.selectedPromptId ?? ''],
+      ['selectedToken', rendererOptions.selectedTokenId ?? d.selectedTokenId ?? ''],
       ['selectedLayer', d.selectedLayer?.layerId || selected.layerId || ''],
       ['selectedGroup', d.selectedGroup?.groupId || selected.groupId || ''],
       ['activationValue', fmtNumber(d.activationValue || 0)],
       ['attributionScore', fmtNumber(d.attributionScore || 0)],
       ['confidence', fmtNumber(d.confidence || 0)],
+      ['selectedEdge', d.selectedEdge?.edgeId || selected.edgeId || ''],
+      ['edgeWeight', d.selectedEdge ? fmtNumber(d.selectedEdge.weight || 0) : ''],
+      ['edgeMethod', d.selectedEdge?.method || ''],
       ['sourceToken', trimText(d.sourceToken || '', 24)],
       ['destinationToken', trimText(d.destinationToken || '', 24)],
       ['model', trimText(d.modelMeta?.modelName || '', 24)],
     ];
+    (payload.diagnostics?.warnings || []).forEach((warning, index) => {{
+      rows.push([`warning${{index + 1}}`, trimText(warning, 58)]);
+    }});
     if (state.reason) {{
       rows.push(['unavailableReason', trimText(state.reason, 42)]);
     }}
@@ -550,10 +879,12 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   }}
 
   function drawOverview(rect) {{
-    const x = 12, y = 10, w = rect.width - 24, h = Math.max(260, rect.height * 0.36);
+    const x = 12, y = 104, w = rect.width - 24, h = Math.max(240, rect.height * 0.32);
     panel(x, y, w, h);
     const layers = payload.layers || [];
-    const paths = payload.activationPaths || [];
+    const edges = filteredEdges();
+    const paths = filteredPaths();
+    const groups = payload.nodeGroups || [];
     const left = x + 56, right = x + w - 56, top = y + 48, bottom = y + h - 54;
 
     ctx.save();
@@ -568,12 +899,19 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     }}
     ctx.restore();
 
-    paths.forEach((path, index) => drawPath(path, left, right, top, bottom, index));
+    if (shouldDrawHeatmap()) {{
+      drawHeatmapCloud(left, right, top, bottom);
+    }}
+    if (rendererOptions.visualizationMode !== 'aggregate_heatmap') {{
+      edges.forEach((edge) => drawEdge(edge, left, right, top, bottom));
+      paths.forEach((path, index) => drawPath(path, left, right, top, bottom, index));
+    }}
     layers.forEach((layer, index) => drawFret(layer, index, layers.length, left, right, top, bottom));
+    groups.forEach((group) => drawOverviewNode(group, left, right, top, bottom));
   }}
 
   function drawLayerPane(rect) {{
-    const x = 62, y = Math.max(300, rect.height * 0.41), w = rect.width - 124, h = 150;
+    const x = 62, y = Math.max(360, rect.height * 0.45), w = rect.width - 124, h = 150;
     panel(x, y, w, h);
     const layer = layerById(selected.layerId) || payload.layers?.[0] || null;
     const groups = (payload.nodeGroups || []).filter((g) => g.layerId === selected.layerId).slice(0, 120);
@@ -587,13 +925,14 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   }}
 
   function drawDrilldownPane(rect) {{
-    const x = 62, y = Math.max(470, rect.height * 0.61), w = rect.width - 124, h = 150;
+    const x = 62, y = Math.max(530, rect.height * 0.64), w = rect.width - 124, h = 150;
     panel(x, y, w, h);
     drawSelectedTarget(x + w / 2, y + h / 2 + 6, selected.groupId);
   }}
 
   function drawDiagnostics(rect) {{
     const x = 62, y = Math.max(640, rect.height * 0.80), w = rect.width - 124, h = rect.height - y - 16;
+    if (!rendererOptions.developerDiagnostics && y < rect.height - 80) return;
     panel(x, y, w, Math.max(110, h));
     drawDiagnosticText(x + 18, y + 28, selectedDiagnostics());
   }}
@@ -667,11 +1006,15 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
     if (hoverTarget.batchId) {{
       selected.batchId = hoverTarget.batchId;
     }}
+    if (hoverTarget.edgeId) {{
+      selected.edgeId = hoverTarget.edgeId;
+    }}
     syncSelection();
     requestAnimationFrame(drawAll);
   }});
 
   window.addEventListener('resize', resizeCanvas);
+  initControls();
   resizeCanvas();
   </script>
 </div>
