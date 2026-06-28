@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 import pandas as pd
 
 from glass_skull.aggregation import label_separation_table
+from glass_skull.activation_map import build_activation_map_payload, build_model_meta
 from glass_skull.attention_view import indexed_tokens
 from glass_skull.chat_store import load_chat, save_chat
 from glass_skull.config import CONTROL_SET_DIR, CONTROL_VECTOR_DIR, DEFAULT_MODEL, MODEL_PRESETS, ensure_dirs
@@ -450,6 +451,44 @@ def main() -> None:
     assert set(label_heat["group"]) == {"animal", "letter"}
     dim_freq = dimension_frequency_df({"prompts": [{"trace_rows": [{"run_id": run_id, "prompt_id": 1, "label": "x", "layer": 0, "stream": "resid_post", "top_dims": [{"dimension": 4, "activation": -2.0}]}]}]})
     assert dim_freq.iloc[0]["dimension"] == 4
+    map_summary = {
+        "model_name": "tiny-trace",
+        "device": "cpu",
+        "layers": 3,
+        "heads": 2,
+        "d_model": 12,
+        "d_head": 6,
+        "d_mlp": 48,
+        "vocab_size": 100,
+        "parameters": 1234,
+        "dtype": "torch.float32",
+    }
+    meta = build_model_meta(map_summary, None, "TransformerLens")
+    assert meta["layerCount"] == 3
+    assert meta["hiddenSize"] == 12
+    assert meta["attentionHeads"] == 2
+    assert meta["visualizationMode"] == "clustered"
+
+    activation_payload = build_activation_map_payload(
+        artifact,
+        map_summary,
+        local_model_context=None,
+        selected_layer=1,
+        selected_group="L1-G0",
+        selected_batch="batch-8",
+    )
+    assert activation_payload["visualizationMode"] in {"sampled", "clustered", "approximate", "unavailable"}
+    assert activation_payload["modelMeta"]["layerCount"] == 3
+    assert [layer["name"] for layer in activation_payload["layers"]] == ["L0", "L1", "L2"]
+    assert activation_payload["layers"][1]["selected"] is True
+    assert activation_payload["nodeGroups"], "node groups should derive from hidden size or trace dimensions"
+    assert activation_payload["activationPaths"], "available trace rows should produce activation paths"
+    assert activation_payload["diagnostics"]["selectedLayer"]["name"] == "L1"
+    assert activation_payload["diagnostics"]["selectedGroup"]["groupId"] == "L1-G0"
+    assert activation_payload["diagnostics"]["modelMeta"]["hiddenSize"] == 12
+    first_path = activation_payload["activationPaths"][0]
+    assert {"batchId", "promptId", "points", "strength", "visualizationMode"}.issubset(first_path)
+    assert first_path["points"], "paths should include per-layer Canvas points"
 
     jsonl = '\n'.join([
         json.dumps({"label": "animal", "prompt": "Explain what a mouse is."}),
