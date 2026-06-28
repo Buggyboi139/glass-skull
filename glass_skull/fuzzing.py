@@ -191,6 +191,7 @@ def run_fuzz_experiment(
         "run_id": run_id,
         "mode": mode,
         "artifact_path": str(exp_dir / "artifact.json"),
+        "trace_row_count": artifact["summary"].get("trace_row_count", 0),
         "trace_supported": artifact["summary"].get("trace_supported", False),
         "trace_unavailable_count": artifact["summary"].get("trace_unavailable_count", 0),
     }

@@ -19,6 +19,7 @@ class LlamaServerStatus:
     glass_available: bool
     glass_info: dict[str, Any]
     steering_supported: bool = False
+    activation_patch_supported: bool = False
     error: str | None = None
 
 
@@ -269,6 +270,40 @@ def per_request_steering_supported(glass_info: dict[str, Any] | None) -> bool:
     return isinstance(per_request, dict) and per_request.get("supported") is True
 
 
+def activation_patch_supported(glass_info: dict[str, Any] | None) -> bool:
+    if not isinstance(glass_info, dict):
+        return False
+    capabilities = glass_info.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return False
+    for key in ("activation_patch", "activation_patching", "patching"):
+        patching = capabilities.get(key)
+        if not isinstance(patching, dict):
+            continue
+        if patching.get("supported") is True:
+            return True
+        per_request = patching.get("per_request")
+        if isinstance(per_request, dict) and per_request.get("supported") is True:
+            return True
+    return False
+
+
+def activation_patch_diagnostic(glass_info: dict[str, Any] | None) -> str:
+    if activation_patch_supported(glass_info):
+        return "This llama.cpp server advertises per-request activation patch support."
+    if not isinstance(glass_info, dict) or not glass_info:
+        return "This llama.cpp server does not advertise Glass Skull activation patch capabilities."
+    capabilities = glass_info.get("capabilities") if isinstance(glass_info.get("capabilities"), dict) else {}
+    for key in ("activation_patch", "activation_patching", "patching"):
+        patching = capabilities.get(key)
+        if isinstance(patching, dict):
+            reason = patching.get("reason")
+            per_request = patching.get("per_request")
+            if isinstance(per_request, dict):
+                reason = per_request.get("reason") or reason
+            return str(reason or "Activation patch capability is present but not marked supported.")
+    return "This llama.cpp server does not advertise activation patching; recipe save/load and baseline comparison are available only."
+
 def build_steering_metadata(
     control_vector: str,
     strength: float,
@@ -314,6 +349,7 @@ def _glass_trace_payload(
     max_new_tokens: int | None = None,
     top_k: int | None = None,
     with_pieces: bool | None = None,
+    include_vectors: bool | None = False,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {"prompt": prompt}
 
@@ -331,6 +367,8 @@ def _glass_trace_payload(
         payload["top_k"] = int(top_k)
     if with_pieces is not None:
         payload["with_pieces"] = bool(with_pieces)
+    if include_vectors is not None:
+        payload["include_vectors"] = bool(include_vectors)
     payload["capture"] = {
         "prompt_tokens": True,
         "layer_inputs": bool(layers is not None or streams is not None),
@@ -444,6 +482,7 @@ def check_server(base_url: str, timeout: float = 3.0, model_alias: str | None = 
             glass_available=False,
             glass_info={},
             steering_supported=False,
+            activation_patch_supported=False,
             error=str(exc),
         )
 
@@ -463,6 +502,7 @@ def check_server(base_url: str, timeout: float = 3.0, model_alias: str | None = 
         glass_available=glass_available,
         glass_info=glass_info,
         steering_supported=per_request_steering_supported(glass_info),
+        activation_patch_supported=activation_patch_supported(glass_info),
         error=None,
     )
 
@@ -490,6 +530,7 @@ def trace_glass_prompt(
     max_new_tokens: int | None = None,
     top_k: int | None = None,
     with_pieces: bool | None = None,
+    include_vectors: bool | None = False,
     timeout: float = 300.0,
 ) -> dict[str, Any]:
     """Request a local llama.cpp trace payload.
@@ -507,6 +548,7 @@ def trace_glass_prompt(
         max_new_tokens=max_new_tokens,
         top_k=top_k,
         with_pieces=with_pieces,
+        include_vectors=include_vectors,
     )
     result = _request_json_object(
         "POST",
@@ -591,12 +633,16 @@ def chat_completion(
     model_alias: str | None = None,
     steering: dict[str, Any] | None = None,
     steering_supported: bool = False,
+    activation_patch: dict[str, Any] | None = None,
+    activation_patch_supported: bool = False,
     timeout: float = 300.0,
 ) -> str:
     base_url = normalize_base_url(base_url)
 
     if steering is not None and not steering_supported:
         raise RuntimeError("This llama.cpp server does not advertise per-request Glass Skull steering support.")
+    if activation_patch is not None and not activation_patch_supported:
+        raise RuntimeError("This llama.cpp server does not advertise per-request activation patch support.")
 
     system_parts = [LOCAL_DIRECT_SYSTEM_PROMPT]
     if system_prompt:
@@ -626,6 +672,9 @@ def chat_completion(
     if steering is not None:
         payload["glass_skull"] = {"steering": steering}
         payload["metadata"] = {"glass_skull": {"steering": steering}}
+    if activation_patch is not None:
+        payload.setdefault("glass_skull", {})["activation_patch"] = activation_patch
+        payload.setdefault("metadata", {}).setdefault("glass_skull", {})["activation_patch"] = activation_patch
 
     # Primary OpenAI-compatible chat endpoint.
     result = _request_json(
@@ -654,6 +703,8 @@ def chat_completion(
             legacy_payload["model"] = model_id
         if steering is not None:
             legacy_payload["glass_skull"] = {"steering": steering}
+        if activation_patch is not None:
+            legacy_payload.setdefault("glass_skull", {})["activation_patch"] = activation_patch
         legacy_result = _request_json(
             "POST",
             _join_url(base_url, "/completion"),

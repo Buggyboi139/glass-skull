@@ -32,10 +32,13 @@ Set `START_LLAMA_CPP=1` and configure these environment variables when you want 
 ```bash
 LLAMA_MODEL_PATH=/path/to/model.gguf
 LLAMA_MODEL_ALIAS=local-model
-LLAMA_SERVER_BIN=/path/to/llama-server
 LLAMA_PORT=8080
 ./run_glass_skull.sh
 ```
+
+By default, the launcher starts the repo-managed patched server at
+`managed/llama.cpp-glass/build/bin/llama-server`. Set `LLAMA_SERVER_BIN=/path/to/llama-server`
+only when intentionally overriding that managed binary.
 
 ## Local llama.cpp
 
@@ -64,7 +67,7 @@ managed/llama.cpp-glass/build/bin/llama-server
 managed/llama.cpp-glass/build/bin/llama-cvector-generator
 ```
 
-External local builds can also be used by setting `LLAMA_SERVER_BIN` and the app settings fields.
+The app settings default to these managed binary paths. External local builds can still be used by explicitly setting `LLAMA_SERVER_BIN` or editing the app settings fields.
 
 ## App Workflow
 

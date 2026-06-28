@@ -680,6 +680,6 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
 
 def render_activation_map(payload: dict, key: str = "activation_map_canvas", height: int = 960) -> None:
     _ = key
-    import streamlit.components.v1 as components
+    import streamlit as st
 
-    components.html(activation_map_html(payload, height=height), height=height, scrolling=False)
+    st.iframe(activation_map_html(payload, height=height), height=height, width="stretch")

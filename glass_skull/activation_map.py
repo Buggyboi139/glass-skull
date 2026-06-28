@@ -425,8 +425,11 @@ def build_activation_map_payload(
         "modelMeta": model_meta,
         "captureTimestamp": artifact.get("created_at") or datetime.now(timezone.utc).isoformat(),
     }
+    patch_meta = artifact.get("activation_patch") or artifact.get("activationPatch")
+    if isinstance(patch_meta, dict):
+        diagnostics["activationPatch"] = patch_meta
 
-    return {
+    payload = {
         "modelMeta": model_meta,
         "batches": batches,
         "layers": layers,
@@ -437,3 +440,6 @@ def build_activation_map_payload(
         "visualizationMode": visualization_mode,
         "unavailableReason": unavailable_reason,
     }
+    if isinstance(patch_meta, dict):
+        payload["activationPatch"] = patch_meta
+    return payload

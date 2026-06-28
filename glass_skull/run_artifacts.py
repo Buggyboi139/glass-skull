@@ -120,6 +120,7 @@ def normalize_llama_trace(
             "trace_source": "llama.cpp",
             "unavailable_reason": "",
             "top_dims": row.get("top_dims", []),
+            "vector": row.get("vector") or row.get("activation_vector"),
         })
     return rows
 
@@ -171,6 +172,8 @@ def build_run_artifact(
 
     for idx, prompt in enumerate(prompts):
         trace_rows = list(prompt.get("trace_rows") or [])
+        if any(row.get("trace_available", True) for row in trace_rows):
+            trace_rows = [row for row in trace_rows if row.get("trace_available", True)]
         trace_rows_count += sum(1 for row in trace_rows if row.get("trace_available", True))
         unavailable_count += sum(1 for row in trace_rows if row.get("trace_available") is False)
         if prompt.get("error"):

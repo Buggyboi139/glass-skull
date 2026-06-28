@@ -9,12 +9,13 @@ ADDRESS="${STREAMLIT_SERVER_ADDRESS:-localhost}"
 START_LLAMA_CPP="${START_LLAMA_CPP:-1}"
 LLAMA_HOST="${LLAMA_HOST:-127.0.0.1}"
 LLAMA_PORT="${LLAMA_PORT:-8080}"
-LLAMA_MODEL_PATH="${LLAMA_MODEL_PATH:-}"
-LLAMA_MODEL_ALIAS="${LLAMA_MODEL_ALIAS:-local-gguf}"
+LLAMA_MODEL_PATH="${LLAMA_MODEL_PATH:-/home/dsmason321/models/Best/Qwen3.6-35B-heretic-MTP-Q4_K_S.gguf}"
+LLAMA_MODEL_ALIAS="${LLAMA_MODEL_ALIAS:-qwen3.6-heretic}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-}"
 LLAMA_LOG_FILE="${LLAMA_LOG_FILE:-$SCRIPT_DIR/data/logs/llama-server.log}"
 LLAMA_EXTRA_ARGS="${LLAMA_EXTRA_ARGS:---jinja --flash-attn auto --cache-type-k q4_0 --cache-type-v q4_0 --no-mmap}"
 LLAMA_N_GPU_LAYERS="${LLAMA_N_GPU_LAYERS:-999}"
+MANAGED_LLAMA_SERVER_BIN="$SCRIPT_DIR/managed/llama.cpp-glass/build/bin/llama-server"
 LLAMA_PID=""
 
 on_exit() {
@@ -70,15 +71,7 @@ find_llama_server_bin() {
         echo "$LLAMA_SERVER_BIN"
         return
     fi
-    if [[ -x /home/dsmason321/llama.cpp/build/bin/llama-server ]]; then
-        echo /home/dsmason321/llama.cpp/build/bin/llama-server
-        return
-    fi
-    if [[ -x "$SCRIPT_DIR/managed/llama.cpp-glass/build/bin/llama-server" ]]; then
-        echo "$SCRIPT_DIR/managed/llama.cpp-glass/build/bin/llama-server"
-        return
-    fi
-    echo "$SCRIPT_DIR/managed/llama.cpp-glass/build/bin/llama-server"
+    echo "$MANAGED_LLAMA_SERVER_BIN"
 }
 
 check_no_existing_llama() {
@@ -133,6 +126,35 @@ PY
     exit 1
 }
 
+verify_glass_trace_activation_support() {
+    local url="http://$LLAMA_HOST:$LLAMA_PORT/glass-skull/info"
+    python3 - "$url" <<'PY'
+import json
+import sys
+import urllib.request
+
+url = sys.argv[1]
+try:
+    with urllib.request.urlopen(url, timeout=5.0) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+except Exception as exc:
+    print(f"Could not read Glass Skull trace capabilities from {url}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+trace = payload.get("capabilities", {}).get("trace", {})
+activations = trace.get("activations", {})
+layer_inputs = trace.get("layer_inputs", {})
+if activations.get("supported") is True or layer_inputs.get("supported") is True:
+    sys.exit(0)
+
+reason = activations.get("reason") or layer_inputs.get("reason") or "activation capture is not advertised"
+print("The running llama-server exposes /glass-skull/trace but does not support activation capture.", file=sys.stderr)
+print(f"Reason: {reason}", file=sys.stderr)
+print("Use the repo-managed patched binary at managed/llama.cpp-glass/build/bin/llama-server, or rebuild it with scripts/setup_llama_cpp_glass.py.", file=sys.stderr)
+sys.exit(1)
+PY
+}
+
 start_llama_cpp() {
     if [[ "$START_LLAMA_CPP" == "0" || "$START_LLAMA_CPP" == "false" ]]; then
         log "Skipping llama.cpp startup because START_LLAMA_CPP=$START_LLAMA_CPP"
@@ -156,6 +178,12 @@ start_llama_cpp() {
 
     mkdir -p "$(dirname "$LLAMA_LOG_FILE")"
     log "Starting llama.cpp on http://$LLAMA_HOST:$LLAMA_PORT"
+    echo "Managed llama.cpp binary: $MANAGED_LLAMA_SERVER_BIN"
+    if [[ -n "$LLAMA_SERVER_BIN" ]]; then
+        echo "LLAMA_SERVER_BIN override: $server_bin"
+    else
+        echo "llama.cpp binary: $server_bin"
+    fi
     echo "llama.cpp log: $LLAMA_LOG_FILE"
 
     # shellcheck disable=SC2206
@@ -172,6 +200,7 @@ start_llama_cpp() {
     LLAMA_PID="$!"
 
     wait_for_llama
+    verify_glass_trace_activation_support
     log "llama.cpp is ready"
 }
 
