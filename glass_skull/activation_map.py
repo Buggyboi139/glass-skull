@@ -120,6 +120,24 @@ def _available_path_df(artifact: dict) -> pd.DataFrame:
     return df.dropna(subset=["layer", "activation_norm"])
 
 
+def _artifact_trace_rows(artifact: dict) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for prompt in artifact.get("prompts", []):
+        for row in prompt.get("trace_rows", []):
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def _unavailable_reason(rows: list[dict[str, Any]]) -> str:
+    reasons: list[str] = []
+    for row in rows:
+        reason = str(row.get("unavailable_reason") or "").strip()
+        if reason and reason not in reasons:
+            reasons.append(reason)
+    return " | ".join(reasons)
+
+
 def _trace_hidden_size(df: pd.DataFrame) -> int:
     max_dim = -1
     for dims in df.get("top_dims", pd.Series(dtype=object)):
@@ -147,9 +165,11 @@ def _point_y(group_index: int, group_count: int) -> float:
     return (group_index + 0.5) / group_count
 
 
-def _path_mode(df: pd.DataFrame, node_groups: list[dict]) -> str:
+def _path_mode(df: pd.DataFrame, trace_rows: list[dict[str, Any]], node_groups: list[dict]) -> str:
     if not df.empty:
         return "sampled"
+    if trace_rows:
+        return "unavailable"
     if node_groups:
         return "clustered"
     return "unavailable"
@@ -166,7 +186,9 @@ def build_activation_map_payload(
     backend = str(artifact.get("backend") or summary.get("backend") or "TransformerLens")
     model_meta = build_model_meta(summary, local_model_context, backend)
     batches = _batch_rows(artifact)
+    trace_rows = _artifact_trace_rows(artifact)
     available_df = _available_path_df(artifact)
+    unavailable_reason = _unavailable_reason(trace_rows)
     trace_hidden_size = _trace_hidden_size(available_df) if not available_df.empty else 0
     hidden_size = max(model_meta["hiddenSize"], trace_hidden_size)
     layer_count = model_meta["layerCount"]
@@ -180,13 +202,13 @@ def build_activation_map_payload(
     layers: list[dict[str, Any]] = []
     node_groups: list[dict[str, Any]] = []
     group_lookup: dict[tuple[int, int], dict[str, Any]] = {}
+    group_heatmap_values: dict[str, list[float]] = {}
     top_dims_lookup: dict[tuple[int, str], list[dict[str, Any]]] = {}
 
     for layer_index in range(max(layer_count, 0)):
         layer_rows = available_df[available_df["layer"] == layer_index].copy() if not available_df.empty else pd.DataFrame()
         group_count = _group_count(hidden_size, len(layer_rows))
         active_groups: set[int] = set()
-        layer_participants: set[str] = set()
         group_values = {group_index: 0.0 for group_index in range(group_count)}
         group_attr = {group_index: 0.0 for group_index in range(group_count)}
         group_batches = {group_index: set() for group_index in range(group_count)}
@@ -196,29 +218,36 @@ def build_activation_map_payload(
             strongest_rows = layer_rows.sort_values("activation_norm", ascending=False)
             for row in strongest_rows.to_dict("records"):
                 batch_id = str(row.get("batch_id") or f"batch-{row.get('prompt_id')}")
-                layer_participants.add(batch_id)
+                activation_value = _float_or_zero(row.get("activation_norm"))
                 dims = row.get("top_dims")
                 if isinstance(dims, list) and dims:
                     key = (layer_index, batch_id)
                     top_dims_lookup.setdefault(key, [])
                     top_dims_lookup[key].extend([item for item in dims if isinstance(item, dict)])
+                    row_group_ids: set[str] = set()
                     for item in dims:
                         if not isinstance(item, dict):
                             continue
                         dim = _int_or_none(item.get("dimension"))
                         group_index = _group_index_for_dimension(dim, group_count, hidden_size)
-                        group_values[group_index] = max(group_values[group_index], _float_or_zero(row.get("activation_norm")))
+                        group_id = f"L{layer_index}-G{group_index}"
+                        row_group_ids.add(group_id)
+                        group_values[group_index] = max(group_values[group_index], activation_value)
                         group_attr[group_index] = max(
                             group_attr[group_index],
                             abs(_float_or_zero(item.get("abs_activation", item.get("activation")))),
                         )
                         group_batches[group_index].add(batch_id)
                         active_groups.add(group_index)
+                    for group_id in row_group_ids:
+                        group_heatmap_values.setdefault(group_id, []).append(activation_value)
                 elif group_count:
-                    group_values[0] = max(group_values[0], _float_or_zero(row.get("activation_norm")))
-                    group_attr[0] = max(group_attr[0], _float_or_zero(row.get("activation_norm")))
+                    group_id = f"L{layer_index}-G0"
+                    group_values[0] = max(group_values[0], activation_value)
+                    group_attr[0] = max(group_attr[0], activation_value)
                     group_batches[0].add(batch_id)
                     active_groups.add(0)
+                    group_heatmap_values.setdefault(group_id, []).append(activation_value)
 
         for group_index in range(group_count):
             group = {
@@ -234,6 +263,7 @@ def build_activation_map_payload(
             }
             node_groups.append(group)
             group_lookup[(layer_index, group_index)] = group
+            group_heatmap_values.setdefault(group["groupId"], [])
 
         top_active_groups = [
             group_lookup[(layer_index, group_index)]["groupId"]
@@ -353,17 +383,18 @@ def build_activation_map_payload(
             "batchParticipation": int(layer_rows["prompt_id"].nunique()) if not layer_rows.empty else 0,
         })
     for group in node_groups:
+        group_values = group_heatmap_values.get(group["groupId"], [])
         heatmap_stats["groups"].append({
             "groupId": group["groupId"],
             "layerId": group["layerId"],
-            "activationCount": 1 if group["activationValue"] > 0 else 0,
-            "maxActivation": group["activationValue"],
-            "meanActivation": group["activationValue"],
-            "density": 1.0 if group["activationValue"] > 0 else 0.0,
+            "activationCount": len(group_values),
+            "maxActivation": max(group_values) if group_values else 0.0,
+            "meanActivation": (sum(group_values) / len(group_values)) if group_values else 0.0,
+            "density": 1.0 if group_values else 0.0,
             "batchParticipation": group["batchParticipation"],
         })
 
-    visualization_mode = _path_mode(available_df, node_groups)
+    visualization_mode = _path_mode(available_df, trace_rows, node_groups)
     diagnostics = {
         "selectedBatch": selected_batch_row,
         "selectedLayer": selected_layer_row,
@@ -372,6 +403,7 @@ def build_activation_map_payload(
         "attributionScore": selected_path["attributionScore"] if selected_path else (selected_group_row or {}).get("attributionScore", 0.0),
         "confidence": selected_path["confidence"] if selected_path else 0.0,
         "visualizationMode": visualization_mode,
+        "unavailableReason": unavailable_reason,
         "sourceToken": selected_point["token"] if selected_point else "",
         "destinationToken": (selected_batch_row or {}).get("outputToken", ""),
         "topContributingHeads": [],
@@ -392,4 +424,5 @@ def build_activation_map_payload(
         "heatmapStats": heatmap_stats,
         "diagnostics": diagnostics,
         "visualizationMode": visualization_mode,
+        "unavailableReason": unavailable_reason,
     }

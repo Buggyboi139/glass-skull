@@ -26,6 +26,7 @@ from glass_skull.run_artifacts import (
     label_heatmap_df,
     normalize_llama_trace,
     normalize_transformerlens_trace,
+    trace_unavailable_row,
 )
 from glass_skull.lens import logit_lens_table
 from glass_skull.llama_control import build_cvector_command, build_llama_server_command, classify_cvector_failure, preflight_control_vector_run, read_gguf_tensor_index, shell_join
@@ -489,6 +490,51 @@ def main() -> None:
     first_path = activation_payload["activationPaths"][0]
     assert {"batchId", "promptId", "points", "strength", "visualizationMode"}.issubset(first_path)
     assert first_path["points"], "paths should include per-layer Canvas points"
+    layer_zero_group = next(group for group in activation_payload["heatmapStats"]["groups"] if group["groupId"] == "L0-G0")
+    assert layer_zero_group["activationCount"] == 3
+    assert layer_zero_group["maxActivation"] == 4.0
+    assert abs(layer_zero_group["meanActivation"] - (8.0 / 3.0)) < 1e-9
+
+    unavailable_artifact = build_run_artifact(
+        run_id=f"{run_id}-unavailable",
+        mode="Batch run",
+        backend="llama.cpp",
+        model="qwen-local",
+        prompts=[
+            {
+                "prompt_id": 11,
+                "label": "missing",
+                "prompt": "No trace",
+                "output": "n/a",
+                "error": None,
+                "elapsed_ms": 1.0,
+                "trace_rows": [
+                    {
+                        "run_id": f"{run_id}-unavailable",
+                        "prompt_id": 11,
+                        "label": "missing",
+                        "layer": None,
+                        "stream": "resid_post",
+                        "component": "resid_post",
+                        "token_index": 0,
+                        "token": "No",
+                        "activation_norm": None,
+                        "trace_available": True,
+                        "trace_source": "llama.cpp",
+                        "unavailable_reason": "",
+                        "top_dims": [],
+                    },
+                    trace_unavailable_row(f"{run_id}-unavailable", 11, "missing", "llama.cpp", "not exposed"),
+                ],
+            }
+        ],
+    )
+    unavailable_payload = build_activation_map_payload(unavailable_artifact, map_summary, local_model_context=None)
+    assert unavailable_payload["visualizationMode"] == "unavailable"
+    assert unavailable_payload["unavailableReason"] == "not exposed"
+    assert unavailable_payload["diagnostics"]["visualizationMode"] == "unavailable"
+    assert unavailable_payload["diagnostics"]["unavailableReason"] == "not exposed"
+    assert unavailable_payload["activationPaths"] == []
 
     jsonl = '\n'.join([
         json.dumps({"label": "animal", "prompt": "Explain what a mouse is."}),
