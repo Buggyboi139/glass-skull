@@ -842,6 +842,7 @@ def _assert_direct_activation_steering_model() -> None:
     }
 
     _assert_raises(ValueError, parse_activation_node_ids, "L36:N175")
+    _assert_raises(ValueError, parse_activation_node_ids, "L36-N175,L36-N175")
     _assert_raises(ValueError, build_direct_activation_steering_payload, True, "", "Toward", 0.4, "all")
     _assert_raises(ValueError, build_direct_activation_steering_payload, True, "L36-N175", "Sideways", 0.4, "all")
     _assert_raises(ValueError, build_direct_activation_steering_payload, True, "L36-N175", "Toward", 0.4, "middle")
@@ -852,18 +853,43 @@ def _assert_direct_activation_capability_detection() -> None:
         "capabilities": {
             "direct_activation_steering": {
                 "supported": True,
+                "mechanism": "hook_level_activation_delta",
                 "contract": {
                     "request": "glass_skull.direct_activation_steering",
                     "openai_compatible_alternate": "metadata.glass_skull.direct_activation_steering",
                 },
+                "map_identity": {
+                    "node_id_format": "L<layer>-N<node>",
+                    "layer_base": 0,
+                    "activation_space": "same tensor used by Activation Map",
+                    "node_axis": "embedding/channel dimension",
+                },
+                "token_scope": {"all": True, "prompt": True, "generated": True},
+                "multiple_targets": True,
             }
         }
     }
     assert direct_activation_steering_supported(supported_info) is True
-    assert direct_activation_steering_status(supported_info)["status"] == "supported"
+    assert direct_activation_steering_status(supported_info)["label"] == "Hook-level Supported"
     missing_contract_status = direct_activation_steering_status({"capabilities": {"direct_activation_steering": {"supported": True}}})
     assert direct_activation_steering_supported({"capabilities": {"direct_activation_steering": {"supported": True}}}) is False
     assert missing_contract_status["status"] == "partial"
+    sparse_info = {
+        "capabilities": {
+            "direct_activation_steering": {
+                "supported": True,
+                "contract": {
+                    "request": "glass_skull.direct_activation_steering",
+                    "openai_compatible_alternate": "metadata.glass_skull.direct_activation_steering",
+                },
+                "guards": {"activation_map_layer_ids": "mapped internally to llama.cpp cvec layers 1-n"},
+            }
+        }
+    }
+    sparse_status = direct_activation_steering_status(sparse_info)
+    assert direct_activation_steering_supported(sparse_info) is False
+    assert sparse_status["status"] == "partial"
+    assert "not hook-level" in sparse_status["message"]
 
     legacy_info = {
         "capabilities": {

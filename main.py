@@ -1031,8 +1031,10 @@ def render_direct_activation_steering_panel(glass_info: dict | None, steer_toolt
     else:
         st.caption("No validation errors.")
 
-    if st.session_state.direct_steering_enabled and status["status"] != "supported":
-        st.warning("Direct steering is configured, but the selected backend does not advertise full direct activation steering support.")
+    if st.session_state.direct_steering_enabled and status["status"] == "partial":
+        st.warning("Direct payload support is present, but this backend is not advertising surgical hook-level activation steering.")
+    elif st.session_state.direct_steering_enabled and status["status"] != "supported":
+        st.warning("Direct steering is configured, but the selected backend does not advertise direct activation steering support.")
 
 
 def render_activation_patch_panel(chat_backend: str, max_new_tokens: int, temperature: float, steer_tooltips: dict | None = None) -> None:

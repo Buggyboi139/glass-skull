@@ -7,18 +7,18 @@ index 3e0fe66af..6bf24873b 100644
  #include <sstream>
  #include <stdexcept>
 +#include <vector>
-
+ 
  // vec
-
+ 
 @@ -121,12 +122,16 @@ bool llama_adapter_cvec::apply(
      layer_start = il_start;
      layer_end   = il_end;
-
+ 
 +    const std::vector<float> zeros(n_embd, 0.0f);
 +
      for (size_t il = 1; il < hparams.n_layer(); il++) {
          assert(tensors[il] != nullptr);
-
+ 
          const size_t off = n_embd * (il - 1); // buffer doesn't have data for layer 0, since it's never present
          if (off + n_embd <= len) {
              ggml_backend_tensor_set(tensors[il], data + off, 0, n_embd * ggml_element_size(tensors[il]));
@@ -26,15 +26,520 @@ index 3e0fe66af..6bf24873b 100644
 +            ggml_backend_tensor_set(tensors[il], zeros.data(), 0, n_embd * ggml_element_size(tensors[il]));
          }
      }
-
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 220240ea9..3ffa5312f 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -12,6 +12,7 @@
+ #include "llama-ext.h"
+ #include "llama.h"
+ 
++#include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -1156,6 +1157,41 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
+     sched_need_reserve = true;
+ }
+ 
++void llama_context::set_activation_delta(
++        int32_t task_id,
++        const llama_activation_delta_target * targets,
++        size_t n_targets,
++        int32_t prompt_tokens,
++        llama_activation_delta_token_scope token_scope) {
++    activation_delta.enabled = n_targets > 0;
++    activation_delta.task_id = task_id;
++    activation_delta.prompt_tokens = std::max<int32_t>(0, prompt_tokens);
++    activation_delta.token_scope = token_scope;
++    if (targets && n_targets > 0) {
++        activation_delta.targets.assign(targets, targets + n_targets);
++    } else {
++        activation_delta.targets.clear();
++    }
++    activation_delta.hits.clear();
++    activation_delta.version++;
++    sched_need_reserve = true;
++}
++
++void llama_context::clear_activation_delta() {
++    activation_delta.enabled = false;
++    activation_delta.task_id = -1;
++    activation_delta.prompt_tokens = 0;
++    activation_delta.token_scope = LLAMA_ACTIVATION_DELTA_SCOPE_ALL;
++    activation_delta.targets.clear();
++    activation_delta.hits.clear();
++    activation_delta.version++;
++    sched_need_reserve = true;
++}
++
++const std::vector<llama_activation_delta_hit> & llama_context::get_activation_delta_hits() const {
++    return activation_delta.hits;
++}
++
+ void llama_context::set_nextn_layer_offset(int32_t offset) {
+     cparams.nextn_layer_offset = offset;
+ }
+@@ -2321,10 +2357,11 @@ void llama_context::output_reorder() {
+ //
+ 
+ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
++    const uint32_t glass_activation_delta_nodes = 4u * model.hparams.n_layer();
+     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
+-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
++        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors()) + glass_activation_delta_nodes;
+     }
+-    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
++    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors()) + glass_activation_delta_nodes;
+     for (const auto & lora : model.loras) {
+         res += lora->get_n_nodes();
+     }
+@@ -2408,6 +2445,8 @@ llm_graph_params llama_context::graph_params(
+         /*.sched       =*/ sched.get(),
+         /*.backend_cpu =*/ backend_cpu,
+         /*.cvec        =*/ cvec.get(),
++        /*.activation_delta =*/ &activation_delta,
++        /*.activation_delta_version =*/ activation_delta.version,
+         /*.loras       =*/ loras.get(),
+         /*.mctx        =*/ mctx,
+         /*.cross       =*/ &cross,
+@@ -3707,6 +3746,28 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
+     ctx->set_nextn_layer_offset(offset);
+ }
+ 
++void llama_set_activation_delta(
++        llama_context * ctx,
++        int32_t task_id,
++        const llama_activation_delta_target * targets,
++        size_t n_targets,
++        int32_t prompt_tokens,
++        llama_activation_delta_token_scope token_scope) {
++    ctx->set_activation_delta(task_id, targets, n_targets, prompt_tokens, token_scope);
++}
++
++void llama_clear_activation_delta(llama_context * ctx) {
++    ctx->clear_activation_delta();
++}
++
++const llama_activation_delta_hit * llama_get_activation_delta_hits(llama_context * ctx, size_t * n_hits) {
++    const auto & hits = ctx->get_activation_delta_hits();
++    if (n_hits) {
++        *n_hits = hits.size();
++    }
++    return hits.empty() ? nullptr : hits.data();
++}
++
+ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
+     if (!ctx) {
+         return nullptr;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index f8b780587..b3a275ade 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -116,6 +116,14 @@ struct llama_context {
+     void set_embeddings_nextn(bool value, bool masked);
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
++    void set_activation_delta(
++            int32_t task_id,
++            const llama_activation_delta_target * targets,
++            size_t n_targets,
++            int32_t prompt_tokens,
++            llama_activation_delta_token_scope token_scope);
++    void clear_activation_delta();
++    const std::vector<llama_activation_delta_hit> & get_activation_delta_hits() const;
+     void set_causal_attn(bool value);
+     void set_warmup(bool value);
+ 
+@@ -300,6 +308,8 @@ private:
+     // populated when cparams.output_layer_inp[il] is true
+     std::vector<buffer_view<float>> embd_layer_inp;
+ 
++    mutable llama_activation_delta_runtime activation_delta;
++
+     struct sampling_info {
+         // !samplers.empty() to check if any samplers are active
+         std::map<llama_seq_id, llama_sampler *> samplers;
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 348bbae95..62707be61 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -6,6 +6,7 @@
+ 
+ #include "llama.h"
+ 
++#include <cstddef>
+ #include <cstdint>
+ #include <map>
+ 
+@@ -114,6 +115,44 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
+ // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+ 
++enum llama_activation_delta_token_scope : int32_t {
++    LLAMA_ACTIVATION_DELTA_SCOPE_ALL       = 0,
++    LLAMA_ACTIVATION_DELTA_SCOPE_PROMPT    = 1,
++    LLAMA_ACTIVATION_DELTA_SCOPE_GENERATED = 2,
++};
++
++struct llama_activation_delta_target {
++    int32_t layer;
++    int32_t node_start;
++    int32_t node_end;
++    float   delta;
++};
++
++struct llama_activation_delta_hit {
++    int32_t task_id;
++    int32_t layer;
++    int32_t node_start;
++    int32_t node_end;
++    int32_t token_index;
++    int32_t token_phase;
++    float   signed_delta;
++    int32_t hit_count;
++};
++
++LLAMA_API void llama_set_activation_delta(
++        struct llama_context * ctx,
++        int32_t task_id,
++        const struct llama_activation_delta_target * targets,
++        size_t n_targets,
++        int32_t prompt_tokens,
++        enum llama_activation_delta_token_scope token_scope);
++
++LLAMA_API void llama_clear_activation_delta(struct llama_context * ctx);
++
++LLAMA_API const struct llama_activation_delta_hit * llama_get_activation_delta_hits(
++        struct llama_context * ctx,
++        size_t * n_hits);
++
+ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+ 
+ //
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 68c9e606c..f37ebb14d 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -12,6 +12,7 @@
+ #include "llama-memory-hybrid-iswa.h"
+ #include "llama-memory-recurrent.h"
+ 
++#include <algorithm>
+ #include <cassert>
+ #include <cmath>
+ #include <cstring>
+@@ -883,6 +884,75 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
+     return true;
+ }
+ 
++llm_graph_input_activation_delta::llm_graph_input_activation_delta(
++        llama_activation_delta_runtime * state,
++        int32_t layer,
++        int64_t n_embd,
++        int64_t n_tokens) :
++    state(state),
++    layer(layer),
++    n_embd(n_embd),
++    n_tokens(n_tokens),
++    version(state ? state->version : 0) {
++    values.resize((size_t) n_embd * (size_t) n_tokens, 0.0f);
++}
++
++void llm_graph_input_activation_delta::set_input(const llama_ubatch * ubatch) {
++    std::fill(values.begin(), values.end(), 0.0f);
++
++    if (state && state->enabled && ubatch) {
++        for (const auto & target : state->targets) {
++            if (target.layer != layer) {
++                continue;
++            }
++
++            const int32_t node_start = std::max<int32_t>(0, target.node_start);
++            const int32_t node_end = std::min<int32_t>((int32_t) n_embd - 1, target.node_end);
++            if (node_start > node_end) {
++                continue;
++            }
++
++            for (int64_t i = 0; i < n_tokens && i < ubatch->n_tokens; ++i) {
++                const int32_t token_index = ubatch->pos ? ubatch->pos[i] : (int32_t) i;
++                const bool is_prompt = token_index < state->prompt_tokens;
++                const bool applies =
++                    state->token_scope == LLAMA_ACTIVATION_DELTA_SCOPE_ALL ||
++                    (state->token_scope == LLAMA_ACTIVATION_DELTA_SCOPE_PROMPT && is_prompt) ||
++                    (state->token_scope == LLAMA_ACTIVATION_DELTA_SCOPE_GENERATED && !is_prompt);
++                if (!applies) {
++                    continue;
++                }
++
++                for (int32_t node = node_start; node <= node_end; ++node) {
++                    values[(size_t) i * (size_t) n_embd + (size_t) node] += target.delta;
++                }
++
++                state->hits.push_back({
++                    state->task_id,
++                    layer,
++                    node_start,
++                    node_end,
++                    token_index,
++                    is_prompt ? LLAMA_ACTIVATION_DELTA_SCOPE_PROMPT : LLAMA_ACTIVATION_DELTA_SCOPE_GENERATED,
++                    target.delta,
++                    node_end - node_start + 1,
++                });
++            }
++        }
++    }
++
++    ggml_backend_tensor_set(delta, values.data(), 0, values.size()*sizeof(float));
++}
++
++bool llm_graph_input_activation_delta::can_reuse(const llm_graph_params & params) {
++    return state != nullptr &&
++        params.activation_delta != nullptr &&
++        params.activation_delta == state &&
++        params.activation_delta_version == version &&
++        params.activation_delta->applies_to_layer(layer) &&
++        params.ubatch.n_tokens == n_tokens;
++}
++
+ //
+ // llm_graph_result
+ //
+@@ -1059,6 +1129,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     sched            (params.sched),
+     backend_cpu      (params.backend_cpu),
+     cvec             (params.cvec),
++    activation_delta (params.activation_delta),
++    activation_delta_version(params.activation_delta_version),
+     loras            (params.loras),
+     mctx             (params.mctx),
+     cross            (params.cross),
+@@ -1082,6 +1154,26 @@ ggml_tensor * llm_graph_context::build_cvec(
+     return cvec->apply_to(ctx0, cur, il);
+ }
+ 
++ggml_tensor * llm_graph_context::build_activation_delta(
++         ggml_tensor * cur,
++                 int   il) const {
++    if (!activation_delta || !activation_delta->applies_to_layer(il)) {
++        return cur;
++    }
++
++    auto inp = std::make_unique<llm_graph_input_activation_delta>(activation_delta, il, cur->ne[0], cur->ne[1]);
++    inp->delta = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, cur->ne[0], cur->ne[1]);
++    ggml_set_input(inp->delta);
++    ggml_format_name(inp->delta, "glass_skull_activation_delta_l%d", il);
++
++    ggml_tensor * delta = inp->delta;
++    res->add_input(std::move(inp));
++
++    cur = ggml_add(ctx0, cur, delta);
++    cb(cur, "glass_skull_activation_delta", il);
++    return cur;
++}
++
+ ggml_tensor * llm_graph_context::build_lora_mm(
+           ggml_tensor * w,
+           ggml_tensor * cur,
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index a6e8c3985..5199095bf 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -4,6 +4,7 @@
+ #include "llama-batch.h"
+ #include "llama-hparams.h"
+ #include "llama-adapter.h"
++#include "llama-ext.h"
+ 
+ #include <cstdint>
+ #include <vector>
+@@ -108,6 +109,28 @@ protected:
+ 
+ using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
+ 
++struct llama_activation_delta_runtime {
++    bool enabled = false;
++    uint32_t version = 0;
++    int32_t task_id = -1;
++    int32_t prompt_tokens = 0;
++    llama_activation_delta_token_scope token_scope = LLAMA_ACTIVATION_DELTA_SCOPE_ALL;
++    std::vector<llama_activation_delta_target> targets;
++    std::vector<llama_activation_delta_hit> hits;
++
++    bool applies_to_layer(int32_t layer) const {
++        if (!enabled) {
++            return false;
++        }
++        for (const auto & target : targets) {
++            if (target.layer == layer) {
++                return true;
++            }
++        }
++        return false;
++    }
++};
++
+ class llm_graph_input_embd : public llm_graph_input_i {
+ public:
+     llm_graph_input_embd(int64_t n_embd) : n_embd(n_embd) {}
+@@ -570,6 +593,27 @@ public:
+     std::map<llama_seq_id, llama_sampler *> samplers;
+ };
+ 
++class llm_graph_input_activation_delta : public llm_graph_input_i {
++public:
++    llm_graph_input_activation_delta(
++            llama_activation_delta_runtime * state,
++            int32_t layer,
++            int64_t n_embd,
++            int64_t n_tokens);
++    virtual ~llm_graph_input_activation_delta() = default;
++
++    void set_input(const llama_ubatch * ubatch) override;
++    bool can_reuse(const llm_graph_params & params) override;
++
++    llama_activation_delta_runtime * state;
++    int32_t layer;
++    int64_t n_embd;
++    int64_t n_tokens;
++    uint32_t version;
++    ggml_tensor * delta = nullptr;
++    std::vector<float> values;
++};
++
+ //
+ // llm_graph_result
+ //
+@@ -599,6 +643,8 @@ struct llm_graph_params {
+     ggml_backend_t backend_cpu;
+ 
+     const llama_adapter_cvec     * cvec;
++    llama_activation_delta_runtime * activation_delta;
++    uint32_t activation_delta_version = 0;
+     const llama_adapter_loras    * loras;
+     const llama_memory_context_i * mctx;
+     const llama_cross            * cross;
+@@ -695,6 +741,7 @@ struct llm_graph_params {
+             arch  == other.arch  &&
+             gtype == other.gtype &&
+             cvec  == other.cvec  &&
++            activation_delta_version == other.activation_delta_version &&
+             loras == other.loras &&
+             cross == other.cross;
+     }
+@@ -828,6 +875,8 @@ struct llm_graph_context {
+     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
+ 
+     const llama_adapter_cvec     * cvec;
++    llama_activation_delta_runtime * activation_delta;
++    uint32_t activation_delta_version;
+     const llama_adapter_loras    * loras;
+     const llama_memory_context_i * mctx;
+     const llama_cross            * cross;
+@@ -854,6 +903,10 @@ struct llm_graph_context {
+              ggml_tensor * cur,
+                      int   il) const;
+ 
++    ggml_tensor * build_activation_delta(
++             ggml_tensor * cur,
++                     int   il) const;
++
+     // do mat_mul, while optionally apply lora and per-tensor scale
+     ggml_tensor * build_lora_mm(
+               ggml_tensor * w,
+diff --git a/src/models/gemma4.cpp b/src/models/gemma4.cpp
+index 6a96979ce..21ac60daa 100644
+--- a/src/models/gemma4.cpp
++++ b/src/models/gemma4.cpp
+@@ -210,6 +210,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
+         const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
+         const int   n_rot_l      = hparams.n_rot(il);
+ 
++        inpL = build_activation_delta(inpL, il);
+         res->t_layer_inp[il] = inpL;
+ 
+         // norm
+diff --git a/src/models/llama.cpp b/src/models/llama.cpp
+index 4bfebc884..b5b576042 100644
+--- a/src/models/llama.cpp
++++ b/src/models/llama.cpp
+@@ -124,6 +124,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+     for (int il = 0; il < n_layer; ++il) {
++        inpL = build_activation_delta(inpL, il);
+         res->t_layer_inp[il] = inpL;
+ 
+         ggml_tensor * inpSA = inpL;
+diff --git a/src/models/openai-moe.cpp b/src/models/openai-moe.cpp
+index 6d74f9c7e..74f23a561 100644
+--- a/src/models/openai-moe.cpp
++++ b/src/models/openai-moe.cpp
+@@ -75,6 +75,7 @@ llama_model_openai_moe::graph::graph(const llama_model & model, const llm_graph_
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+     for (int il = 0; il < n_layer; ++il) {
++        inpL = build_activation_delta(inpL, il);
+         res->t_layer_inp[il] = inpL;
+ 
+         const float freq_base_l  = model.get_rope_freq_base (cparams, il);
+diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
+index f4b2a2aeb..b84980a72 100644
+--- a/src/models/qwen3.cpp
++++ b/src/models/qwen3.cpp
+@@ -69,6 +69,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+     for (int il = 0; il < n_layer; ++il) {
++        inpL = build_activation_delta(inpL, il);
+         res->t_layer_inp[il] = inpL;
+ 
+         ggml_tensor * inpSA = inpL;
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index d8ffe43ae..b66195eb5 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -156,6 +156,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+ 
+     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
+     for (int il = 0; il < n_layer; ++il) {
++        inpL = build_activation_delta(inpL, il);
+         res->t_layer_inp[il] = inpL;
+ 
+         ggml_tensor * inpSA = inpL;
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 7b0876cbb..47e849e76 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -179,6 +179,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
+ 
+     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
+     for (int il = 0; il < n_layer; ++il) {
++        inpL = build_activation_delta(inpL, il);
+         res->t_layer_inp[il] = inpL;
+ 
+         ggml_tensor * inpSA = inpL;
+diff --git a/src/models/qwen3moe.cpp b/src/models/qwen3moe.cpp
+index 6f6df5390..824e23362 100644
+--- a/src/models/qwen3moe.cpp
++++ b/src/models/qwen3moe.cpp
+@@ -78,6 +78,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+     for (int il = 0; il < n_layer; ++il) {
++        inpL = build_activation_delta(inpL, il);
+         res->t_layer_inp[il] = inpL;
+ 
+         ggml_tensor * inpSA = inpL;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index ca91449d2..128541718 100644
+index ca91449d2..9b0fa1754 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -16,7 +16,10 @@
  #include "mtmd.h"
  #include "mtmd-helper.h"
-
+ 
 +#include "../../src/llama-ext.h"
 +
  #include <algorithm>
@@ -45,7 +550,7 @@ index ca91449d2..128541718 100644
 @@ -53,6 +56,36 @@ static uint32_t server_n_outputs_max(const common_params & params) {
      return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
  }
-
+ 
 +static std::string server_model_meta_val_str(const llama_model * model, const char * key) {
 +    char buf[256];
 +    int32_t len = llama_model_meta_val_str(model, key, buf, sizeof(buf));
@@ -80,21 +585,21 @@ index ca91449d2..128541718 100644
  enum slot_state {
      SLOT_STATE_IDLE,
 @@ -273,6 +306,8 @@ struct server_slot {
-
+ 
      common_sampler_ptr smpl;
-
+ 
 +    std::vector<glass_trace_layer_input> glass_trace_rows;
 +
      llama_token sampled; // in speculative mode, this is the last accepted token
-
+ 
      // stats
 @@ -287,7 +322,7 @@ struct server_slot {
      double t_prompt_processing = 0.0; // ms
      double t_token_generation = 0.0;  // ms
-
+ 
 -    std::function<void(int /* id_slot */)> callback_on_release;
 +    std::function<void(int /* id_slot */, bool /* was_steered */, bool /* was_glass_trace */, int /* id_task */)> callback_on_release;
-
+ 
      // Speculative decoding stats
      int32_t n_draft_total = 0;      // Total draft tokens generated
 @@ -315,6 +350,7 @@ struct server_slot {
@@ -103,27 +608,34 @@ index ca91449d2..128541718 100644
          generated_token_probs.clear();
 +        glass_trace_rows.clear();
          json_schema = json();
-
+ 
          // clear speculative decoding stats
-@@ -494,9 +530,13 @@ struct server_slot {
-                 prompt_clear(false);
-             }
-
+@@ -489,14 +525,18 @@ struct server_slot {
+ 
+             state = SLOT_STATE_IDLE;
+ 
+-            // do not keep context of the child slots - the parent's context is enough
+-            if (task->is_child()) {
 +            const bool was_steered = task->params.has_request_steering();
 +            const bool was_glass_trace = task->type == SERVER_TASK_TYPE_GLASS_TRACE;
 +            const int id_task = task->id;
 +
++            // do not keep context of child slots or steered requests
++            if (task->is_child() || was_steered) {
+                 prompt_clear(false);
+             }
+ 
              reset();
-
+ 
 -            callback_on_release(id);
 +            callback_on_release(id, was_steered, was_glass_trace, id_task);
          }
      }
-
-@@ -920,6 +960,21 @@ private:
-
+ 
+@@ -920,6 +960,22 @@ private:
+ 
      server_metrics metrics;
-
+ 
 +    common_control_vector_data default_cvec = { -1, {} };
 +    int32_t default_cvec_layer_start = -1;
 +    int32_t default_cvec_layer_end   = -1;
@@ -134,17 +646,18 @@ index ca91449d2..128541718 100644
 +    int32_t global_cvec_layer_end = -1;
 +    bool global_cvec_enabled = false;
 +    bool active_request_steering = false;
++    bool active_request_direct_activation_steering = false;
 +    int active_request_steering_task = -1;
 +    bool active_glass_trace = false;
 +    int active_glass_trace_task = -1;
 +    std::vector<int32_t> active_glass_trace_layers;
 +
      json json_ui_settings = json::object();
-
+ 
      // Necessary similarity of prompt for slot selection
-@@ -934,6 +989,21 @@ private:
+@@ -934,6 +990,21 @@ private:
      int64_t t_last_load_progress_ms = 0;
-
+ 
      void destroy() {
 +        default_cvec = { -1, {} };
 +        default_cvec_layer_start = -1;
@@ -164,10 +677,10 @@ index ca91449d2..128541718 100644
          spec.reset();
          ctx_dft.reset();
          model_dft.reset();
-@@ -947,6 +1017,399 @@ private:
+@@ -947,6 +1018,403 @@ private:
          mctx = nullptr;
      }
-
+ 
 +    void pad_control_vector(common_control_vector_data & cvec) const {
 +        if (cvec.n_embd <= 0 || model_tgt == nullptr) {
 +            return;
@@ -260,12 +773,8 @@ index ca91449d2..128541718 100644
 +            return false;
 +        }
 +
-+        common_control_vector_data cvec = {
-+            n_embd,
-+            std::vector<float>(static_cast<size_t>(n_layer) * static_cast<size_t>(n_embd), 0.0f),
-+        };
-+        int32_t layer_start = n_layer;
-+        int32_t layer_end = 1;
++        std::vector<llama_activation_delta_target> hook_targets;
++        hook_targets.reserve(steering.targets.size());
 +
 +        for (const auto & target : steering.targets) {
 +            if (target.layer < 0 || target.layer >= n_layer) {
@@ -286,29 +795,30 @@ index ca91449d2..128541718 100644
 +                return false;
 +            }
 +
-+            const int32_t cvec_layer = target.layer + 1;
-+            const size_t offset = static_cast<size_t>(target.layer) * static_cast<size_t>(n_embd);
-+            for (int32_t node = target.node_start; node <= target.node_end; node++) {
-+                cvec.data[offset + static_cast<size_t>(node)] += steering.strength;
-+            }
-+            layer_start = std::min(layer_start, cvec_layer);
-+            layer_end = std::max(layer_end, cvec_layer);
++            hook_targets.push_back({
++                target.layer,
++                target.node_start,
++                target.node_end,
++                steering.strength,
++            });
 +        }
 +
-+        if (llama_set_adapter_cvec(ctx_tgt, cvec.data.data(), cvec.data.size(), cvec.n_embd, layer_start, layer_end) != 0) {
-+            error = "failed to apply glass_skull.direct_activation_steering; target width may not match the model embedding width";
-+            return false;
++        llama_activation_delta_token_scope scope = LLAMA_ACTIVATION_DELTA_SCOPE_ALL;
++        if (steering.token_scope == "prompt") {
++            scope = LLAMA_ACTIVATION_DELTA_SCOPE_PROMPT;
++        } else if (steering.token_scope == "generated") {
++            scope = LLAMA_ACTIVATION_DELTA_SCOPE_GENERATED;
 +        }
 +
++        llama_set_activation_delta(ctx_tgt, task.id, hook_targets.data(), hook_targets.size(), task.n_tokens(), scope);
 +        active_request_steering = true;
++        active_request_direct_activation_steering = true;
 +        active_request_steering_task = task.id;
-+        SRV_INF("enabled direct Glass Skull activation steering: task = %d, targets = %zu, strength = %.4f, token_scope = %s, cvec_layers = [%d, %d]\n",
++        SRV_INF("enabled hook-level Glass Skull activation steering: task = %d, targets = %zu, strength = %.4f, token_scope = %s, activation_space = resid_pre\n",
 +                task.id,
 +                steering.targets.size(),
 +                steering.strength,
-+                steering.token_scope.c_str(),
-+                layer_start,
-+                layer_end);
++                steering.token_scope.c_str());
 +        return true;
 +    }
 +
@@ -356,6 +866,7 @@ index ca91449d2..128541718 100644
 +        }
 +
 +        active_request_steering = true;
++        active_request_direct_activation_steering = false;
 +        active_request_steering_task = task.id;
 +        SRV_INF("enabled per-request Glass Skull steering: task = %d, vector = '%s', strength = %.4f, layers = [%d, %d]\n",
 +                task.id,
@@ -371,13 +882,19 @@ index ca91449d2..128541718 100644
 +            return;
 +        }
 +
-+        if (!restore_effective_control_vector()) {
-+            SRV_ERR("failed to restore effective control vector after task %d\n", id_task);
++        if (active_request_direct_activation_steering) {
++            llama_clear_activation_delta(ctx_tgt);
++            SRV_INF("cleared hook-level direct activation steering after task %d\n", id_task);
 +        } else {
-+            SRV_INF("restored effective control vector after task %d\n", id_task);
++            if (!restore_effective_control_vector()) {
++                SRV_ERR("failed to restore effective control vector after task %d\n", id_task);
++            } else {
++                SRV_INF("restored effective control vector after task %d\n", id_task);
++            }
 +        }
 +
 +        active_request_steering = false;
++        active_request_direct_activation_steering = false;
 +        active_request_steering_task = -1;
 +    }
 +
@@ -564,19 +1081,19 @@ index ca91449d2..128541718 100644
      void handle_sleeping_state(bool new_state) {
          GGML_ASSERT(sleeping != new_state);
          if (new_state) {
-@@ -1164,6 +1627,8 @@ private:
+@@ -1164,6 +1632,8 @@ private:
              return false;
          }
-
+ 
 +        load_default_control_vector_state();
 +
          vocab = llama_model_get_vocab(model_tgt);
-
+ 
          n_ctx = llama_n_ctx(ctx_tgt);
-@@ -1356,8 +1821,14 @@ private:
-
+@@ -1356,8 +1826,14 @@ private:
+ 
              SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
-
+ 
 -            slot.callback_on_release = [this](int id_slot) {
 +            slot.callback_on_release = [this](int id_slot, bool was_steered, bool was_glass_trace, int id_task) {
                  queue_tasks.pop_deferred_task(id_slot);
@@ -587,30 +1104,30 @@ index ca91449d2..128541718 100644
 +                    finish_glass_trace(id_task);
 +                }
              };
-
+ 
              slot.reset();
-@@ -1574,7 +2045,7 @@ private:
+@@ -1574,7 +2050,7 @@ private:
          }
-
+ 
          // find the slot that has at least n% prompt similarity
 -        if (slot_prompt_similarity != 0.0f) {
 +        if (!task.params.has_request_steering() && slot_prompt_similarity != 0.0f) {
              float sim_best = 0;
-
+ 
              for (server_slot & slot : slots) {
-@@ -1645,7 +2116,7 @@ private:
+@@ -1645,7 +2121,7 @@ private:
          }
-
+ 
          if (ret) {
 -            update_cache = update_cache && prompt_cache;
 +            update_cache = update_cache && prompt_cache && !task.params.has_request_steering();
-
+ 
              // cache prompts only for completion tasks
              update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
-@@ -1786,6 +2257,34 @@ private:
+@@ -1786,6 +2262,35 @@ private:
              return false;
          }
-
+ 
 +        if (task.type == SERVER_TASK_TYPE_GLASS_TRACE) {
 +            task.params.cache_prompt = false;
 +            task.params.n_cache_reuse = 0;
@@ -634,18 +1151,62 @@ index ca91449d2..128541718 100644
 +                send_error(task, error, ERROR_TYPE_INVALID_REQUEST);
 +                restore_effective_control_vector();
 +                active_request_steering = false;
++                active_request_direct_activation_steering = false;
 +                active_request_steering_task = -1;
 +                return false;
 +            }
 +        }
 +
          SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
-
+ 
          // initialize samplers
-@@ -2209,6 +2708,20 @@ private:
+@@ -1795,6 +2300,9 @@ private:
+             } catch (std::exception & e) {
+                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
+                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
++                if (task.params.has_request_steering()) {
++                    finish_request_steering(task.id);
++                }
+                 return false;
+             }
+ 
+@@ -2160,6 +2668,32 @@ private:
+         }
+ 
+         res->generation_params = slot.task->params; // copy the parameters
++        if (res->generation_params.direct_activation_steering.enabled) {
++            auto & steering = res->generation_params.direct_activation_steering;
++            steering.hook_hits.clear();
++            steering.hook_total_hit_count = 0;
++
++            size_t n_hits = 0;
++            const llama_activation_delta_hit * hits = llama_get_activation_delta_hits(ctx_tgt, &n_hits);
++            for (size_t i = 0; hits && i < n_hits; ++i) {
++                if (hits[i].task_id != slot.task->id) {
++                    continue;
++                }
++
++                const char * phase = hits[i].token_phase == LLAMA_ACTIVATION_DELTA_SCOPE_PROMPT ? "prompt" : "generated";
++                steering.hook_hits.push_back({
++                    hits[i].task_id,
++                    hits[i].layer,
++                    hits[i].node_start,
++                    hits[i].node_end,
++                    hits[i].token_index,
++                    phase,
++                    hits[i].signed_delta,
++                    hits[i].hit_count,
++                });
++                steering.hook_total_hit_count += hits[i].hit_count;
++            }
++        }
+ 
          queue_results.send(std::move(res));
      }
-
+@@ -2209,6 +2743,20 @@ private:
+         queue_results.send(std::move(res));
+     }
+ 
 +    void send_glass_trace(const server_slot & slot) {
 +        auto res = std::make_unique<server_task_result_glass_trace>();
 +        res->id = slot.task->id;
@@ -663,7 +1224,7 @@ index ca91449d2..128541718 100644
      void send_rerank(const server_slot & slot, const llama_batch & batch) {
          auto res = std::make_unique<server_task_result_rerank>();
          res->id       = slot.task->id;
-@@ -2356,6 +2869,7 @@ private:
+@@ -2356,6 +2904,7 @@ private:
              case SERVER_TASK_TYPE_INFILL:
              case SERVER_TASK_TYPE_EMBEDDING:
              case SERVER_TASK_TYPE_RERANK:
@@ -671,10 +1232,10 @@ index ca91449d2..128541718 100644
                  {
                      // special case: if input is provided via CLI, tokenize it first
                      // otherwise, no need to tokenize as it's already done inside the HTTP thread
-@@ -2367,6 +2881,35 @@ private:
-
+@@ -2367,6 +2916,35 @@ private:
+ 
                      const int id_task = task.id;
-
+ 
 +                    if (active_request_steering && !task.params.has_request_steering()) {
 +                        SRV_DBG("per-request steering is active, defer unsteered task, id_task = %d\n", id_task);
 +                        queue_tasks.defer(std::move(task));
@@ -705,9 +1266,9 @@ index ca91449d2..128541718 100644
 +                    }
 +
                      server_slot * slot = get_available_slot(task);
-
+ 
                      //
-@@ -2423,6 +2966,51 @@ private:
+@@ -2423,6 +3001,51 @@ private:
                          }
                      }
                  } break;
@@ -759,18 +1320,18 @@ index ca91449d2..128541718 100644
              case SERVER_TASK_TYPE_CANCEL:
                  {
                      // release slot linked with the task id
-@@ -3707,6 +4295,7 @@ private:
+@@ -3707,6 +4330,7 @@ private:
                  if (slot.task->params.stream && slot.task->params.return_progress) {
                      send_partial_response(slot, {}, true);
                  }
 +                collect_glass_trace_rows(slot, batch_view);
              }
-
+ 
              if (!is_inside_view(slot.i_batch)) {
-@@ -3730,6 +4319,13 @@ private:
+@@ -3730,6 +4354,13 @@ private:
                      return;
                  }
-
+ 
 +                if (slot.task->type == SERVER_TASK_TYPE_GLASS_TRACE) {
 +                    send_glass_trace(slot);
 +                    slot.release();
@@ -779,10 +1340,10 @@ index ca91449d2..128541718 100644
 +                }
 +
                  GGML_ASSERT(slot.task->need_sampling());
-
+ 
                  // prompt evaluated for next-token prediction
-@@ -3995,8 +4591,13 @@ server_context_meta server_context::get_meta() const {
-
+@@ -3995,8 +4626,13 @@ server_context_meta server_context::get_meta() const {
+ 
          /* model_vocab_type       */ llama_vocab_type(impl->vocab),
          /* model_vocab_n_tokens   */ llama_vocab_n_tokens(impl->vocab),
 +        /* model_architecture     */ server_model_meta_val_str(impl->model_tgt, "general.architecture"),
@@ -795,10 +1356,10 @@ index ca91449d2..128541718 100644
          /* model_n_params         */ llama_model_n_params(impl->model_tgt),
          /* model_size             */ llama_model_size(impl->model_tgt),
      };
-@@ -4311,6 +4912,136 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
+@@ -4311,6 +4947,152 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
      init_routes();
  }
-
+ 
 +static json format_response_glass_skull_capabilities(const server_context_meta & meta, const common_params & params) {
 +    return json {
 +        {"completion", true},
@@ -831,6 +1392,7 @@ index ca91449d2..128541718 100644
 +        }},
 +        {"direct_activation_steering", {
 +            {"supported", true},
++            {"mechanism", "hook_level_activation_delta"},
 +            {"contract", {
 +                {"request", "glass_skull.direct_activation_steering"},
 +                {"openai_compatible_alternate", "metadata.glass_skull.direct_activation_steering"},
@@ -839,12 +1401,27 @@ index ca91449d2..128541718 100644
 +                {"strength", "float magnitude; toward applies positive values and away applies negative values"},
 +                {"token_scope", {"all", "prompt", "generated"}},
 +            }},
++            {"map_identity", {
++                {"node_id_format", "L<layer>-N<node>"},
++                {"layer_base", 0},
++                {"activation_space", "same tensor used by Activation Map"},
++                {"tensor_stream", "resid_pre"},
++                {"node_axis", "embedding/channel dimension"},
++                {"node_range", "inclusive"},
++            }},
++            {"token_scope", {
++                {"all", true},
++                {"prompt", true},
++                {"generated", true},
++            }},
++            {"multiple_targets", true},
 +            {"guards", {
 +                {"exclusive_execution", true},
 +                {"prompt_cache_reuse", false},
 +                {"n_cmpl_max", 1},
++                {"steered_slot_kv_reuse", false},
 +                {"default_control_vector_restore", true},
-+                {"activation_map_layer_ids", "0-based L0-L(n-1), mapped internally to llama.cpp cvec layers 1-n"},
++                {"activation_map_layer_ids", "0-based L0-L(n-1), applied directly to resid_pre tensor coordinates"},
 +            }},
 +        }},
 +        {"steering", {
@@ -932,10 +1509,10 @@ index ca91449d2..128541718 100644
  void server_routes::init_routes() {
      // IMPORTANT: all lambda functions must start with create_response()
      // this is to ensure that the server_res_generator can handle sleeping case correctly
-@@ -4857,6 +5588,281 @@ void server_routes::init_routes() {
+@@ -4857,6 +5639,281 @@ void server_routes::init_routes() {
          return res;
      };
-
+ 
 +    this->get_glass_skull_info = [this](const server_http_req &) {
 +        auto res = create_response(true);
 +
@@ -1214,7 +1791,7 @@ index ca91449d2..128541718 100644
      this->post_tokenize = [this](const server_http_req & req) {
          auto res = create_response();
          const json body = json::parse(req.body);
-@@ -5074,9 +6080,14 @@ json server_routes::get_model_info() const {
+@@ -5074,9 +6131,14 @@ json server_routes::get_model_info() const {
          {"meta",     {
              {"vocab_type",  meta->model_vocab_type},
              {"n_vocab",     meta->model_vocab_n_tokens},
@@ -1266,7 +1843,7 @@ index a87e4e423..661502c97 100644
 @@ -1630,6 +1630,17 @@ void server_models_routes::init_routes() {
          return models.proxy_request(req, method, name, true); // update last usage for POST request only
      };
-
+ 
 +    this->proxy_delete = [this](const server_http_req & req) {
 +        std::string method = "DELETE";
 +        std::string name = req.get_param("model");
@@ -1294,13 +1871,13 @@ index 9ed4aeead..41f275c71 100644
      server_http_context::handler_t post_router_models_load;
      server_http_context::handler_t post_router_models_unload;
 diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
-index ed4bda241..01d869b89 100644
+index ed4bda241..8af3985c1 100644
 --- a/tools/server/server-schema.cpp
 +++ b/tools/server/server-schema.cpp
-@@ -2,8 +2,276 @@
-
+@@ -2,8 +2,277 @@
+ 
  #include "json-schema-to-grammar.h"
-
+ 
 +#include <algorithm>
 +#include <cctype>
 +#include <cmath>
@@ -1309,7 +1886,7 @@ index ed4bda241..01d869b89 100644
 +#include <utility>
 +
  namespace server_schema {
-
+ 
 +static std::string trim_copy(const std::string & value) {
 +    size_t first = 0;
 +    while (first < value.size() && std::isspace(static_cast<unsigned char>(value[first]))) {
@@ -1508,9 +2085,10 @@ index ed4bda241..01d869b89 100644
 +        std::set<std::string> & seen,
 +        task_params::direct_activation_steering_target target) {
 +    const std::string key = target.node_id + ":" + std::to_string(target.node_start) + "-" + std::to_string(target.node_end);
-+    if (seen.insert(key).second) {
-+        targets.push_back(std::move(target));
++    if (!seen.insert(key).second) {
++        throw std::invalid_argument("glass_skull.direct_activation_steering contains duplicate target " + target.node_id);
 +    }
++    targets.push_back(std::move(target));
 +}
 +
 +static void parse_glass_skull_direct_activation_steering(task_params & params, const json & data) {
@@ -1574,10 +2152,10 @@ index ed4bda241..01d869b89 100644
  //
  // llama.cpp-specific completion schema
  //
-@@ -522,8 +790,19 @@ task_params eval_llama_cmpl_schema(
+@@ -522,8 +791,19 @@ task_params eval_llama_cmpl_schema(
          f->eval(ctx, data);
      }
-
+ 
 +    parse_glass_skull_steering(params, data);
 +    parse_glass_skull_direct_activation_steering(params, data);
 +
@@ -1595,22 +2173,22 @@ index ed4bda241..01d869b89 100644
              // note: should be the slot's context and not the full context, but it's ok
              params.sampling.penalty_last_n = n_ctx_slot;
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index a9ebac013..cecf98810 100644
+index a9ebac013..4b8f681bb 100644
 --- a/tools/server/server-task.cpp
 +++ b/tools/server/server-task.cpp
 @@ -10,6 +10,8 @@
  #include "speculative.h"
  #include "server-common.h"
-
+ 
 +#include <cmath>
 +
  using json = nlohmann::ordered_json;
-
+ 
  //
-@@ -27,6 +29,19 @@ json task_params::format_logit_bias(const std::vector<llama_logit_bias> & logit_
+@@ -27,6 +29,42 @@ json task_params::format_logit_bias(const std::vector<llama_logit_bias> & logit_
      return data;
  }
-
+ 
 +static json direct_activation_targets_to_json(const std::vector<task_params::direct_activation_steering_target> & targets) {
 +    json data = json::array();
 +    for (const auto & target : targets) {
@@ -1624,19 +2202,42 @@ index a9ebac013..cecf98810 100644
 +    return data;
 +}
 +
++static json direct_activation_hook_to_json(const task_params::direct_activation_steering_params & steering) {
++    json events = json::array();
++    for (const auto & hit : steering.hook_hits) {
++        events.push_back({
++            {"task_id", hit.task_id},
++            {"layer", hit.layer},
++            {"node_start", hit.node_start},
++            {"node_end", hit.node_end},
++            {"token_index", hit.token_index},
++            {"token_phase", hit.token_phase},
++            {"signed_delta", hit.signed_delta},
++            {"hit_count", hit.hit_count},
++        });
++    }
++
++    return {
++        {"mechanism", "hook_level_activation_delta"},
++        {"activation_space", "resid_pre"},
++        {"total_hit_count", steering.hook_total_hit_count},
++        {"events", std::move(events)},
++    };
++}
++
  json task_params::to_json(bool only_metrics) const {
      std::vector<std::string> samplers;
      samplers.reserve(sampling.samplers.size());
-@@ -40,7 +55,7 @@ json task_params::to_json(bool only_metrics) const {
+@@ -40,7 +78,7 @@ json task_params::to_json(bool only_metrics) const {
      }
-
+ 
      if (only_metrics) {
 -        return json {
 +        json res = {
              {"seed",                      sampling.seed},
              {"temperature",               sampling.temp},
              {"dynatemp_range",            sampling.dynatemp_range},
-@@ -82,6 +97,24 @@ json task_params::to_json(bool only_metrics) const {
+@@ -82,6 +120,27 @@ json task_params::to_json(bool only_metrics) const {
              {"backend_sampling",          sampling.backend_sampling},
              {"lora",                      lora},
          };
@@ -1656,21 +2257,24 @@ index a9ebac013..cecf98810 100644
 +                {"strength", direct_activation_steering.strength},
 +                {"token_scope", direct_activation_steering.token_scope},
 +            };
++            if (direct_activation_steering.hook_total_hit_count > 0 || !direct_activation_steering.hook_hits.empty()) {
++                res["glass_skull.direct_activation_steering"]["hook"] = direct_activation_hook_to_json(direct_activation_steering);
++            }
 +        }
 +        return res;
      }
-
+ 
      auto grammar_triggers = json::array();
-@@ -90,7 +123,7 @@ json task_params::to_json(bool only_metrics) const {
+@@ -90,7 +149,7 @@ json task_params::to_json(bool only_metrics) const {
          grammar_triggers.push_back(ct.to_json());
      }
-
+ 
 -    return json {
 +    json res = {
          {"seed",                      sampling.seed},
          {"temperature",               sampling.temp},
          {"dynatemp_range",            sampling.dynatemp_range},
-@@ -139,6 +172,28 @@ json task_params::to_json(bool only_metrics) const {
+@@ -139,6 +198,31 @@ json task_params::to_json(bool only_metrics) const {
          {"backend_sampling",          sampling.backend_sampling},
          {"lora",                      lora},
      };
@@ -1691,18 +2295,21 @@ index a9ebac013..cecf98810 100644
 +            {"strength", direct_activation_steering.strength},
 +            {"token_scope", direct_activation_steering.token_scope},
 +        };
++        if (direct_activation_steering.hook_total_hit_count > 0 || !direct_activation_steering.hook_hits.empty()) {
++            glass_skull["direct_activation_steering"]["hook"] = direct_activation_hook_to_json(direct_activation_steering);
++        }
 +    }
 +    if (!glass_skull.empty()) {
 +        res["glass_skull"] = glass_skull;
 +    }
 +    return res;
  }
-
+ 
  //
-@@ -1487,6 +1542,47 @@ json server_task_result_rerank::to_json() {
+@@ -1487,6 +1571,47 @@ json server_task_result_rerank::to_json() {
      };
  }
-
+ 
 +//
 +// server_task_result_glass_trace
 +//
@@ -1748,7 +2355,7 @@ index a9ebac013..cecf98810 100644
  // server_task_result_error
  //
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 293bdf053..2f3a5912d 100644
+index 293bdf053..b65122ea8 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
 @@ -7,6 +7,8 @@
@@ -1757,7 +2364,7 @@ index 293bdf053..2f3a5912d 100644
  #include <map>
 +#include <utility>
 +#include <vector>
-
+ 
  // TODO: prevent including the whole server-common.h as we only use server_tokens
  #include "server-common.h"
 @@ -27,6 +29,10 @@ enum server_task_type {
@@ -1769,12 +2376,12 @@ index 293bdf053..2f3a5912d 100644
 +    SERVER_TASK_TYPE_GLASS_STEERING_SET,
 +    SERVER_TASK_TYPE_GLASS_STEERING_CLEAR,
  };
-
+ 
  // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
-@@ -67,6 +73,39 @@ struct task_params {
-
+@@ -67,6 +73,52 @@ struct task_params {
+ 
      std::map<int, float> lora; // mapping adapter ID -> scale
-
+ 
 +    struct request_steering_params {
 +        bool enabled = false;
 +        std::string control_vector;
@@ -1793,11 +2400,24 @@ index 293bdf053..2f3a5912d 100644
 +    };
 +
 +    struct direct_activation_steering_params {
++        struct hook_hit {
++            int32_t task_id = -1;
++            int32_t layer = -1;
++            int32_t node_start = -1;
++            int32_t node_end = -1;
++            int32_t token_index = -1;
++            std::string token_phase;
++            float signed_delta = 0.0f;
++            int32_t hit_count = 0;
++        };
++
 +        bool enabled = false;
 +        std::vector<direct_activation_steering_target> targets;
 +        std::string direction = "toward";
 +        float strength = 0.0f;
 +        std::string token_scope = "all";
++        std::vector<hook_hit> hook_hits;
++        int32_t hook_total_hit_count = 0;
 +    };
 +    direct_activation_steering_params direct_activation_steering;
 +
@@ -1810,9 +2430,9 @@ index 293bdf053..2f3a5912d 100644
 +
      std::vector<std::string> antiprompt;
      std::vector<std::string> response_fields;
-
-@@ -97,6 +136,10 @@ struct task_params {
-
+ 
+@@ -97,6 +149,10 @@ struct task_params {
+ 
      json format_logit_bias(const std::vector<llama_logit_bias> & logit_bias) const;
      json to_json(bool only_metrics = false) const;
 +
@@ -1820,21 +2440,21 @@ index 293bdf053..2f3a5912d 100644
 +        return steering.enabled || direct_activation_steering.enabled;
 +    }
  };
-
+ 
  // struct for tracking the state of a task (e.g., for streaming)
-@@ -172,6 +215,8 @@ struct server_task {
+@@ -172,6 +228,8 @@ struct server_task {
      // used by SERVER_TASK_TYPE_SET_LORA
      std::map<int, float> set_lora; // mapping adapter ID -> scale
-
+ 
 +    task_params::request_steering_params glass_steering;
 +
      server_task() = default;
-
+ 
      server_task(server_task_type type) : type(type) {}
-@@ -238,6 +283,11 @@ struct server_task {
+@@ -238,6 +296,11 @@ struct server_task {
              copy.params.sampling.seed += (uint32_t)child_tasks.size() + 1;
          }
-
+ 
 +        // cvec state is context-global in llama.cpp. Keep per-request steering
 +        // single-output until the scheduler has independent per-slot cvec state.
 +        copy.params.steering.enabled = false;
@@ -1842,11 +2462,11 @@ index 293bdf053..2f3a5912d 100644
 +
          child_tasks.push_back(std::move(copy));
      }
-
-@@ -490,6 +540,25 @@ struct server_task_result_rerank : server_task_result {
+ 
+@@ -490,6 +553,25 @@ struct server_task_result_rerank : server_task_result {
      virtual json to_json() override;
  };
-
+ 
 +struct glass_trace_layer_input {
 +    int32_t layer = -1;
 +    std::string stream;
@@ -1869,10 +2489,10 @@ index 293bdf053..2f3a5912d 100644
  struct server_task_result_error : server_task_result {
      error_type err_type = ERROR_TYPE_SERVER;
      std::string err_msg;
-@@ -565,6 +634,14 @@ struct server_task_result_control : server_task_result {
+@@ -565,6 +647,14 @@ struct server_task_result_control : server_task_result {
      }
  };
-
+ 
 +struct server_task_result_json : server_task_result {
 +    json data;
 +
@@ -1914,10 +2534,10 @@ index dd4b1c507..b04d8ccdf 100644
      ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
 diff --git a/tools/server/tests/unit/test_glass_skull.py b/tools/server/tests/unit/test_glass_skull.py
 new file mode 100644
-index 000000000..ee7c87c9f
+index 000000000..862ccfdfc
 --- /dev/null
 +++ b/tools/server/tests/unit/test_glass_skull.py
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,303 @@
 +import math
 +
 +import pytest
@@ -2030,8 +2650,19 @@ index 000000000..ee7c87c9f
 +    assert info.status_code == 200
 +    direct = info.body["capabilities"]["direct_activation_steering"]
 +    assert direct["supported"] is True
++    assert direct["mechanism"] == "hook_level_activation_delta"
 +    assert direct["contract"]["request"] == "glass_skull.direct_activation_steering"
 +    assert direct["contract"]["openai_compatible_alternate"] == "metadata.glass_skull.direct_activation_steering"
++    assert direct["map_identity"] == {
++        "node_id_format": "L<layer>-N<node>",
++        "layer_base": 0,
++        "activation_space": "same tensor used by Activation Map",
++        "tensor_stream": "resid_pre",
++        "node_axis": "embedding/channel dimension",
++        "node_range": "inclusive",
++    }
++    assert direct["token_scope"] == {"all": True, "prompt": True, "generated": True}
++    assert direct["multiple_targets"] is True
 +
 +    res = server.make_request("POST", "/completion", data={
 +        "prompt": "hello",
@@ -2057,6 +2688,7 @@ index 000000000..ee7c87c9f
 +    assert parsed["direction"] == "away"
 +    assert parsed["token_scope"] == "generated"
 +    assert [target["node_id"] for target in parsed["targets"]] == ["L0-N0", "L0-N1"]
++    assert "hook" not in parsed
 +
 +
 +def test_glass_skull_direct_activation_steering_metadata_alternate_and_validation():
@@ -2099,3 +2731,113 @@ index 000000000..ee7c87c9f
 +    })
 +    assert res.status_code == 400
 +    assert "Malformed activation node ID" in res.body["error"]["message"]
++
++    duplicate = server.make_request("POST", "/completion", data={
++        "prompt": "hello",
++        "n_predict": 0,
++        "glass_skull": {
++            "direct_activation_steering": {
++                "enabled": True,
++                "targets": "L0-N0,L0-N0",
++                "direction": "Toward",
++                "strength": 0.4,
++                "token_scope": "all",
++            },
++        },
++    })
++    assert duplicate.status_code == 400
++    assert "duplicate" in duplicate.body["error"]["message"].lower()
++
++
++def _direct_hook_events(response_body):
++    parsed = response_body["generation_settings"]["glass_skull"]["direct_activation_steering"]
++    hook = parsed["hook"]
++    assert hook["mechanism"] == "hook_level_activation_delta"
++    assert hook["activation_space"] == "resid_pre"
++    assert hook["total_hit_count"] > 0
++    assert hook["events"]
++    return hook["events"]
++
++
++def test_glass_skull_direct_activation_steering_hook_hits_prompt_scope_exact_node():
++    global server
++    server.start()
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": "hello world",
++        "n_predict": 1,
++        "verbose": True,
++        "glass_skull": {
++            "direct_activation_steering": {
++                "enabled": True,
++                "targets": [{"node_id": "L0-N0", "node_range": [0, 0]}],
++                "direction": "Toward",
++                "strength": 0.4,
++                "token_scope": "prompt",
++            },
++        },
++    })
++    assert res.status_code == 200
++    events = _direct_hook_events(res.body)
++    assert {event["layer"] for event in events} == {0}
++    assert {event["node_start"] for event in events} == {0}
++    assert {event["node_end"] for event in events} == {0}
++    assert {event["token_phase"] for event in events} == {"prompt"}
++    assert {event["signed_delta"] for event in events} == {0.4}
++    assert all(event["token_index"] < res.body["tokens_evaluated"] for event in events)
++
++
++def test_glass_skull_direct_activation_steering_hook_hits_generated_scope_and_ranges():
++    global server
++    server.start()
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": "hello",
++        "n_predict": 2,
++        "verbose": True,
++        "glass_skull": {
++            "direct_activation_steering": {
++                "enabled": True,
++                "targets": [
++                    {"node_id": "L0-N0", "node_range": [0, 1]},
++                    {"node_id": "L1-N2", "node_range": [2, 2]},
++                ],
++                "direction": "Away",
++                "strength": 0.25,
++                "token_scope": "generated",
++            },
++        },
++    })
++    assert res.status_code == 200
++    events = _direct_hook_events(res.body)
++    assert {event["token_phase"] for event in events} == {"generated"}
++    assert all(event["token_index"] >= res.body["tokens_evaluated"] for event in events)
++    assert {
++        (event["layer"], event["node_start"], event["node_end"], event["signed_delta"])
++        for event in events
++    } == {(0, 0, 1, -0.25), (1, 2, 2, -0.25)}
++    assert all(event["layer"] != 2 for event in events)
++    assert all(not (event["layer"] == 0 and event["node_start"] <= 2 <= event["node_end"]) for event in events)
++
++
++def test_glass_skull_direct_activation_steering_disabled_records_no_hook_hits():
++    global server
++    server.start()
++
++    res = server.make_request("POST", "/completion", data={
++        "prompt": "hello",
++        "n_predict": 1,
++        "verbose": True,
++        "glass_skull": {
++            "direct_activation_steering": {
++                "enabled": False,
++                "targets": "not-a-node",
++                "direction": "Sideways",
++                "strength": 0.25,
++                "token_scope": "middle",
++            },
++        },
++    })
++    assert res.status_code == 200
++    settings = res.body["generation_settings"]
++    assert "glass_skull" not in settings or "direct_activation_steering" not in settings.get("glass_skull", {})

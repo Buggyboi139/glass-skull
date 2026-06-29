@@ -276,6 +276,36 @@ def _contract_mentions_direct_activation(section: dict[str, Any]) -> bool:
     return "glass_skull.direct_activation_steering" in text or "direct_activation_steering" in text
 
 
+def _direct_activation_hook_contract_supported(section: dict[str, Any]) -> bool:
+    if section.get("supported") is not True:
+        return False
+    if section.get("mechanism") != "hook_level_activation_delta":
+        return False
+    if not _contract_mentions_direct_activation(section):
+        return False
+
+    map_identity = section.get("map_identity")
+    if not isinstance(map_identity, dict):
+        return False
+    required_identity = {
+        "node_id_format": "L<layer>-N<node>",
+        "layer_base": 0,
+        "activation_space": "same tensor used by Activation Map",
+        "node_axis": "embedding/channel dimension",
+    }
+    for key, expected in required_identity.items():
+        if map_identity.get(key) != expected:
+            return False
+
+    token_scope = section.get("token_scope")
+    if not isinstance(token_scope, dict):
+        return False
+    if not all(token_scope.get(scope) is True for scope in ("all", "prompt", "generated")):
+        return False
+
+    return section.get("multiple_targets") is True
+
+
 def direct_activation_steering_status(glass_info: dict[str, Any] | None) -> dict[str, str]:
     if not isinstance(glass_info, dict) or not glass_info:
         return {
@@ -309,16 +339,21 @@ def direct_activation_steering_status(glass_info: dict[str, Any] | None) -> dict
             candidates.append((per_request, False))
 
     for section, _direct_named in candidates:
-        if section.get("supported") is True and _contract_mentions_direct_activation(section):
+        if _direct_activation_hook_contract_supported(section):
             return {
                 "status": "supported",
-                "label": "Supported",
-                "message": "This llama.cpp server advertises direct activation steering.",
+                "label": "Hook-level Supported",
+                "message": "This llama.cpp server advertises hook-level direct activation steering for Activation Map node IDs.",
             }
 
     for section, direct_named in candidates:
         if direct_named or _contract_mentions_direct_activation(section):
-            reason = str(section.get("reason") or "Direct activation steering is advertised but not fully supported.")
+            if section.get("mechanism") and section.get("mechanism") != "hook_level_activation_delta":
+                reason = "Direct activation steering is advertised but its mechanism is not hook-level activation delta."
+            elif section.get("supported") is True and _contract_mentions_direct_activation(section):
+                reason = "Direct activation steering is advertised but not hook-level surgical support."
+            else:
+                reason = str(section.get("reason") or "Direct activation steering is advertised but not fully supported.")
             return {"status": "partial", "label": "Partial", "message": reason}
 
     if per_request_steering_supported(glass_info):

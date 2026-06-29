@@ -49,7 +49,7 @@ def parse_activation_node_ids(raw: str | Iterable[Any]) -> list[dict[str, Any]]:
     for part in parts:
         target = _parse_node_id(part)
         if target["node_id"] in seen:
-            continue
+            raise ValueError(f"Duplicate activation node ID {target['node_id']!r}.")
         seen.add(target["node_id"])
         targets.append(target)
     return targets
@@ -80,7 +80,7 @@ def _coerce_targets(targets: str | Iterable[Any]) -> list[dict[str, Any]]:
         else:
             merged = _parse_node_id(item)
         if merged["node_id"] in seen:
-            continue
+            raise ValueError(f"Duplicate activation node ID {merged['node_id']!r}.")
         seen.add(merged["node_id"])
         resolved.append(merged)
     if not resolved:
