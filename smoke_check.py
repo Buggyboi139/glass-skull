@@ -26,6 +26,7 @@ from glass_skull.config import (
     CONTROL_VECTOR_DIR,
     DEFAULT_BATCH_MESSAGES,
     DEFAULT_GGUF_MODEL_PATH,
+    TOOLTIP_DIR,
     ensure_dirs,
     seed_missing_defaults,
 )
@@ -85,8 +86,10 @@ from glass_skull.visuals import (
 )
 from glass_skull.workspaces import (
     apply_workspace_state,
+    apply_tab_state,
     clear_tab_state,
     clear_workspace,
+    collect_tab_state,
     load_tab_state,
     load_workspace,
     save_tab_state,
@@ -94,6 +97,7 @@ from glass_skull.workspaces import (
     save_workspace,
     save_workspace_as,
 )
+from glass_skull.tooltip_generator import ensure_tooltips, tooltip_text
 
 
 def _write_fake_gguf(path: Path) -> None:
@@ -402,7 +406,10 @@ def _assert_model_layer_contracts(summary: dict, local_meta: dict) -> None:
             "resolve_trace_layers",
             "resolve_trace_plan",
             "model_identity_diagnostics",
+            "clear_model_dependent_state",
             "invalidate_model_dependent_state",
+            "invalidate_if_model_backend_changed",
+            "model_backend_snapshot",
         },
         namespace,
     )
@@ -460,6 +467,24 @@ def _assert_model_layer_contracts(summary: dict, local_meta: dict) -> None:
     assert state["last_batch_result"] is None
     assert state["map_selected_token"] is None
     assert state["modelArtifactsInvalidated"] is True
+    same_model_new_url_state = _SessionState(
+        activeModelFingerprint="/models/gemma-4-31b.gguf|gemma-live",
+        llama_model_path="/models/gemma-4-31b.gguf",
+        llama_model_alias="gemma-live",
+        llama_url="http://old",
+        llama_glass_url="http://old-glass",
+        last_behavior_artifact={"run_id": "stale"},
+        last_behavior_scores="old",
+        local_dashboard_trace={"old": True},
+        map_selected_batch="batch-0",
+    )
+    before = funcs["model_backend_snapshot"](same_model_new_url_state)
+    same_model_new_url_state["llama_url"] = "http://new"
+    assert funcs["invalidate_if_model_backend_changed"](same_model_new_url_state, before) is True
+    assert same_model_new_url_state["activeModelFingerprint"] == "/models/gemma-4-31b.gguf|gemma-live"
+    assert same_model_new_url_state["last_behavior_artifact"] is None
+    assert same_model_new_url_state["local_dashboard_trace"] is None
+    assert same_model_new_url_state["map_selected_batch"] is None
     namespace["st"] = types.SimpleNamespace(session_state=_SessionState(modelArtifactsInvalidated=True))
     namespace["latest_saved_behavior_artifact"] = lambda: {"run_id": "old_saved_model"}
     funcs = _load_main_functions({"latest_behavior_artifact"}, namespace)
@@ -652,6 +677,9 @@ def _assert_workspace_round_trip() -> None:
 
     clear_workspace(state)
     assert state["active_run_id"] is None
+    assert state["active_run_mode"] == "Single message"
+    assert state["batch_pasted_prompts"] == DEFAULT_BATCH_MESSAGES
+    assert state["llama_model_path"] == str(DEFAULT_GGUF_MODEL_PATH)
     assert state["last_behavior_artifact"] is None
     assert state["tab_state"] == {}
     assert saved.path.exists()
@@ -674,8 +702,68 @@ def _assert_workspace_round_trip() -> None:
     assert tab_state["global_marker"] == "keep"
     assert tab_state["tab_state"]["Map"] == {}
     assert tab_state["tab_state"]["Run"] == {"draft": "keep"}
+
+    app_state = {
+        "llama_control_strength": 0.5,
+        "llama_control_layer_start": 2,
+        "llama_control_layer_end": 6,
+        "llama_control_port": 8099,
+        "llama_control_extra_args": "--jinja",
+        "tab_state": {"Steer": {"workspace_name": "old"}},
+    }
+    steer_state = collect_tab_state("Steer", app_state)
+    assert steer_state["llama_control_strength"] == 0.5
+    apply_tab_state(app_state, "Steer", {"llama_control_strength": 1.75, "llama_control_layer_end": 12})
+    assert app_state["llama_control_strength"] == 1.75
+    assert app_state["llama_control_layer_end"] == 12
+    clear_tab_state(app_state, "Steer")
+    assert app_state["llama_control_strength"] == 1.25
+    assert app_state["llama_control_layer_start"] == 1
+    assert app_state["tab_state"]["Steer"] == {}
+    settings_state = {
+        "llama_model_alias": "changed",
+        "llama_model_path": "/tmp/changed.gguf",
+        "llama_url": "http://127.0.0.1:9999",
+        "llama_glass_url": "http://127.0.0.1:9998",
+        "llama_control_strength": 9.0,
+        "tab_state": {"Settings": {"workspace_name": "old"}},
+    }
+    clear_tab_state(settings_state, "Settings")
+    assert settings_state["llama_model_alias"] == "local"
+    assert settings_state["llama_model_path"] == str(DEFAULT_GGUF_MODEL_PATH)
+    assert settings_state["llama_control_strength"] == 9.0
+    assert settings_state["tab_state"]["Settings"] == {}
     for path in [saved.path, renamed.path, corrupt_path, tab_saved.path, run_tab_saved.path]:
         path.unlink(missing_ok=True)
+
+
+def _assert_steer_tooltips() -> None:
+    metadata = [
+        {
+            "control_id": "smoke_control",
+            "title": "Smoke control",
+            "control_type": "slider",
+            "typical_values": "1 to 3",
+            "use": "Use this in smoke tests.",
+            "downside": "Bad values make the smoke test fail.",
+        }
+    ]
+    path = TOOLTIP_DIR / "smoke_tooltips.json"
+    if path.exists():
+        path.unlink()
+    tooltips = ensure_tooltips("smoke", metadata)
+    assert path.exists()
+    assert "smoke_control" in tooltips
+    first_text = path.read_text(encoding="utf-8")
+    tooltips["smoke_control"]["explanation"] = "Approved local edit."
+    path.write_text(json.dumps(tooltips, indent=2), encoding="utf-8")
+    reused = ensure_tooltips("smoke", metadata)
+    assert reused["smoke_control"]["explanation"] == "Approved local edit."
+    assert path.read_text(encoding="utf-8") != first_text
+    rendered = tooltip_text(reused["smoke_control"])
+    assert "Smoke control" in rendered
+    assert "Approved local edit." in rendered
+    path.unlink(missing_ok=True)
 
 
 def _assert_node_annotation_round_trip() -> None:
@@ -982,6 +1070,18 @@ def main() -> None:
     assert '"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES' in main_source
     assert 'key="batch_pasted_prompts"' in main_source
     assert '"batch_pasted_prompts"' in Path("glass_skull/workspaces.py").read_text()
+    assert "with tabs[\"Settings\"]" in main_source
+    run_app_source = main_source.split("def run_app() -> None:", 1)[1]
+    settings_section = run_app_source.split('with tabs["Settings"]:', 1)[1]
+    before_settings = run_app_source.split('with tabs["Settings"]:', 1)[0]
+    assert "render_global_workspace_controls()" in settings_section
+    assert "render_global_workspace_controls()" not in before_settings
+    assert "apply_tab_state(st.session_state, tab_name, result.state)" in main_source
+    assert "collect_tab_state(tab_name, st.session_state, state)" in main_source
+    assert "repeat_prompt=prompt" not in main_source
+    assert "repeat_prompt=prompt or repeat" not in main_source
+    assert "ensure_tooltips(\"steer\", STEER_CONTROL_METADATA)" in main_source
+    assert "help=steer_help(" in main_source
     assert "seed_missing_defaults(st.session_state, defaults)" in main_source
     assert "persist_single_run_artifact(artifact)" in main_source
     assert "latest_saved_behavior_artifact()" in main_source
@@ -1006,6 +1106,8 @@ def main() -> None:
     assert [p.label for p in labeled] == ["x", "unlabeled"]
     batch = batch_items_from_inputs(pasted_payload="pasted", repeat_prompt="again", repeat_count=2, uploaded_items=labeled)
     assert len(batch) == 5
+    pasted_only_batch = batch_items_from_inputs(pasted_payload="pasted", repeat_prompt="", repeat_count=1, uploaded_items=[])
+    assert [item.prompt for item in pasted_only_batch] == ["pasted"]
     user_batch_state = {"batch_pasted_prompts": "custom\ncontent"}
     original_user_batch = dict(user_batch_state)
     seed_missing_defaults(user_batch_state, {"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES})
@@ -1020,6 +1122,7 @@ def main() -> None:
     assert dashboard_context("Batch run", "abc") == {"mode": "Batch run", "run_id": "abc"}
     assert new_run_id("unit").startswith("unit_")
     _assert_workspace_round_trip()
+    _assert_steer_tooltips()
     _assert_node_annotation_round_trip()
 
     dummy_backend_patch = {"recipe": {"name": "smoke patch", "target_run_id": "run1", "patches": []}, "source_vectors": []}

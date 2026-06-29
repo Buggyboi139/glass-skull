@@ -6,10 +6,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, MutableMapping
 
-from .config import GLOBAL_WORKSPACE_DIR, TAB_WORKSPACE_DIR
+from .config import DEFAULT_BATCH_MESSAGES, DEFAULT_GGUF_MODEL_PATH, GLOBAL_WORKSPACE_DIR, TAB_WORKSPACE_DIR
 from .experiment_store import safe_slug
+from .llama_paths import DEFAULT_CVECTOR_GENERATOR, DEFAULT_LLAMA_SERVER
 from .node_annotations import annotation_file_metadata
 
+
+DEFAULT_CHAT_BACKEND_LABEL = "Local GGUF normal (llama.cpp)"
 
 GLOBAL_STATE_KEYS = [
     "active_run_id",
@@ -45,9 +48,25 @@ GLOBAL_STATE_KEYS = [
 ]
 
 GLOBAL_CLEAR_DEFAULTS: dict[str, Any] = {
+    "chat_messages": [],
+    "chat_backend_label": DEFAULT_CHAT_BACKEND_LABEL,
     "active_run_id": None,
+    "active_run_mode": "Single message",
     "last_run_id": None,
     "last_output": "",
+    "llama_model_alias": "local",
+    "llama_model_path": str(DEFAULT_GGUF_MODEL_PATH),
+    "llama_url": "http://127.0.0.1:8080",
+    "llama_glass_url": "http://127.0.0.1:8088",
+    "llama_server_bin": str(DEFAULT_LLAMA_SERVER),
+    "llama_cvector_generator": str(DEFAULT_CVECTOR_GENERATOR),
+    "llama_control_set": "",
+    "llama_control_vector": "",
+    "llama_control_strength": 1.25,
+    "llama_control_layer_start": 1,
+    "llama_control_layer_end": 32,
+    "llama_control_port": 8088,
+    "llama_control_extra_args": "--jinja --flash-attn auto",
     "local_dashboard_trace": None,
     "local_dashboard_trace_meta": {},
     "local_dashboard_trace_counter": 0,
@@ -56,12 +75,151 @@ GLOBAL_CLEAR_DEFAULTS: dict[str, Any] = {
     "last_behavior_artifact": None,
     "last_behavior_scores": None,
     "behavior_run_history": [],
+    "behavior_profile": "concise_helpfulness",
+    "batch_pasted_prompts": DEFAULT_BATCH_MESSAGES,
+    "batch_running": False,
+    "batch_status": "",
     "loaded_activation_patch_recipe": None,
     "last_activation_patch_comparison": None,
     "tab_state": {},
+    "workspace_name": "default",
+    "workspace_save_as_name": "",
+    "workspace_error": "",
+    "workspace_warning": "",
+    "map_visualization_mode": "",
     "map_selected_prompt": None,
     "map_selected_batch": None,
     "map_selected_token": None,
+    "map_top_k": 8,
+    "map_background_opacity": 0.24,
+    "map_edge_threshold": 0.0,
+    "map_show_aggregate_heatmap": False,
+    "map_show_secondary_branches": True,
+    "map_annotation_selected_group": "",
+    "map_annotation_new_tag": "",
+    "map_annotation_note": "",
+    "map_annotation_status": "",
+}
+
+TAB_STATE_KEYS: dict[str, list[str]] = {
+    "Run": [
+        "active_run_mode",
+        "chat_backend_label",
+        "batch_pasted_prompts",
+    ],
+    "Map": [
+        "behavior_profile",
+        "map_visualization_mode",
+        "map_selected_prompt",
+        "map_selected_batch",
+        "map_selected_token",
+        "map_top_k",
+        "map_background_opacity",
+        "map_edge_threshold",
+        "map_show_aggregate_heatmap",
+        "map_show_secondary_branches",
+        "map_annotation_selected_group",
+    ],
+    "Steer": [
+        "llama_control_set",
+        "llama_control_vector",
+        "llama_control_strength",
+        "llama_control_layer_start",
+        "llama_control_layer_end",
+        "llama_control_port",
+        "llama_control_extra_args",
+        "loaded_activation_patch_recipe",
+        "last_activation_patch_comparison",
+        "patch_source_run",
+        "patch_target_run",
+        "patch_layer",
+        "patch_token_start",
+        "patch_token_end",
+        "patch_mode",
+        "patch_node_start",
+        "patch_node_end",
+        "patch_strength",
+        "patch_recipe_load",
+    ],
+    "Timeline": [
+        "behavior_profile",
+    ],
+    "Model": [
+        "llama_model_alias",
+        "llama_model_path",
+        "llama_url",
+        "llama_glass_url",
+    ],
+    "Settings": [
+        "llama_model_alias",
+        "llama_model_path",
+        "llama_url",
+        "llama_glass_url",
+        "llama_server_bin",
+        "llama_cvector_generator",
+        "llama_control_port",
+        "llama_control_extra_args",
+    ],
+}
+
+MODEL_AND_SETTINGS_CLEAR_DEFAULTS: dict[str, Any] = {
+    "llama_model_alias": "local",
+    "llama_model_path": str(DEFAULT_GGUF_MODEL_PATH),
+    "llama_url": "http://127.0.0.1:8080",
+    "llama_glass_url": "http://127.0.0.1:8088",
+    "llama_server_bin": str(DEFAULT_LLAMA_SERVER),
+    "llama_cvector_generator": str(DEFAULT_CVECTOR_GENERATOR),
+    "llama_control_port": 8088,
+    "llama_control_extra_args": "--jinja --flash-attn auto",
+}
+
+TAB_CLEAR_DEFAULTS: dict[str, dict[str, Any]] = {
+    "Run": {
+        "active_run_mode": "Single message",
+        "batch_pasted_prompts": DEFAULT_BATCH_MESSAGES,
+    },
+    "Map": {
+        "map_visualization_mode": "",
+        "map_selected_prompt": None,
+        "map_selected_batch": None,
+        "map_selected_token": None,
+        "map_top_k": 8,
+        "map_background_opacity": 0.24,
+        "map_edge_threshold": 0.0,
+        "map_show_aggregate_heatmap": False,
+        "map_show_secondary_branches": True,
+        "map_annotation_selected_group": "",
+    },
+    "Steer": {
+        "llama_control_set": "",
+        "llama_control_vector": "",
+        "llama_control_strength": 1.25,
+        "llama_control_layer_start": 1,
+        "llama_control_layer_end": 32,
+        "llama_control_port": 8088,
+        "llama_control_extra_args": "--jinja --flash-attn auto",
+        "loaded_activation_patch_recipe": None,
+        "last_activation_patch_comparison": None,
+        "patch_source_run": None,
+        "patch_target_run": None,
+        "patch_layer": None,
+        "patch_token_start": 0,
+        "patch_token_end": 0,
+        "patch_mode": "blend",
+        "patch_node_start": "",
+        "patch_node_end": "",
+        "patch_strength": 0.35,
+        "patch_recipe_load": "",
+    },
+    "Timeline": {
+        "behavior_profile": "concise_helpfulness",
+    },
+    "Model": {
+        key: value
+        for key, value in MODEL_AND_SETTINGS_CLEAR_DEFAULTS.items()
+        if key in {"llama_model_alias", "llama_model_path", "llama_url", "llama_glass_url"}
+    },
+    "Settings": MODEL_AND_SETTINGS_CLEAR_DEFAULTS,
 }
 
 
@@ -258,6 +416,30 @@ def clear_workspace(state: MutableMapping[str, Any]) -> None:
         state[key] = _jsonable(value)
 
 
+def collect_tab_state(
+    tab_name: str,
+    app_state: MutableMapping[str, Any],
+    local_state: MutableMapping[str, Any] | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    collected = dict(local_state or {})
+    for key in TAB_STATE_KEYS.get(tab_name, []):
+        if key in app_state:
+            collected[key] = _jsonable(app_state.get(key))
+    return _jsonable(collected)
+
+
+def apply_tab_state(app_state: MutableMapping[str, Any], tab_name: str, state: dict[str, Any]) -> None:
+    allowed = set(TAB_STATE_KEYS.get(tab_name, []))
+    for key, value in state.items():
+        if key in allowed:
+            app_state[key] = value
+    tabs = app_state.get("tab_state")
+    if not isinstance(tabs, dict):
+        tabs = {}
+        app_state["tab_state"] = tabs
+    tabs[tab_name] = dict(state)
+
+
 def save_tab_state(tab_name: str, state: MutableMapping[str, Any] | dict[str, Any] | None = None, name: str | None = None) -> WorkspaceResult:
     tab_state = dict(state or {})
     current_names = tab_state.get("current_tab_workspace_names") if isinstance(tab_state.get("current_tab_workspace_names"), dict) else {}
@@ -299,6 +481,8 @@ def load_tab_state(tab_name: str, name: str) -> WorkspaceResult:
 
 
 def clear_tab_state(state: MutableMapping[str, Any], tab_name: str) -> None:
+    for key, value in TAB_CLEAR_DEFAULTS.get(tab_name, {}).items():
+        state[key] = _jsonable(value)
     tabs = state.get("tab_state")
     if not isinstance(tabs, dict):
         tabs = {}

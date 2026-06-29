@@ -59,7 +59,6 @@ from glass_skull.llama_control import (
 from glass_skull.logger import log_run, recent_runs
 from glass_skull.model_context import local_gguf_context
 from glass_skull.path_mapping import rank_activation_paths, recommended_steering_targets
-from glass_skull.prompt_loader import load_prompt_file_bytes
 from glass_skull.run_artifacts import (
     activation_path_df,
     batch_heatmap_df,
@@ -71,6 +70,7 @@ from glass_skull.run_artifacts import (
     trace_unavailable_row,
 )
 from glass_skull.ui_local import LOCAL_TABS, batch_items_from_inputs, dashboard_context, new_run_id
+from glass_skull.tooltip_generator import STEER_CONTROL_METADATA, ensure_tooltips, tooltip_text
 from glass_skull.visuals import (
     activation_path_graph,
     batch_activation_heatmap,
@@ -82,9 +82,11 @@ from glass_skull.visuals import (
     path_rank_bar_fig,
 )
 from glass_skull.workspaces import (
+    apply_tab_state,
     apply_workspace_state,
     clear_tab_state,
     clear_workspace,
+    collect_tab_state,
     list_tab_states,
     list_workspaces,
     load_tab_state,
@@ -369,6 +371,11 @@ def _set_status(result, *, scope: str) -> None:
         st.session_state[f"{scope}_warning"] = ""
 
 
+def steer_help(control_id: str, tooltips: dict | None = None) -> str | None:
+    entries = tooltips if isinstance(tooltips, dict) else ensure_tooltips("steer", STEER_CONTROL_METADATA)
+    return tooltip_text(entries.get(control_id))
+
+
 def render_global_workspace_controls() -> None:
     st.caption("Workspace")
     workspaces = list_workspaces()
@@ -421,21 +428,22 @@ def render_tab_workspace_controls(tab_name: str) -> None:
     load_key = f"{tab_key}_tab_load_name"
     save_as_key = f"{tab_key}_tab_save_as_name"
     error_key = f"{tab_key}_tab_error"
+    help_for = (lambda control_id: steer_help(control_id)) if tab_name == "Steer" else (lambda control_id: None)
     st.caption(f"{tab_name} state")
     cols = st.columns([1, 1, 1, 1, 1.4])
     with cols[0]:
-        if st.button("Save", key=f"{tab_key}_tab_save", width="stretch"):
-            result = save_tab_state(tab_name, state, name=state.get("workspace_name"))
+        if st.button("Save", key=f"{tab_key}_tab_save", width="stretch", help=help_for(f"{tab_key}_tab_save")):
+            result = save_tab_state(tab_name, collect_tab_state(tab_name, st.session_state, state), name=state.get("workspace_name"))
             state["workspace_name"] = result.name
             st.session_state[error_key] = result.error or result.warning or ""
             st.rerun()
     with cols[1]:
-        if st.button("Save As", key=f"{tab_key}_tab_save_as", width="stretch"):
+        if st.button("Save As", key=f"{tab_key}_tab_save_as", width="stretch", help=help_for(f"{tab_key}_tab_save_as")):
             name = str(st.session_state.get(save_as_key, "")).strip()
             if not name:
                 st.session_state[error_key] = "Save As requires a tab state name."
             else:
-                result = save_tab_state_as(tab_name, state, name)
+                result = save_tab_state_as(tab_name, collect_tab_state(tab_name, st.session_state, state), name)
                 state["workspace_name"] = result.name
                 st.session_state[error_key] = result.error or result.warning or ""
                 st.rerun()
@@ -445,21 +453,26 @@ def render_tab_workspace_controls(tab_name: str) -> None:
             saved or [state.get("workspace_name") or "default"],
             key=load_key,
             label_visibility="collapsed",
+            help=help_for(f"{tab_key}_tab_load_name"),
         )
-        if st.button("Load", key=f"{tab_key}_tab_load", width="stretch"):
+        if st.button("Load", key=f"{tab_key}_tab_load", width="stretch", help=help_for(f"{tab_key}_tab_load")):
             result = load_tab_state(tab_name, str(selected))
             st.session_state[error_key] = result.error or result.warning or ""
             if not result.error and not result.warning:
-                st.session_state.tab_state[tab_name] = result.state
+                model_backend_before = model_backend_snapshot(st.session_state)
+                apply_tab_state(st.session_state, tab_name, result.state)
                 st.session_state.tab_state[tab_name]["workspace_name"] = result.name
                 st.session_state[f"{tab_key}_tab_pending_state"] = result.state
+                invalidate_if_model_backend_changed(st.session_state, model_backend_before)
                 st.rerun()
     with cols[3]:
-        if st.button("Clear", key=f"{tab_key}_tab_clear", width="stretch"):
+        if st.button("Clear", key=f"{tab_key}_tab_clear", width="stretch", help=help_for(f"{tab_key}_tab_clear")):
+            model_backend_before = model_backend_snapshot(st.session_state)
             clear_tab_state(st.session_state, tab_name)
+            invalidate_if_model_backend_changed(st.session_state, model_backend_before)
             st.rerun()
     with cols[4]:
-        st.text_input("Save As tab name", key=save_as_key, label_visibility="collapsed", placeholder="tab state name")
+        st.text_input("Save As tab name", key=save_as_key, label_visibility="collapsed", placeholder="tab state name", help=help_for(f"{tab_key}_tab_save_as_name"))
     if st.session_state.get(error_key):
         st.warning(st.session_state[error_key])
 
@@ -670,12 +683,8 @@ def resolve_trace_layers(base_url: str, model_alias: str | None, summary: dict |
     return resolve_trace_plan(base_url, model_alias, summary)["layers"]
 
 
-def invalidate_model_dependent_state(state, model_path: str | None, model_alias: str | None) -> bool:
-    fingerprint = f"{str(model_path or '').strip()}|{str(model_alias or '').strip()}"
-    if state.get("activeModelFingerprint") == fingerprint:
-        return False
-    state["activeModelFingerprint"] = fingerprint
-    for key, value in {
+def clear_model_dependent_state(state) -> None:
+    clear_values = {
         "llama_status": None,
         "llama_glass_status": None,
         "local_dashboard_trace": None,
@@ -683,14 +692,47 @@ def invalidate_model_dependent_state(state, model_path: str | None, model_alias:
         "last_batch_result": None,
         "last_fuzz_result": None,
         "last_behavior_artifact": None,
-        "last_behavior_scores": pd.DataFrame(),
+        "last_behavior_scores": pd.DataFrame,
         "map_selected_prompt": None,
         "map_selected_batch": None,
         "map_selected_token": None,
         "map_annotation_selected_group": "",
-    }.items():
-        state[key] = value
+    }
+    for key, value in clear_values.items():
+        state[key] = value() if callable(value) else value
     state["modelArtifactsInvalidated"] = True
+
+
+def model_backend_snapshot(state) -> tuple[str, str, str, str]:
+    keys = (
+        "llama_model_path",
+        "llama_model_alias",
+        "llama_url",
+        "llama_glass_url",
+    )
+    return tuple(str(state.get(key) or "").strip() for key in keys)
+
+
+def invalidate_model_dependent_state(state, model_path: str | None, model_alias: str | None) -> bool:
+    fingerprint = f"{str(model_path or '').strip()}|{str(model_alias or '').strip()}"
+    if state.get("activeModelFingerprint") == fingerprint:
+        return False
+    state["activeModelFingerprint"] = fingerprint
+    clear_model_dependent_state(state)
+    return True
+
+
+def invalidate_if_model_backend_changed(state, before: tuple[str, str, str, str]) -> bool:
+    after = model_backend_snapshot(state)
+    if after == before:
+        return False
+    changed = invalidate_model_dependent_state(
+        state,
+        state.get("llama_model_path", ""),
+        state.get("llama_model_alias", ""),
+    )
+    if not changed:
+        clear_model_dependent_state(state)
     return True
 
 
@@ -883,32 +925,36 @@ def parse_layer_list(raw: str, max_layer: int) -> list[int]:
     return sorted(layers)
 
 
-def render_control_panel(local_context: dict | None) -> None:
+def render_control_panel(local_context: dict | None, steer_tooltips: dict | None = None) -> None:
     ui.section_header("Local control vectors", "Generate and launch llama.cpp control-vector runs.")
     control_sets = list_control_sets()
     control_vectors = list_control_vectors()
 
     c1, c2 = st.columns(2)
     with c1:
+        control_set_names = [""] + [str(item.get("name", "")) for item in control_sets]
+        current_control_set = st.session_state.get("llama_control_set", "")
         st.session_state.llama_control_set = st.selectbox(
             "Control set",
-            [""] + [str(item.get("name", "")) for item in control_sets],
-            index=0,
-            help="Positive and negative prompts stored under data/control_sets.",
+            control_set_names,
+            index=control_set_names.index(current_control_set) if current_control_set in control_set_names else 0,
+            help=steer_help("control_set", steer_tooltips),
         )
     with c2:
+        control_vector_names = [""] + [str(item.get("name", "")) for item in control_vectors]
+        current_control_vector = st.session_state.get("llama_control_vector", "")
         st.session_state.llama_control_vector = st.selectbox(
             "Control vector",
-            [""] + [str(item.get("name", "")) for item in control_vectors],
-            index=0,
-            help="Generated GGUF vectors stored under data/control_vectors.",
+            control_vector_names,
+            index=control_vector_names.index(current_control_vector) if current_control_vector in control_vector_names else 0,
+            help=steer_help("control_vector", steer_tooltips),
         )
 
     with st.expander("Create control set", expanded=False):
-        set_name = st.text_input("Set name", value="local_behavior")
-        pos = st.text_area("Positive prompts", height=120)
-        neg = st.text_area("Negative prompts", height=120)
-        if st.button("Save control set", width="stretch"):
+        set_name = st.text_input("Set name", value="local_behavior", help=steer_help("set_name", steer_tooltips))
+        pos = st.text_area("Positive prompts", height=120, help=steer_help("positive_prompts", steer_tooltips))
+        neg = st.text_area("Negative prompts", height=120, help=steer_help("negative_prompts", steer_tooltips))
+        if st.button("Save control set", width="stretch", help=steer_help("save_control_set", steer_tooltips)):
             positive = [line.strip() for line in pos.splitlines() if line.strip()]
             negative = [line.strip() for line in neg.splitlines() if line.strip()]
             if positive and negative:
@@ -920,11 +966,11 @@ def render_control_panel(local_context: dict | None) -> None:
 
     p1, p2, p3 = st.columns(3)
     with p1:
-        st.session_state.llama_control_strength = st.number_input("Strength", value=float(st.session_state.llama_control_strength), step=0.25)
+        st.session_state.llama_control_strength = st.number_input("Strength", value=float(st.session_state.llama_control_strength), step=0.25, help=steer_help("strength", steer_tooltips))
     with p2:
-        st.session_state.llama_control_layer_start = st.number_input("Layer start", min_value=1, value=int(st.session_state.llama_control_layer_start))
+        st.session_state.llama_control_layer_start = st.number_input("Layer start", min_value=1, value=int(st.session_state.llama_control_layer_start), help=steer_help("layer_start", steer_tooltips))
     with p3:
-        st.session_state.llama_control_layer_end = st.number_input("Layer end", min_value=1, value=int(st.session_state.llama_control_layer_end))
+        st.session_state.llama_control_layer_end = st.number_input("Layer end", min_value=1, value=int(st.session_state.llama_control_layer_end), help=steer_help("layer_end", steer_tooltips))
 
     preflight = preflight_control_vector_run(
         st.session_state.llama_model_path,
@@ -944,7 +990,7 @@ def render_control_panel(local_context: dict | None) -> None:
     if st.session_state.llama_control_set:
         selected = next((item for item in control_sets if item.get("name") == st.session_state.llama_control_set), None)
         if selected:
-            vector_name = st.text_input("Vector name", value=selected.name)
+            vector_name = st.text_input("Vector name", value=selected.name, help=steer_help("vector_name", steer_tooltips))
             command = build_cvector_command(
                 st.session_state.llama_model_path,
                 selected["positive_path"],
@@ -953,7 +999,7 @@ def render_control_panel(local_context: dict | None) -> None:
                 st.session_state.llama_cvector_generator,
             )
             st.code(shell_join(command), language="bash")
-            if st.button("Generate vector", type="primary", width="stretch"):
+            if st.button("Generate vector", type="primary", width="stretch", help=steer_help("generate_vector", steer_tooltips)):
                 try:
                     meta = generate_control_vector(
                         vector_name,
@@ -984,7 +1030,7 @@ def render_control_panel(local_context: dict | None) -> None:
         st.code(shell_join(cmd), language="bash")
 
 
-def render_activation_patch_panel(chat_backend: str, max_new_tokens: int, temperature: float) -> None:
+def render_activation_patch_panel(chat_backend: str, max_new_tokens: int, temperature: float, steer_tooltips: dict | None = None) -> None:
     ui.section_header("Activation Patch", "Capture local trace activations, save recipes, and compare patched llama.cpp runs.")
     artifact_options = saved_behavior_artifact_options()
     if not artifact_options:
@@ -997,9 +1043,9 @@ def render_activation_patch_panel(chat_backend: str, max_new_tokens: int, temper
     ]
     c1, c2 = st.columns(2)
     with c1:
-        source_label = st.selectbox("Source run", option_labels, key="patch_source_run")
+        source_label = st.selectbox("Source run", option_labels, key="patch_source_run", help=steer_help("patch_source_run", steer_tooltips))
     with c2:
-        target_label = st.selectbox("Target/current run", option_labels, index=0, key="patch_target_run")
+        target_label = st.selectbox("Target/current run", option_labels, index=0, key="patch_target_run", help=steer_help("patch_target_run", steer_tooltips))
 
     source_row = artifact_options[option_labels.index(source_label)]
     target_row = artifact_options[option_labels.index(target_label)]
@@ -1015,29 +1061,29 @@ def render_activation_patch_panel(chat_backend: str, max_new_tokens: int, temper
 
     p1, p2, p3, p4 = st.columns(4)
     with p1:
-        layer = st.selectbox("Layer", layer_values, key="patch_layer")
+        layer = st.selectbox("Layer", layer_values, key="patch_layer", help=steer_help("patch_layer", steer_tooltips))
     with p2:
-        token_start = st.number_input("Token start", min_value=0, value=0, step=1, key="patch_token_start")
+        token_start = st.number_input("Token start", min_value=0, value=0, step=1, key="patch_token_start", help=steer_help("patch_token_start", steer_tooltips))
     with p3:
-        token_end = st.number_input("Token end", min_value=0, value=max(int(token_start), 0), step=1, key="patch_token_end")
+        token_end = st.number_input("Token end", min_value=0, value=max(int(token_start), 0), step=1, key="patch_token_end", help=steer_help("patch_token_end", steer_tooltips))
     with p4:
-        mode = st.selectbox("Patch mode", ["replace", "add_delta", "scale", "zero", "blend"], index=4, key="patch_mode")
+        mode = st.selectbox("Patch mode", ["replace", "add_delta", "scale", "zero", "blend"], index=4, key="patch_mode", help=steer_help("patch_mode", steer_tooltips))
 
     n1, n2, n3 = st.columns(3)
     with n1:
-        node_start_raw = st.text_input("Node/channel start", value="", key="patch_node_start")
+        node_start_raw = st.text_input("Node/channel start", value="", key="patch_node_start", help=steer_help("patch_node_start", steer_tooltips))
     with n2:
-        node_end_raw = st.text_input("Node/channel end", value="", key="patch_node_end")
+        node_end_raw = st.text_input("Node/channel end", value="", key="patch_node_end", help=steer_help("patch_node_end", steer_tooltips))
     with n3:
-        strength = st.slider("Strength", 0.0, 2.0, 0.35, 0.05, key="patch_strength")
+        strength = st.slider("Strength", 0.0, 2.0, 0.35, 0.05, key="patch_strength", help=steer_help("patch_strength", steer_tooltips))
 
     prompt_default = ""
     for prompt_run in target_artifact.get("prompts", []):
         if prompt_run.get("prompt"):
             prompt_default = str(prompt_run["prompt"])
             break
-    target_prompt = st.text_area("Target prompt", value=prompt_default or DEFAULT_CHAT_INPUT, height=90)
-    recipe_name = st.text_input("Recipe name", value=f"patch-{source_artifact.get('run_id', 'source')}-layer-{layer}")
+    target_prompt = st.text_area("Target prompt", value=prompt_default or DEFAULT_CHAT_INPUT, height=90, help=steer_help("patch_target_prompt", steer_tooltips))
+    recipe_name = st.text_input("Recipe name", value=f"patch-{source_artifact.get('run_id', 'source')}-layer-{layer}", help=steer_help("patch_recipe_name", steer_tooltips))
 
     def optional_int(raw: str) -> int | None:
         raw = raw.strip()
@@ -1072,13 +1118,13 @@ def render_activation_patch_panel(chat_backend: str, max_new_tokens: int, temper
 
     recipe_cols = st.columns(3)
     with recipe_cols[0]:
-        if st.button("Save patch recipe", width="stretch", disabled=bool(validation_errors)):
+        if st.button("Save patch recipe", width="stretch", disabled=bool(validation_errors), help=steer_help("save_patch_recipe", steer_tooltips)):
             path = save_activation_patch_recipe(recipe, recipe_name)
             st.success(f"Saved {path.name}")
     with recipe_cols[1]:
         recipes = list_activation_patch_recipes()
         recipe_labels = [str(item.get("name")) for item in recipes]
-        selected_recipe = st.selectbox("Load recipe", [""] + recipe_labels, key="patch_recipe_load")
+        selected_recipe = st.selectbox("Load recipe", [""] + recipe_labels, key="patch_recipe_load", help=steer_help("patch_recipe_load", steer_tooltips))
         if selected_recipe:
             recipe_row = recipes[recipe_labels.index(selected_recipe)]
             st.session_state.loaded_activation_patch_recipe = load_activation_patch_recipe(str(recipe_row["path"]))
@@ -1107,9 +1153,9 @@ def render_activation_patch_panel(chat_backend: str, max_new_tokens: int, temper
 
     action_cols = st.columns(2)
     with action_cols[0]:
-        run_patched = st.button("Run patched generation", type="primary", width="stretch", disabled=bool(validation_errors))
+        run_patched = st.button("Run patched generation", type="primary", width="stretch", disabled=bool(validation_errors), help=steer_help("run_patched_generation", steer_tooltips))
     with action_cols[1]:
-        run_compare = st.button("Compare patched vs baseline", width="stretch", disabled=bool(validation_errors))
+        run_compare = st.button("Compare patched vs baseline", width="stretch", disabled=bool(validation_errors), help=steer_help("compare_patched_vs_baseline", steer_tooltips))
 
     if run_patched or run_compare:
         baseline = ""
@@ -1174,6 +1220,7 @@ def run_app() -> None:
         active_backend,
     )
     summary = local_summary(local_context)
+    steer_tooltips = ensure_tooltips("steer", STEER_CONTROL_METADATA)
 
     trace_active = st.session_state.get("local_dashboard_trace") is not None
     ui.hud(
@@ -1188,8 +1235,6 @@ def run_app() -> None:
             ui.pill("Glass server", ui.server_status_color(st.session_state.llama_glass_status)),
         ]),
     )
-    render_global_workspace_controls()
-
     tabs = dict(zip(LOCAL_TABS, st.tabs(LOCAL_TABS)))
 
     with tabs["Run"]:
@@ -1224,20 +1269,12 @@ def run_app() -> None:
             st.warning(steering_error)
 
         if mode == "Batch run":
-            uploaded = st.file_uploader("Batch prompt file", type=["txt", "jsonl", "csv"])
-            uploaded_items = []
-            if uploaded is not None:
-                uploaded_items = load_prompt_file_bytes(uploaded.name, uploaded.getvalue())
-                st.caption(f"Loaded {len(uploaded_items)} prompts.")
             pasted = st.text_area("Pasted prompts", height=120, key="batch_pasted_prompts")
-            repeat = st.text_input("Repeat current prompt", value="")
-            repeat_count = st.number_input("Repeat count", 1, 1000, 1)
+            run_batch = st.button("Run batch", type="primary", width="stretch")
             _tab_state("Run")["batch_pasted_prompts"] = st.session_state.batch_pasted_prompts
         else:
-            uploaded_items = []
             pasted = ""
-            repeat = ""
-            repeat_count = 1
+            run_batch = False
 
         chat_box = st.container(height=420, border=True)
         with chat_box:
@@ -1249,7 +1286,7 @@ def run_app() -> None:
                     if msg.get("ts"):
                         st.caption(msg["ts"])
 
-        prompt = seeded_chat_input()
+        prompt = seeded_chat_input() if mode == "Single message" else None
         col_a, col_b = st.columns(2)
         with col_a:
             if st.button("New chat", width="stretch"):
@@ -1336,12 +1373,12 @@ def run_app() -> None:
             log_run(active_model_label(), "chat_generate", prompt, output=output, metadata={"backend": chat_backend, "run_id": run_id, "error": error})
             st.rerun()
 
-        if prompt and mode == "Batch run":
+        if run_batch and mode == "Batch run":
             prompt_items = batch_items_from_inputs(
                 pasted_payload=pasted,
-                repeat_prompt=prompt or repeat,
-                repeat_count=int(repeat_count),
-                uploaded_items=uploaded_items,
+                repeat_prompt="",
+                repeat_count=1,
+                uploaded_items=[],
             )
             if not prompt_items:
                 st.warning("Batch run needs at least one prompt.")
@@ -1554,9 +1591,9 @@ def run_app() -> None:
 
     with tabs["Steer"]:
         render_tab_workspace_controls("Steer")
-        render_control_panel(local_context)
+        render_control_panel(local_context, steer_tooltips)
         st.markdown("---")
-        render_activation_patch_panel(chat_backend, max_new_tokens, temperature)
+        render_activation_patch_panel(chat_backend, max_new_tokens, temperature, steer_tooltips)
 
     with tabs["Timeline"]:
         ui.section_header("Timeline", "Behavior scores and saved local run history.")
@@ -1599,6 +1636,7 @@ def run_app() -> None:
     with tabs["Settings"]:
         ui.section_header("Settings", "Local llama.cpp paths and URLs.")
         render_tab_workspace_controls("Settings")
+        render_global_workspace_controls()
         next_model_alias = st.text_input("Model alias", value=st.session_state.llama_model_alias).strip()
         next_model_path = st.text_input("GGUF model path", value=st.session_state.llama_model_path)
         if next_model_alias != st.session_state.llama_model_alias or next_model_path != st.session_state.llama_model_path:

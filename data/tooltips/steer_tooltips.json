@@ -1,0 +1,226 @@
+{
+  "compare_patched_vs_baseline": {
+    "control_id": "compare_patched_vs_baseline",
+    "explanation": "Compare patched vs baseline is a button in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Current target prompt and active patch recipe. Use it to run a baseline and patched output for side-by-side comparison.",
+    "title": "Compare patched vs baseline",
+    "warning_if_any": "It performs two generations, so runtime and model variance both increase."
+  },
+  "control_set": {
+    "control_id": "control_set",
+    "explanation": "Control set is a dropdown in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Blank, or a saved positive/negative prompt set. Use it to choose prompts for generating a new control vector.",
+    "title": "Control set",
+    "warning_if_any": "A weak or mismatched control set can produce a vector that steers unrelated behavior."
+  },
+  "control_vector": {
+    "control_id": "control_vector",
+    "explanation": "Control vector is a dropdown in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Blank, or a generated GGUF control vector. Use it to select the vector applied to a steered llama.cpp run.",
+    "title": "Control vector",
+    "warning_if_any": "Vectors from another model or layer layout may fail or steer unpredictably."
+  },
+  "generate_vector": {
+    "control_id": "generate_vector",
+    "explanation": "Generate vector is a button in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: The selected control set and current GGUF model. Use it to run the repo-managed cvector generator and create a new vector.",
+    "title": "Generate vector",
+    "warning_if_any": "Generation can take time and fails if the managed llama.cpp tools are missing."
+  },
+  "layer_end": {
+    "control_id": "layer_end",
+    "explanation": "Layer end is a number input in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: A later layer index such as 16 to 32. Use it to choose the last transformer layer receiving the control vector.",
+    "title": "Layer end",
+    "warning_if_any": "A range outside the loaded model's layers will fail in llama.cpp."
+  },
+  "layer_start": {
+    "control_id": "layer_start",
+    "explanation": "Layer start is a number input in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Early positive layer index, default 1. Use it to choose the first transformer layer receiving the control vector.",
+    "title": "Layer start",
+    "warning_if_any": "Starting too early can create broad, hard-to-debug changes."
+  },
+  "negative_prompts": {
+    "control_id": "negative_prompts",
+    "explanation": "Negative prompts is a text area in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Several examples of the behavior you want less of. Use it to define the contrast direction for the control vector.",
+    "title": "Negative prompts",
+    "warning_if_any": "If negatives differ in topic instead of behavior, the vector can steer topic rather than style."
+  },
+  "patch_layer": {
+    "control_id": "patch_layer",
+    "explanation": "Patch layer is a dropdown in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Any layer captured in the source trace. Use it to choose which layer's activation slice the patch modifies.",
+    "title": "Patch layer",
+    "warning_if_any": "Layer effects vary by model; a layer that works for one behavior may do little for another."
+  },
+  "patch_mode": {
+    "control_id": "patch_mode",
+    "explanation": "Patch mode is a dropdown in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: blend, replace, add_delta, scale, or zero. Use it to choose how source activations modify target activations.",
+    "title": "Patch mode",
+    "warning_if_any": "Replace and zero are strong interventions and can produce brittle outputs."
+  },
+  "patch_node_end": {
+    "control_id": "patch_node_end",
+    "explanation": "Node/channel end is a text input in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Blank for all channels, or an index after the start. Use it to close the channel range for a targeted patch.",
+    "title": "Node/channel end",
+    "warning_if_any": "Invalid ranges are rejected and overly wide ranges can obscure causality."
+  },
+  "patch_node_start": {
+    "control_id": "patch_node_start",
+    "explanation": "Node/channel start is a text input in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Blank for all channels, or a zero-based channel index. Use it to limit the patch to a specific activation channel range.",
+    "title": "Node/channel start",
+    "warning_if_any": "Narrow ranges are easier to inspect but may miss distributed behavior."
+  },
+  "patch_recipe_load": {
+    "control_id": "patch_recipe_load",
+    "explanation": "Load recipe is a dropdown in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Any saved activation patch recipe. Use it to activate a saved patch recipe for the next patched generation.",
+    "title": "Load recipe",
+    "warning_if_any": "A recipe built from old runs may not match the current source artifact."
+  },
+  "patch_recipe_name": {
+    "control_id": "patch_recipe_name",
+    "explanation": "Recipe name is a text input in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Names that include source run and layer. Use it to name the saved activation patch recipe.",
+    "title": "Recipe name",
+    "warning_if_any": "Reusing a name can replace an earlier recipe."
+  },
+  "patch_source_run": {
+    "control_id": "patch_source_run",
+    "explanation": "Source run is a dropdown in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: A saved single-message or batch run with trace rows. Use it to choose where activation values are copied or transformed from.",
+    "title": "Source run",
+    "warning_if_any": "Runs without captured activations cannot produce useful patch targets."
+  },
+  "patch_strength": {
+    "control_id": "patch_strength",
+    "explanation": "Patch strength is a slider in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: 0.0 to 2.0; default 0.35. Use it to scale the patch effect for blend, delta, and scale modes.",
+    "title": "Patch strength",
+    "warning_if_any": "Large values can destabilize generation or make comparisons less interpretable."
+  },
+  "patch_target_prompt": {
+    "control_id": "patch_target_prompt",
+    "explanation": "Target prompt is a text area in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: The prompt to run with the patch. Use it to edit the generation prompt for patched and comparison runs.",
+    "title": "Target prompt",
+    "warning_if_any": "Changing it after choosing runs can make the baseline comparison less direct."
+  },
+  "patch_target_run": {
+    "control_id": "patch_target_run",
+    "explanation": "Target/current run is a dropdown in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: A saved run you want to compare against or patch. Use it to provide the target prompt and baseline context for patch comparison.",
+    "title": "Target/current run",
+    "warning_if_any": "Using an unrelated target run can make comparisons misleading."
+  },
+  "patch_token_end": {
+    "control_id": "patch_token_end",
+    "explanation": "Token end is a number input in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: A token index at or after Token start. Use it to choose the final token in the activation patch span.",
+    "title": "Token end",
+    "warning_if_any": "Large spans can make the intervention harder to attribute."
+  },
+  "patch_token_start": {
+    "control_id": "patch_token_start",
+    "explanation": "Token start is a number input in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Zero-based token index. Use it to choose the first target token in the activation patch span.",
+    "title": "Token start",
+    "warning_if_any": "Choosing the wrong token span can patch irrelevant context."
+  },
+  "positive_prompts": {
+    "control_id": "positive_prompts",
+    "explanation": "Positive prompts is a text area in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Several examples of the behavior you want more of. Use it to define the direction the control vector should encourage.",
+    "title": "Positive prompts",
+    "warning_if_any": "Too few or inconsistent examples make the generated vector noisy."
+  },
+  "run_patched_generation": {
+    "control_id": "run_patched_generation",
+    "explanation": "Run patched generation is a button in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Current target prompt and active patch recipe. Use it to send one patched request to the local llama.cpp server.",
+    "title": "Run patched generation",
+    "warning_if_any": "It requires server-side activation patch support."
+  },
+  "save_control_set": {
+    "control_id": "save_control_set",
+    "explanation": "Save control set is a button in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Positive and negative prompt lists. Use it to write the control set under data/control_sets.",
+    "title": "Save control set",
+    "warning_if_any": "Both prompt lists are required; empty lists are rejected."
+  },
+  "save_patch_recipe": {
+    "control_id": "save_patch_recipe",
+    "explanation": "Save patch recipe is a button in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: The currently valid patch settings. Use it to store the patch recipe under data/activation_patch_recipes.",
+    "title": "Save patch recipe",
+    "warning_if_any": "Invalid recipes cannot be saved and saved recipes do not include source trace files."
+  },
+  "set_name": {
+    "control_id": "set_name",
+    "explanation": "Set name is a text input in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Short names such as concise_helpfulness. Use it to name the saved positive/negative prompt set.",
+    "title": "Set name",
+    "warning_if_any": "Reusing a name can replace the previous control set files."
+  },
+  "steer_tab_clear": {
+    "control_id": "steer_tab_clear",
+    "explanation": "Clear Steer state is a button in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Built-in Steer defaults. Use it to reset only the Steer tab controls to defaults.",
+    "title": "Clear Steer state",
+    "warning_if_any": "It does not delete saved tab states, but unsaved Steer edits are discarded."
+  },
+  "steer_tab_load": {
+    "control_id": "steer_tab_load",
+    "explanation": "Load Steer state is a button in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Any saved Steer tab state. Use it to restore only Steer controls from the selected tab state.",
+    "title": "Load Steer state",
+    "warning_if_any": "Other tabs and the global workspace are not changed."
+  },
+  "steer_tab_load_name": {
+    "control_id": "steer_tab_load_name",
+    "explanation": "Load Steer state selector is a dropdown in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Any saved Steer tab state. Use it before pressing Load to choose which local Steer settings to restore.",
+    "title": "Load Steer state selector",
+    "warning_if_any": "Loading replaces only Steer tab settings, so unsaved Steer edits are lost."
+  },
+  "steer_tab_save": {
+    "control_id": "steer_tab_save",
+    "explanation": "Save Steer state is a button in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Current Steer tab state name. Use it to overwrite the selected Steer tab state with the current controls.",
+    "title": "Save Steer state",
+    "warning_if_any": "It overwrites that tab state; use Save As when you need a new copy."
+  },
+  "steer_tab_save_as": {
+    "control_id": "steer_tab_save_as",
+    "explanation": "Save Steer state as is a button in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: A short local name. Use it to create a separate saved Steer tab state.",
+    "title": "Save Steer state as",
+    "warning_if_any": "Reusing a name replaces the existing saved Steer state with that name."
+  },
+  "steer_tab_save_as_name": {
+    "control_id": "steer_tab_save_as_name",
+    "explanation": "Steer Save As name is a text input in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Names such as baseline_steer or high_strength_test. Use it to name the next Steer Save As target.",
+    "title": "Steer Save As name",
+    "warning_if_any": "Names are normalized for filesystem safety, so punctuation may become underscores."
+  },
+  "strength": {
+    "control_id": "strength",
+    "explanation": "Strength is a number input in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: Around 0.5 to 2.0; default 1.25. Increase it for stronger steering or reduce it for subtler behavior changes.",
+    "title": "Strength",
+    "warning_if_any": "High strength can degrade coherence or overpower the base model."
+  },
+  "vector_name": {
+    "control_id": "vector_name",
+    "explanation": "Vector name is a text input in the Steer workflow. Changing it updates how local steering or activation patching is configured.",
+    "practical_use": "Typical values: A short name matching the control set. Use it to name the generated GGUF control vector file.",
+    "title": "Vector name",
+    "warning_if_any": "Reusing a name can replace the previous vector metadata and file."
+  }
+}

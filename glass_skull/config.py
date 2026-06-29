@@ -16,6 +16,7 @@ ACTIVATION_PATCH_RECIPE_DIR = DATA_DIR / "activation_patch_recipes"
 WORKSPACE_DIR = DATA_DIR / "workspaces"
 GLOBAL_WORKSPACE_DIR = WORKSPACE_DIR / "global"
 TAB_WORKSPACE_DIR = WORKSPACE_DIR / "tabs"
+TOOLTIP_DIR = DATA_DIR / "tooltips"
 NODE_ANNOTATION_DIR = DATA_DIR / "node_annotations"
 NODE_ANNOTATION_PATH = NODE_ANNOTATION_DIR / "annotations.json"
 DB_PATH = LOG_DIR / "glass_skull.db"
@@ -57,6 +58,7 @@ def ensure_dirs() -> None:
         ACTIVATION_PATCH_RECIPE_DIR,
         GLOBAL_WORKSPACE_DIR,
         TAB_WORKSPACE_DIR,
+        TOOLTIP_DIR,
         NODE_ANNOTATION_DIR,
     ]:
         path.mkdir(parents=True, exist_ok=True)
