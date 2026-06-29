@@ -379,7 +379,15 @@ def steer_help(control_id: str, tooltips: dict | None = None) -> str | None:
     return tooltip_text(entries.get(control_id))
 
 
-def mark_batch_prompts_user_set() -> None:
+def sync_batch_prompt_widget_state() -> None:
+    seed_batch_prompt_default(st.session_state)
+    current = st.session_state.get("batch_pasted_prompts", DEFAULT_BATCH_MESSAGES)
+    if st.session_state.get("batch_pasted_prompts_widget") != current:
+        st.session_state.batch_pasted_prompts_widget = current
+
+
+def update_batch_prompts_from_widget() -> None:
+    st.session_state.batch_pasted_prompts = st.session_state.get("batch_pasted_prompts_widget", "")
     st.session_state.batch_pasted_prompts_user_set = True
     st.session_state.batch_pasted_prompts_source = "user"
 
@@ -1277,7 +1285,9 @@ def run_app() -> None:
             st.warning(steering_error)
 
         if mode == "Batch run":
-            pasted = st.text_area("Pasted prompts", height=120, key="batch_pasted_prompts", on_change=mark_batch_prompts_user_set)
+            sync_batch_prompt_widget_state()
+            st.text_area("Pasted prompts", height=120, key="batch_pasted_prompts_widget", on_change=update_batch_prompts_from_widget)
+            pasted = st.session_state.batch_pasted_prompts
             run_batch = st.button("Run batch", type="primary", width="stretch")
             _tab_state("Run")["batch_pasted_prompts"] = st.session_state.batch_pasted_prompts
         else:

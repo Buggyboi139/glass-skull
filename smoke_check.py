@@ -1069,7 +1069,9 @@ def main() -> None:
     assert "`async` and `await`" in DEFAULT_BATCH_MESSAGES
     assert '"opportunity cost"' in DEFAULT_BATCH_MESSAGES
     assert '"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES' in main_source
-    assert 'key="batch_pasted_prompts"' in main_source
+    assert 'key="batch_pasted_prompts_widget"' in main_source
+    assert "sync_batch_prompt_widget_state()" in main_source
+    assert "update_batch_prompts_from_widget" in main_source
     assert '"batch_pasted_prompts"' in Path("glass_skull/workspaces.py").read_text()
     assert "with tabs[\"Settings\"]" in main_source
     run_app_source = main_source.split("def run_app() -> None:", 1)[1]
@@ -1140,6 +1142,27 @@ def main() -> None:
     assert loaded_empty_tab_state["batch_pasted_prompts"] == ""
     assert loaded_empty_tab_state["batch_pasted_prompts_user_set"] is True
     assert loaded_empty_tab_state["batch_pasted_prompts_source"] == "loaded"
+    widget_state = _SessionState(
+        batch_pasted_prompts="",
+        batch_pasted_prompts_user_set=True,
+        batch_pasted_prompts_widget="",
+    )
+    widget_namespace = {
+        "DEFAULT_BATCH_MESSAGES": DEFAULT_BATCH_MESSAGES,
+        "seed_batch_prompt_default": seed_batch_prompt_default,
+        "st": types.SimpleNamespace(session_state=widget_state),
+    }
+    widget_funcs = _load_main_functions(
+        {"sync_batch_prompt_widget_state", "update_batch_prompts_from_widget"},
+        widget_namespace,
+    )
+    widget_funcs["sync_batch_prompt_widget_state"]()
+    assert widget_state["batch_pasted_prompts"] == DEFAULT_BATCH_MESSAGES
+    assert widget_state["batch_pasted_prompts_widget"] == DEFAULT_BATCH_MESSAGES
+    widget_state["batch_pasted_prompts_widget"] = ""
+    widget_funcs["update_batch_prompts_from_widget"]()
+    assert widget_state["batch_pasted_prompts"] == ""
+    assert widget_state["batch_pasted_prompts_source"] == "user"
     assert dashboard_context("Batch run", "abc") == {"mode": "Batch run", "run_id": "abc"}
     assert new_run_id("unit").startswith("unit_")
     _assert_workspace_round_trip()
