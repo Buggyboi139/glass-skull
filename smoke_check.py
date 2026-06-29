@@ -1097,9 +1097,12 @@ def main() -> None:
     assert "layers=trace_layers" in main_source
     assert "active_recipe = validate_activation_patch_recipe(loaded_recipe)" in main_source
     assert "build_activation_patch_backend_payload(active_recipe" in main_source
+    assert "render_activation_map(payload, key=f\"activation_map_{artifact.get('run_id', 'latest')}\", height=1840)" in main_source
     render_source = inspect.getsource(activation_map_view.render_activation_map)
     assert "st.iframe" in render_source
     assert "components.html" not in render_source
+    assert inspect.signature(activation_map_view.activation_map_html).parameters["height"].default == 1920
+    assert inspect.signature(activation_map_view.render_activation_map).parameters["height"].default == 1920
     assert normalize_base_url("http://127.0.0.1:8080/v1") == "http://127.0.0.1:8080"
     assert safe_slug("../bad name") == "bad_name"
 
@@ -1303,6 +1306,9 @@ def main() -> None:
     assert all(edge["method"] != "cosine_similarity" for edge in payload["activationEdges"])
     assert all(edge["tokenIndex"] == payload["activationPaths"][0]["tokenIndex"] for edge in payload["activationEdges"])
     html = activation_map_html(payload)
+    assert 'class="gs-map-shell" style="height:1920px"' in html
+    assert "h = Math.max(480, rect.height * 0.32)" in html
+    assert "w = rect.width - 124, h = 300" in html
     assert "canvas" in html and "selectedDiagnostics" in html and "Activation path unavailable" not in html
     assert "function clamp(" in html
     assert "function withPanelClip(" in html
@@ -1493,6 +1499,51 @@ def main() -> None:
     legend_html = _legend_panel_html(batch_path_payload)
     assert "gs-prompt-legend-panel" in legend_html
     assert "width: 10px;" in legend_html
+    long_prompt = (
+        "alpha prompt with enough extra detail to reach the far edge of the prompt paths panel before truncation "
+        * 4
+    ).strip()
+    long_prompt_artifact = build_run_artifact(
+        run_id="long_prompt_paths",
+        mode="Batch run",
+        backend="llama.cpp",
+        model="local",
+        prompts=[
+            {
+                "prompt_id": 0,
+                "label": "a",
+                "prompt": long_prompt,
+                "output": "ok",
+                "trace_rows": normalize_llama_trace(
+                    {"layer_inputs": [
+                        {"layer": 0, "stream": "resid_pre", "token_index": 0, "activation_norm": 1.0, "top_dims": [{"dimension": 1, "activation": 1.0}]},
+                        {"layer": 1, "stream": "resid_pre", "token_index": 0, "activation_norm": 1.0, "top_dims": [{"dimension": 2, "activation": 1.0}]},
+                    ]},
+                    prompt_id=0,
+                    label="a",
+                    metadata={"run_id": "long_prompt_paths"},
+                ),
+            },
+            {
+                "prompt_id": 1,
+                "label": "b",
+                "prompt": "short comparison prompt",
+                "output": "ok",
+                "trace_rows": normalize_llama_trace(
+                    {"layer_inputs": [
+                        {"layer": 0, "stream": "resid_pre", "token_index": 0, "activation_norm": 1.0, "top_dims": [{"dimension": 3, "activation": 1.0}]},
+                        {"layer": 1, "stream": "resid_pre", "token_index": 0, "activation_norm": 1.0, "top_dims": [{"dimension": 4, "activation": 1.0}]},
+                    ]},
+                    prompt_id=1,
+                    label="b",
+                    metadata={"run_id": "long_prompt_paths"},
+                ),
+            },
+        ],
+    )
+    long_prompt_payload = build_activation_map_payload(long_prompt_artifact, summary, local_model_context=local_meta)
+    assert long_prompt_payload["promptLegendPanel"]["entries"][0]["label"] == long_prompt
+    assert long_prompt in _legend_panel_html(long_prompt_payload)
     legend_source = inspect.getsource(activation_map_view._legend_panel_html)
     assert '""" %' not in legend_source
     assert "% (" not in legend_source

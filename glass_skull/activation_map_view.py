@@ -12,7 +12,7 @@ def _json_script_payload(payload: dict[str, Any]) -> str:
     )
 
 
-def activation_map_html(payload: dict, height: int = 960) -> str:
+def activation_map_html(payload: dict, height: int = 1920) -> str:
     data = _json_script_payload(payload)
     return f"""
 <div class="gs-map-shell" style="height:{int(height)}px">
@@ -1167,7 +1167,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   }}
 
   function drawOverview(rect) {{
-    const x = 12, y = 104, w = rect.width - 24, h = Math.max(240, rect.height * 0.32);
+    const x = 12, y = 104, w = rect.width - 24, h = Math.max(480, rect.height * 0.32);
     panel(x, y, w, h);
     const layers = payload.layers || [];
     const edges = filteredEdges();
@@ -1202,7 +1202,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   }}
 
   function drawLayerPane(rect) {{
-    const x = 62, y = Math.max(360, rect.height * 0.45), w = rect.width - 124, h = 150;
+    const x = 62, y = Math.max(720, rect.height * 0.45), w = rect.width - 124, h = 300;
     panel(x, y, w, h);
     const layer = layerById(selected.layerId) || payload.layers?.[0] || null;
     const groups = (payload.nodeGroups || []).filter((g) => g.layerId === selected.layerId);
@@ -1219,7 +1219,7 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
   }}
 
   function drawDrilldownPane(rect) {{
-    const x = 62, y = Math.max(530, rect.height * 0.64), w = rect.width - 124, h = 150;
+    const x = 62, y = Math.max(1060, rect.height * 0.64), w = rect.width - 124, h = 300;
     panel(x, y, w, h);
     const drilldownBounds = {{ left: x + 18, right: x + w - 18, top: y + 42, bottom: y + h - 18 }};
     withPanelClip(drilldownBounds, () => {{
@@ -1371,6 +1371,8 @@ def _legend_panel_html(payload: dict) -> str:
     grid-template-columns: 14px minmax(32px, max-content) minmax(0, 1fr);
     align-items: center;
     gap: 8px;
+    width: 100%;
+    box-sizing: border-box;
     min-width: 0;
     padding: 5px 6px;
     border-radius: 6px;
@@ -1394,7 +1396,9 @@ def _legend_panel_html(payload: dict) -> str:
   .gs-prompt-legend-label,
   .gs-prompt-legend-more,
   .gs-prompt-legend-warning {
+    display: block;
     min-width: 0;
+    max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1416,7 +1420,7 @@ def _legend_panel_html(payload: dict) -> str:
 """
 
 
-def render_activation_map(payload: dict, key: str = "activation_map_canvas", height: int = 960) -> None:
+def render_activation_map(payload: dict, key: str = "activation_map_canvas", height: int = 1920) -> None:
     _ = key
     import streamlit as st
 

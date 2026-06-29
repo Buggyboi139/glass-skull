@@ -1577,7 +1577,7 @@ def run_app() -> None:
                     "lengthDelta": patch_comparison.get("length_delta"),
                     "error": patch_comparison.get("error"),
                 }
-            render_activation_map(payload, key=f"activation_map_{artifact.get('run_id', 'latest')}", height=920)
+            render_activation_map(payload, key=f"activation_map_{artifact.get('run_id', 'latest')}", height=1840)
             render_node_annotation_inspector(payload)
             _tab_state("Map")["annotation_selected_group"] = st.session_state.map_annotation_selected_group
             scores_df = score_run_artifact(artifact, profile=get_behavior_profile(st.session_state.behavior_profile))

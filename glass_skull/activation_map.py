@@ -147,6 +147,10 @@ def _prompt_preview(value: Any, limit: int = 260) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+def _prompt_legend_label(value: Any) -> str:
+    return str(value or "").replace("\n", " ").strip()
+
+
 def _string_id(value: Any) -> str:
     if value is None:
         return ""
@@ -298,7 +302,7 @@ def _legend_entries(
         key = _string_id(item.get("promptId"))
         if not key:
             continue
-        text = _prompt_preview(item.get("promptText") or item.get("promptPreview"))
+        text = _prompt_legend_label(item.get("promptText") or item.get("promptPreview"))
         if text and key not in prompt_text:
             prompt_text[key] = text
     legend = []
@@ -307,7 +311,7 @@ def _legend_entries(
         label = prompt_text.get(key) or f"prompt {entry['promptId']}"
         legend.append({
             **entry,
-            "label": _preview(label, 38),
+            "label": _prompt_legend_label(label),
         })
     return legend, max(0, len(entries) - PROMPT_LEGEND_LIMIT)
 
