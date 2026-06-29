@@ -1117,7 +1117,10 @@ def main() -> None:
     seed_missing_defaults(stale_empty_batch_state, {"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES})
     seed_batch_prompt_default(stale_empty_batch_state)
     assert stale_empty_batch_state["batch_pasted_prompts"] == DEFAULT_BATCH_MESSAGES
-    user_cleared_batch_state = {"batch_pasted_prompts": "", "batch_pasted_prompts_user_set": True}
+    stale_empty_with_old_marker = {"batch_pasted_prompts": "", "batch_pasted_prompts_user_set": True}
+    seed_batch_prompt_default(stale_empty_with_old_marker)
+    assert stale_empty_with_old_marker["batch_pasted_prompts"] == DEFAULT_BATCH_MESSAGES
+    user_cleared_batch_state = {"batch_pasted_prompts": "", "batch_pasted_prompts_source": "user"}
     seed_missing_defaults(user_cleared_batch_state, {"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES})
     seed_batch_prompt_default(user_cleared_batch_state)
     assert user_cleared_batch_state["batch_pasted_prompts"] == ""
@@ -1130,11 +1133,13 @@ def main() -> None:
     seed_batch_prompt_default(loaded_empty_batch_state)
     assert loaded_empty_batch_state["batch_pasted_prompts"] == ""
     assert loaded_empty_batch_state["batch_pasted_prompts_user_set"] is True
+    assert loaded_empty_batch_state["batch_pasted_prompts_source"] == "loaded"
     loaded_empty_tab_state = {"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES, "tab_state": {}}
     apply_tab_state(loaded_empty_tab_state, "Run", {"batch_pasted_prompts": ""})
     seed_batch_prompt_default(loaded_empty_tab_state)
     assert loaded_empty_tab_state["batch_pasted_prompts"] == ""
     assert loaded_empty_tab_state["batch_pasted_prompts_user_set"] is True
+    assert loaded_empty_tab_state["batch_pasted_prompts_source"] == "loaded"
     assert dashboard_context("Batch run", "abc") == {"mode": "Batch run", "run_id": "abc"}
     assert new_run_id("unit").startswith("unit_")
     _assert_workspace_round_trip()

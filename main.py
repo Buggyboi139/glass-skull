@@ -167,6 +167,7 @@ def init_state() -> None:
         "behavior_profile": "concise_helpfulness",
         "batch_pasted_prompts": DEFAULT_BATCH_MESSAGES,
         "batch_pasted_prompts_user_set": False,
+        "batch_pasted_prompts_source": "default",
         "batch_running": False,
         "batch_status": "",
         "chat_cancel_requested": False,
@@ -380,6 +381,7 @@ def steer_help(control_id: str, tooltips: dict | None = None) -> str | None:
 
 def mark_batch_prompts_user_set() -> None:
     st.session_state.batch_pasted_prompts_user_set = True
+    st.session_state.batch_pasted_prompts_source = "user"
 
 
 def render_global_workspace_controls() -> None:

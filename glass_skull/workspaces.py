@@ -27,6 +27,7 @@ GLOBAL_STATE_KEYS = [
     "behavior_profile",
     "batch_pasted_prompts",
     "batch_pasted_prompts_user_set",
+    "batch_pasted_prompts_source",
     "map_visualization_mode",
     "map_selected_prompt",
     "map_selected_batch",
@@ -79,6 +80,7 @@ GLOBAL_CLEAR_DEFAULTS: dict[str, Any] = {
     "behavior_profile": "concise_helpfulness",
     "batch_pasted_prompts": DEFAULT_BATCH_MESSAGES,
     "batch_pasted_prompts_user_set": False,
+    "batch_pasted_prompts_source": "default",
     "batch_running": False,
     "batch_status": "",
     "loaded_activation_patch_recipe": None,
@@ -109,6 +111,7 @@ TAB_STATE_KEYS: dict[str, list[str]] = {
         "chat_backend_label",
         "batch_pasted_prompts",
         "batch_pasted_prompts_user_set",
+        "batch_pasted_prompts_source",
     ],
     "Map": [
         "behavior_profile",
@@ -181,6 +184,7 @@ TAB_CLEAR_DEFAULTS: dict[str, dict[str, Any]] = {
         "active_run_mode": "Single message",
         "batch_pasted_prompts": DEFAULT_BATCH_MESSAGES,
         "batch_pasted_prompts_user_set": False,
+        "batch_pasted_prompts_source": "default",
     },
     "Map": {
         "map_visualization_mode": "",
@@ -375,6 +379,7 @@ def apply_workspace_state(target: MutableMapping[str, Any], state: dict[str, Any
         target[key] = value
     if "batch_pasted_prompts" in state:
         target["batch_pasted_prompts_user_set"] = True
+        target["batch_pasted_prompts_source"] = "loaded"
     model = state.get("model") if isinstance(state.get("model"), dict) else {}
     map_state = state.get("map") if isinstance(state.get("map"), dict) else {}
     steering = state.get("steering") if isinstance(state.get("steering"), dict) else {}
@@ -441,6 +446,7 @@ def apply_tab_state(app_state: MutableMapping[str, Any], tab_name: str, state: d
             app_state[key] = value
     if tab_name == "Run" and "batch_pasted_prompts" in state:
         app_state["batch_pasted_prompts_user_set"] = True
+        app_state["batch_pasted_prompts_source"] = "loaded"
     tabs = app_state.get("tab_state")
     if not isinstance(tabs, dict):
         tabs = {}

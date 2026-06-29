@@ -47,8 +47,10 @@ def seed_missing_defaults(state: MutableMapping[str, Any], defaults: dict[str, A
 
 
 def seed_batch_prompt_default(state: MutableMapping[str, Any]) -> None:
-    if not state.get("batch_pasted_prompts") and not state.get("batch_pasted_prompts_user_set"):
+    source = str(state.get("batch_pasted_prompts_source") or "")
+    if not state.get("batch_pasted_prompts") and source not in {"loaded", "user"}:
         state["batch_pasted_prompts"] = DEFAULT_BATCH_MESSAGES
+        state["batch_pasted_prompts_source"] = "default"
 
 
 def ensure_dirs() -> None:
