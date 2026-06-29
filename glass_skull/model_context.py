@@ -80,6 +80,10 @@ def local_gguf_context(model_path: str | Path, model_alias: str = "", backend: s
     expert_count = _int_or_none(_metadata_value(metadata, architecture, "expert_count"))
     expert_used_count = _int_or_none(_metadata_value(metadata, architecture, "expert_used_count"))
     context_length = _int_or_none(_metadata_value(metadata, architecture, "context_length"))
+    nextn_predict_layers = _int_or_none(_metadata_value(metadata, architecture, "nextn_predict_layers"))
+    trace_layer_count = block_count
+    if block_count is not None and nextn_predict_layers is not None and 0 < nextn_predict_layers < block_count:
+        trace_layer_count = block_count - nextn_predict_layers
 
     tensor_count = _int_or_none(metadata.get("_tensor_count"))
     if tensor_count is None and not tensor_df.empty:
@@ -100,6 +104,8 @@ def local_gguf_context(model_path: str | Path, model_alias: str = "", backend: s
         "errors": errors,
         "architecture": architecture,
         "block_count": block_count,
+        "trace_layer_count": trace_layer_count,
+        "nextn_predict_layers": nextn_predict_layers,
         "embedding_length": embedding_length,
         "head_count": head_count,
         "head_count_kv": head_count_kv,
@@ -126,6 +132,8 @@ def local_gguf_context(model_path: str | Path, model_alias: str = "", backend: s
             ("model_path", str(path)),
             ("architecture", architecture),
             ("block_count", _fmt(block_count)),
+            ("trace_layer_count", _fmt(trace_layer_count)),
+            ("nextn_predict_layers", _fmt(nextn_predict_layers)),
             ("embedding_length", _fmt(embedding_length)),
             ("head_count", _fmt(head_count)),
             ("head_count_kv", _fmt(head_count_kv)),

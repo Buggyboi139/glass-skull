@@ -153,6 +153,76 @@ def _string_id(value: Any) -> str:
     return str(value)
 
 
+def _normalized_path(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).expanduser().resolve(strict=False))
+    except Exception:
+        return text
+
+
+def _paths_match(left: Any, right: Any) -> bool:
+    left_text = _normalized_path(left)
+    right_text = _normalized_path(right)
+    return bool(left_text and right_text and left_text == right_text)
+
+
+def _backend_model_path(info: dict[str, Any] | None) -> str:
+    if not isinstance(info, dict):
+        return ""
+    model = info.get("model") if isinstance(info.get("model"), dict) else {}
+    for source in (model, info):
+        for key in ("path", "model_path", "modelPath"):
+            value = source.get(key)
+            if value:
+                return str(value)
+    return ""
+
+
+def _backend_model_name(info: dict[str, Any] | None) -> str:
+    if not isinstance(info, dict):
+        return ""
+    model = info.get("model") if isinstance(info.get("model"), dict) else {}
+    for source in (model, info):
+        for key in ("id", "name", "model", "model_name", "modelName"):
+            value = source.get(key)
+            if value:
+                return str(value)
+    return ""
+
+
+def _layer_ids_from_requested_summary(summary: dict[str, Any] | None) -> list[int]:
+    if not isinstance(summary, dict):
+        return []
+    layers = summary.get("layers")
+    if isinstance(layers, list):
+        ids = [
+            _int_or_none(item.get("layer") if isinstance(item, dict) else item)
+            for item in layers
+        ]
+        return sorted({layer for layer in ids if layer is not None and layer >= 0})
+    count = _positive_count(layers)
+    if count is not None:
+        return list(range(count))
+    return []
+
+
+def _layer_range_fields(prefix: str, layer_ids: list[int]) -> dict[str, Any]:
+    if not layer_ids:
+        return {
+            f"{prefix}MinLayer": None,
+            f"{prefix}MaxLayer": None,
+            f"{prefix}LayerCount": 0,
+        }
+    return {
+        f"{prefix}MinLayer": min(layer_ids),
+        f"{prefix}MaxLayer": max(layer_ids),
+        f"{prefix}LayerCount": len(layer_ids),
+    }
+
+
 def _prompt_sort_key(value: Any) -> tuple[int, int | str]:
     text = _string_id(value)
     if text.lstrip("-").isdigit():
@@ -247,7 +317,7 @@ def build_model_meta(summary: dict, local_model_context: dict | None, backend: s
     is_local = bool(local_model_context)
     metadata = local_model_context.get("metadata") or {}
     layer_count = (
-        _int_or_none(local_model_context.get("block_count"))
+        _int_or_none(local_model_context.get("trace_layer_count") or local_model_context.get("block_count"))
         if is_local
         else _int_or_none(summary.get("layers"))
     )
@@ -273,6 +343,9 @@ def build_model_meta(summary: dict, local_model_context: dict | None, backend: s
         "modelPath": local_model_context.get("model_path") if is_local else str(summary.get("model_path", "")),
         "architecture": local_model_context.get("architecture") if is_local else str(summary.get("architecture", "local")),
         "layerCount": max(layer_count or 0, 0),
+        "ggufLayerCount": _int_or_none(local_model_context.get("block_count")) if is_local else None,
+        "ggufTraceLayerCount": _int_or_none(local_model_context.get("trace_layer_count")) if is_local else None,
+        "nextnPredictLayers": _int_or_none(local_model_context.get("nextn_predict_layers")) if is_local else None,
         "hiddenSize": max(hidden_size or 0, 0),
         "attentionHeads": heads,
         "kvHeads": _int_or_none(local_model_context.get("head_count_kv")) if is_local else _int_or_none(summary.get("kv_heads")),
@@ -425,14 +498,14 @@ def _layer_count_from_backend_info(info: dict[str, Any] | None) -> int | None:
 
 
 def _backend_info_from_sources(artifact: dict[str, Any], summary: dict[str, Any] | None, backend_info: dict[str, Any] | None) -> dict[str, Any] | None:
-    if isinstance(backend_info, dict):
+    if isinstance(backend_info, dict) and backend_info:
         return backend_info
     for source in (artifact, summary or {}, artifact.get("summary") if isinstance(artifact.get("summary"), dict) else {}):
         if not isinstance(source, dict):
             continue
         for key in ("backend_info", "backendInfo", "glass_info", "glassInfo"):
             value = source.get(key)
-            if isinstance(value, dict):
+            if isinstance(value, dict) and value:
                 return value
     return None
 
@@ -548,6 +621,157 @@ def resolve_render_layers(
             source=source,
         ),
     )
+
+
+def model_identity_diagnostics(
+    ui_selected_model_path: str | None,
+    backend_info: dict[str, Any] | None,
+    *,
+    backend_process_model_path: str | None = None,
+    active_model_fingerprint: str | None = None,
+    ui_selected_model_name: str | None = None,
+) -> dict[str, Any]:
+    backend_info_path = _backend_model_path(backend_info)
+    backend_info_name = _backend_model_name(backend_info)
+    ui_selected_model_name = str(ui_selected_model_name or "").strip()
+    mismatches: list[str] = []
+    if ui_selected_model_path and backend_info_path and not _paths_match(ui_selected_model_path, backend_info_path):
+        mismatches.append("UI selected model path differs from backend info model path")
+    if ui_selected_model_path and backend_process_model_path and not _paths_match(ui_selected_model_path, backend_process_model_path):
+        mismatches.append("UI selected model path differs from backend process model path")
+    if backend_info_path and backend_process_model_path and not _paths_match(backend_info_path, backend_process_model_path):
+        mismatches.append("backend info model path differs from backend process model path")
+    if not backend_info_path and ui_selected_model_name and backend_info_name and ui_selected_model_name.lower() != "local" and ui_selected_model_name != backend_info_name:
+        mismatches.append("UI selected model name differs from backend info model name")
+    return {
+        "uiSelectedModelPath": str(ui_selected_model_path or ""),
+        "uiSelectedModelName": ui_selected_model_name,
+        "backendInfoModelPath": backend_info_path,
+        "backendProcessModelPath": str(backend_process_model_path or ""),
+        "backendInfoModelName": backend_info_name,
+        "activeModelFingerprint": active_model_fingerprint or "",
+        "modelIdentityMismatch": bool(mismatches),
+        "mismatchSummary": "; ".join(mismatches),
+    }
+
+
+def trace_layer_diagnostics(
+    artifact: dict[str, Any],
+    summary: dict[str, Any] | None = None,
+    *,
+    backend_info: dict[str, Any] | None = None,
+    local_model_context: dict[str, Any] | None = None,
+    ui_selected_model_path: str | None = None,
+    ui_selected_model_name: str | None = None,
+    backend_process_model_path: str | None = None,
+    active_model_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    summary = summary or artifact.get("summary") or {}
+    backend = str(artifact.get("backend") or summary.get("backend") or "llama.cpp")
+    model_meta = build_model_meta(summary, local_model_context, backend)
+    resolved_backend_info = _backend_info_from_sources(artifact, summary, backend_info)
+    render_bounds = resolve_render_layers(artifact, resolved_backend_info, model_meta)
+    available = _available_rows(_artifact_trace_rows(artifact))
+    requested_layer_ids = []
+    if isinstance(artifact.get("summary"), dict):
+        requested_layer_ids = _layer_ids_from_requested_summary(artifact.get("summary"))
+    if not requested_layer_ids:
+        requested_layer_ids = _layer_ids_from_requested_summary(summary)
+    returned_layer_ids = _layer_ids_from_rows(available)
+    backend_count = _layer_count_from_backend_info(resolved_backend_info)
+    gguf_layer_count = _positive_count(model_meta.get("ggufLayerCount")) or _positive_count(model_meta.get("layerCount"))
+    gguf_trace_layer_count = _positive_count(model_meta.get("ggufTraceLayerCount")) or _positive_count(model_meta.get("layerCount"))
+    identity = model_identity_diagnostics(
+        ui_selected_model_path,
+        resolved_backend_info,
+        backend_process_model_path=backend_process_model_path,
+        active_model_fingerprint=active_model_fingerprint or str(model_meta.get("modelFingerprint") or ""),
+        ui_selected_model_name=ui_selected_model_name,
+    )
+
+    warnings = list(render_bounds.warnings)
+    if requested_layer_ids and returned_layer_ids and len(returned_layer_ids) < len(requested_layer_ids):
+        warning = (
+            "Trace returned fewer layers than requested: "
+            f"requested {len(requested_layer_ids)} (last L{max(requested_layer_ids)}) "
+            f"but returned {len(returned_layer_ids)} (last L{max(returned_layer_ids)})."
+        )
+        if warning not in warnings:
+            warnings.append(warning)
+    if identity["modelIdentityMismatch"]:
+        warning = f"Model identity mismatch: {identity['mismatchSummary']}"
+        if warning not in warnings:
+            warnings.append(warning)
+
+    stale_cache_suspected = bool(
+        identity["modelIdentityMismatch"]
+        or (requested_layer_ids and returned_layer_ids and len(returned_layer_ids) < len(requested_layer_ids))
+        or (
+            render_bounds.source == "trace_rows"
+            and backend_count is not None
+            and returned_layer_ids
+            and len(returned_layer_ids) < backend_count
+        )
+    )
+
+    diagnostics = {
+        **identity,
+        "ggufArchitecture": str(model_meta.get("architecture") or ""),
+        "ggufLayerCount": gguf_layer_count,
+        "ggufTraceLayerCount": gguf_trace_layer_count,
+        "backendInfoLayerCount": backend_count,
+        **_layer_range_fields("traceRequested", requested_layer_ids),
+        **_layer_range_fields("traceReturned", returned_layer_ids),
+        **_layer_range_fields("renderer", render_bounds.layer_ids),
+        "renderLayerSource": render_bounds.source,
+        "renderLayerCount": render_bounds.layer_count,
+        "renderFirstLayer": render_bounds.first_layer,
+        "renderLastLayer": render_bounds.last_layer,
+        "renderLayerIds": render_bounds.layer_ids,
+        "rendererLayerSource": render_bounds.source,
+        "rendererLayerCount": render_bounds.layer_count,
+        "rendererLayerIds": render_bounds.layer_ids,
+        "staleCacheSuspected": stale_cache_suspected,
+        "layerMismatchWarning": " | ".join(warnings),
+    }
+    return diagnostics
+
+
+def managed_backend_process_model_path(server_bin: str | Path | None = None) -> str:
+    try:
+        from .llama_paths import DEFAULT_LLAMA_SERVER
+    except Exception:
+        DEFAULT_LLAMA_SERVER = Path("managed/llama.cpp-glass/build/bin/llama-server")
+
+    target = _normalized_path(server_bin or DEFAULT_LLAMA_SERVER)
+    if not target:
+        return ""
+    proc = Path("/proc")
+    if not proc.exists():
+        return ""
+    for pid_dir in proc.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        try:
+            cmdline = (pid_dir / "cmdline").read_bytes().split(b"\0")
+        except Exception:
+            continue
+        args = [part.decode("utf-8", errors="replace") for part in cmdline if part]
+        if not args:
+            continue
+        exe_path = ""
+        try:
+            exe_path = _normalized_path((pid_dir / "exe").resolve(strict=True))
+        except Exception:
+            exe_path = ""
+        if _normalized_path(args[0]) != target and exe_path != target:
+            continue
+        for index, arg in enumerate(args):
+            if arg in {"-m", "--model"} and index + 1 < len(args):
+                return args[index + 1]
+            if arg.startswith("--model="):
+                return arg.split("=", 1)[1]
+    return ""
 
 
 def _unavailable_reason(rows: list[dict[str, Any]]) -> str:
@@ -977,6 +1201,11 @@ def inspect_trace_artifact(artifact: dict, summary: dict | None = None, local_mo
     batch_count = _batch_count(available)
     token_count = _token_count(available)
     renderer_mode = _default_visualization_mode(data_mode, prompt_count, None)
+    layer_diagnostics = trace_layer_diagnostics(
+        artifact,
+        summary,
+        local_model_context=local_model_context,
+    )
     return {
         "run_id": artifact.get("run_id"),
         "model": artifact.get("model") or model_meta.get("modelName"),
@@ -1011,6 +1240,7 @@ def inspect_trace_artifact(artifact: dict, summary: dict | None = None, local_mo
         "backendInfoLayerCount": backend_count,
         "modelMetaLayerCount": model_count,
         "layerMismatchWarning": " | ".join(render_bounds.warnings),
+        **layer_diagnostics,
     }
 
 
@@ -1020,6 +1250,10 @@ def build_activation_map(
     local_model_context: dict | None = None,
     *,
     backend_info: dict[str, Any] | None = None,
+    ui_selected_model_path: str | None = None,
+    ui_selected_model_name: str | None = None,
+    backend_process_model_path: str | None = None,
+    active_model_fingerprint: str | None = None,
     visualization_mode: str | None = None,
     selected_prompt: Any = None,
     selected_token: int | None = None,
@@ -1092,8 +1326,22 @@ def build_activation_map(
     heatmap = _build_heatmap(heatmap_rows, hidden_size)
 
     diagnostics = inspect_trace_artifact(artifact, summary, local_model_context)
+    diagnostics.update(trace_layer_diagnostics(
+        artifact,
+        summary,
+        backend_info=resolved_backend_info,
+        local_model_context=local_model_context,
+        ui_selected_model_path=ui_selected_model_path,
+        ui_selected_model_name=ui_selected_model_name,
+        backend_process_model_path=backend_process_model_path,
+        active_model_fingerprint=active_model_fingerprint,
+    ))
+    diagnostic_warnings = [*warnings, *[warning for warning in render_bounds.warnings if warning not in warnings]]
+    layer_mismatch_warning = str(diagnostics.get("layerMismatchWarning") or "").strip()
+    if layer_mismatch_warning and layer_mismatch_warning not in diagnostic_warnings:
+        diagnostic_warnings.append(layer_mismatch_warning)
     diagnostics.update({
-        "warnings": [*warnings, *[warning for warning in render_bounds.warnings if warning not in warnings]],
+        "warnings": diagnostic_warnings,
         "dataMode": data_mode,
         "renderer_mode": mode,
         "rendererMode": mode,
@@ -1109,15 +1357,22 @@ def build_activation_map(
         "modelMeta": model_meta,
         "renderLayerSource": render_bounds.source,
         "renderLayerCount": render_bounds.layer_count,
+        "rendererLayerCount": render_bounds.layer_count,
         "renderFirstLayer": render_bounds.first_layer,
         "renderLastLayer": render_bounds.last_layer,
+        "rendererMinLayer": render_bounds.first_layer,
+        "rendererMaxLayer": render_bounds.last_layer,
         "renderLayerIds": render_bounds.layer_ids,
+        "rendererLayerIds": render_bounds.layer_ids,
         "traceLayerCount": len(trace_layer_ids),
         "traceMinLayer": min(trace_layer_ids) if trace_layer_ids else None,
         "traceMaxLayer": max(trace_layer_ids) if trace_layer_ids else None,
+        "traceReturnedLayerCount": len(trace_layer_ids),
+        "traceReturnedMinLayer": min(trace_layer_ids) if trace_layer_ids else None,
+        "traceReturnedMaxLayer": max(trace_layer_ids) if trace_layer_ids else None,
         "backendInfoLayerCount": _layer_count_from_backend_info(resolved_backend_info),
         "modelMetaLayerCount": model_meta_layer_count,
-        "layerMismatchWarning": " | ".join(render_bounds.warnings),
+        "layerMismatchWarning": diagnostics.get("layerMismatchWarning") or " | ".join(render_bounds.warnings),
         "pathCompletenessWarning": " | ".join(path_incomplete_warnings),
     })
 
@@ -1521,6 +1776,10 @@ def build_activation_map_payload(
     selected_batch: str | None = None,
     *,
     backend_info: dict[str, Any] | None = None,
+    ui_selected_model_path: str | None = None,
+    ui_selected_model_name: str | None = None,
+    backend_process_model_path: str | None = None,
+    active_model_fingerprint: str | None = None,
     visualization_mode: str | None = None,
     selected_prompt: Any = None,
     selected_token: int | None = None,
@@ -1540,6 +1799,10 @@ def build_activation_map_payload(
         summary,
         local_model_context,
         backend_info=backend_info,
+        ui_selected_model_path=ui_selected_model_path,
+        ui_selected_model_name=ui_selected_model_name,
+        backend_process_model_path=backend_process_model_path,
+        active_model_fingerprint=active_model_fingerprint,
         visualization_mode=visualization_mode,
         selected_prompt=selected_prompt,
         selected_token=selected_token,
@@ -1744,12 +2007,96 @@ def _inspect_latest() -> None:
     print(json.dumps(report, indent=2, sort_keys=True))
 
 
+def _latest_trace_artifact() -> dict[str, Any]:
+    artifacts = latest_run_artifacts(limit=25)
+    if not artifacts:
+        return {}
+    for candidate in artifacts:
+        loaded = load_run_artifact(candidate["artifact_path"])
+        if _available_rows(_artifact_trace_rows(loaded)):
+            return loaded
+    return load_run_artifact(artifacts[0]["artifact_path"])
+
+
+def _diagnose_model_layers(base_url: str, model_alias: str | None, ui_selected_model_path: str | None) -> None:
+    from .llama_client import get_glass_info
+    from .model_context import local_gguf_context
+
+    backend_info: dict[str, Any] = {}
+    backend_error = ""
+    try:
+        backend_info = get_glass_info(base_url, model_alias=model_alias or None)
+    except Exception as exc:
+        backend_error = str(exc)
+
+    backend_process_model_path = managed_backend_process_model_path()
+    backend_info_model_path = _backend_model_path(backend_info)
+    active_model_path = backend_process_model_path or backend_info_model_path
+    selected_model_path = ui_selected_model_path or active_model_path
+    local_context = local_gguf_context(selected_model_path, model_alias or "", "llama.cpp") if selected_model_path else {}
+
+    artifact = _latest_trace_artifact()
+    summary = artifact.get("summary", {}) if isinstance(artifact.get("summary"), dict) else {}
+    payload: dict[str, Any] = {}
+    if artifact:
+        payload = build_activation_map_payload(
+            artifact,
+            summary,
+            local_model_context=local_context,
+            backend_info=backend_info,
+            ui_selected_model_path=selected_model_path,
+            ui_selected_model_name=model_alias or "",
+            backend_process_model_path=backend_process_model_path,
+        )
+    diagnostics = dict(payload.get("diagnostics", {})) if payload else trace_layer_diagnostics(
+        {},
+        {},
+        backend_info=backend_info,
+        local_model_context=local_context,
+        ui_selected_model_path=selected_model_path,
+        ui_selected_model_name=model_alias or "",
+        backend_process_model_path=backend_process_model_path,
+    )
+    metadata = local_context.get("metadata") if isinstance(local_context, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    requested = _layer_ids_from_requested_summary(summary)
+    returned = diagnostics.get("rendererLayerIds") if not artifact else _layer_ids_from_rows(_available_rows(_artifact_trace_rows(artifact)))
+    returned = returned if isinstance(returned, list) else []
+    report = {
+        "activeModelPath": active_model_path,
+        "uiSelectedModelPath": selected_model_path,
+        "backendModelPath": backend_info_model_path,
+        "backendProcessModelPath": backend_process_model_path,
+        "backendInfoError": backend_error,
+        "ggufArchitecture": local_context.get("architecture"),
+        "ggufName": metadata.get("general.name"),
+        "ggufLayerCount": local_context.get("block_count"),
+        "ggufTraceLayerCount": local_context.get("trace_layer_count"),
+        "ggufNextnPredictLayers": local_context.get("nextn_predict_layers"),
+        "backendInfoLayerCount": _layer_count_from_backend_info(backend_info),
+        "traceRequestedLayers": requested,
+        "traceReturnedLayers": returned,
+        "rendererLayerCount": diagnostics.get("rendererLayerCount"),
+        "renderLayerSource": diagnostics.get("renderLayerSource"),
+        "staleCacheSuspected": diagnostics.get("staleCacheSuspected"),
+        "mismatchSummary": diagnostics.get("mismatchSummary"),
+        **diagnostics,
+    }
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect Glass Skull activation map artifacts.")
     parser.add_argument("--inspect-latest", action="store_true", help="print schema and map diagnostics for the latest run artifact")
+    parser.add_argument("--diagnose-model-layers", action="store_true", help="print active model/layer diagnostics")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8080", help="llama.cpp base URL for diagnostics")
+    parser.add_argument("--model-alias", default="", help="model alias to pass to /glass-skull/info")
+    parser.add_argument("--ui-selected-model-path", default="", help="UI-selected GGUF path to compare against backend identity")
     args = parser.parse_args()
     if args.inspect_latest:
         _inspect_latest()
+    elif args.diagnose_model_layers:
+        _diagnose_model_layers(args.base_url, args.model_alias, args.ui_selected_model_path)
     else:
         parser.print_help()
 

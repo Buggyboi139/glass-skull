@@ -1129,11 +1129,26 @@ def activation_map_html(payload: dict, height: int = 960) -> str:
       ['confidence', fmtNumber(d.confidence || 0)],
       ['selectedEdge', d.selectedEdge?.edgeId || selected.edgeId || ''],
       ['edgeWeight', d.selectedEdge ? fmtNumber(d.selectedEdge.weight || 0) : ''],
-      ['edgeMethod', d.selectedEdge?.method || ''],
-      ['sourceToken', trimText(d.sourceToken || '', 24)],
-      ['destinationToken', trimText(d.destinationToken || '', 24)],
-      ['model', trimText(d.modelMeta?.modelName || '', 24)],
-    ];
+	      ['edgeMethod', d.selectedEdge?.method || ''],
+	      ['sourceToken', trimText(d.sourceToken || '', 24)],
+	      ['destinationToken', trimText(d.destinationToken || '', 24)],
+	      ['model', trimText(d.modelMeta?.modelName || '', 24)],
+	      ['uiSelectedModelPath', trimText(d.uiSelectedModelPath || '', 58)],
+	      ['uiSelectedModelName', trimText(d.uiSelectedModelName || '', 36)],
+	      ['backendProcessModelPath', trimText(d.backendProcessModelPath || '', 58)],
+	      ['backendInfoModelPath', trimText(d.backendInfoModelPath || '', 58)],
+	      ['backendInfoModelName', trimText(d.backendInfoModelName || '', 36)],
+	      ['activeModelFingerprint', trimText(d.activeModelFingerprint || '', 36)],
+	      ['ggufArchitecture', d.ggufArchitecture || ''],
+	      ['ggufLayerCount', d.ggufLayerCount ?? ''],
+	      ['backendInfoLayerCount', d.backendInfoLayerCount ?? ''],
+	      ['traceRequested', `${{d.traceRequestedMinLayer ?? ''}}..${{d.traceRequestedMaxLayer ?? ''}} (${{d.traceRequestedLayerCount ?? 0}})`],
+	      ['traceReturned', `${{d.traceReturnedMinLayer ?? ''}}..${{d.traceReturnedMaxLayer ?? ''}} (${{d.traceReturnedLayerCount ?? 0}})`],
+	      ['rendererLayers', `${{d.rendererMinLayer ?? ''}}..${{d.rendererMaxLayer ?? ''}} (${{d.rendererLayerCount ?? d.renderLayerCount ?? 0}})`],
+	      ['modelIdentityMismatch', d.modelIdentityMismatch ?? false],
+	      ['layerMismatchWarning', trimText(d.layerMismatchWarning || '', 58)],
+	      ['staleCacheSuspected', d.staleCacheSuspected ?? false],
+	    ];
     (payload.diagnostics?.warnings || []).forEach((warning, index) => {{
       rows.push([`warning${{index + 1}}`, trimText(warning, 58)]);
     }});

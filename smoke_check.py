@@ -15,6 +15,7 @@ from glass_skull.activation_map import (
     build_model_meta,
     inspect_trace_artifact,
     resolve_render_layers,
+    trace_layer_diagnostics,
 )
 from glass_skull.activation_map_view import activation_map_html
 from glass_skull.behavior_profiles import get_behavior_profile, list_behavior_profiles
@@ -311,7 +312,13 @@ def _assert_main_layer_resolver_and_trace_mock(summary: dict, local_meta: dict) 
         "get_glass_info": llama_client.get_glass_info,
     }
     funcs = _load_main_functions(
-        {"_positive_int", "_trace_layer_count_from_glass_info", "resolve_trace_layers"},
+        {
+            "_positive_int",
+            "_trace_layer_count_from_glass_info",
+            "model_identity_diagnostics",
+            "resolve_trace_plan",
+            "resolve_trace_layers",
+        },
         namespace,
     )
     resolve_trace_layers = funcs["resolve_trace_layers"]
@@ -350,17 +357,172 @@ def _assert_main_layer_resolver_and_trace_mock(summary: dict, local_meta: dict) 
 
     namespace["get_glass_info"] = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("missing server"))
     funcs = _load_main_functions(
-        {"_positive_int", "_trace_layer_count_from_glass_info", "resolve_trace_layers"},
+        {
+            "_positive_int",
+            "_trace_layer_count_from_glass_info",
+            "model_identity_diagnostics",
+            "resolve_trace_plan",
+            "resolve_trace_layers",
+        },
         namespace,
     )
     assert funcs["resolve_trace_layers"]("http://missing", "local", {"layers": 41}) == list(range(41))
     assert funcs["resolve_trace_layers"]("http://missing", "local", {"layers": 0}) == [0]
     namespace["get_glass_info"] = lambda *args, **kwargs: {"layers": "bad", "meta": {"n_layer": -3}}
     funcs = _load_main_functions(
-        {"_positive_int", "_trace_layer_count_from_glass_info", "resolve_trace_layers"},
+        {
+            "_positive_int",
+            "_trace_layer_count_from_glass_info",
+            "model_identity_diagnostics",
+            "resolve_trace_plan",
+            "resolve_trace_layers",
+        },
         namespace,
     )
     assert funcs["resolve_trace_layers"]("http://bad", "local", {"layers": "invalid"}) == [0]
+
+
+def _assert_model_layer_contracts(summary: dict, local_meta: dict) -> None:
+    namespace = {
+        "pd": pd,
+        "get_glass_info": lambda *args, **kwargs: {
+            "layers": 60,
+            "meta": {"n_layer": 60},
+            "model": {
+                "path": "/models/gemma-4-31b.gguf",
+                "id": "gemma-live",
+                "architecture": "gemma",
+            },
+        },
+    }
+    funcs = _load_main_functions(
+        {
+            "_positive_int",
+            "_trace_layer_count_from_glass_info",
+            "resolve_trace_layers",
+            "resolve_trace_plan",
+            "model_identity_diagnostics",
+            "invalidate_model_dependent_state",
+        },
+        namespace,
+    )
+
+    stale_qwen_summary = {**summary, "layers": 40}
+    assert funcs["resolve_trace_layers"]("http://local", "gemma-live", stale_qwen_summary) == list(range(60))
+    trace_plan = funcs["resolve_trace_plan"](
+        "http://local",
+        "gemma-live",
+        stale_qwen_summary,
+        ui_model_path="/models/gemma-4-31b.gguf",
+    )
+    assert trace_plan["layers"] == list(range(60))
+    assert trace_plan["traceRequestedMinLayer"] == 0
+    assert trace_plan["traceRequestedMaxLayer"] == 59
+    assert trace_plan["traceRequestedLayerCount"] == 60
+    assert trace_plan["modelIdentityMismatch"] is False
+
+    mismatch = funcs["model_identity_diagnostics"](
+        "/models/gemma-4-31b.gguf",
+        {"model": {"path": "/models/qwen.gguf", "id": "qwen-live"}, "layers": 40},
+        backend_process_model_path="/models/qwen.gguf",
+    )
+    assert mismatch["modelIdentityMismatch"] is True
+    assert "UI selected model path differs from backend info model path" in mismatch["mismatchSummary"]
+    assert "backend process model path" in mismatch["mismatchSummary"]
+    name_mismatch = funcs["model_identity_diagnostics"](
+        "",
+        {"model": {"id": "qwen-live"}, "layers": 40},
+        ui_selected_model_name="gemma-live",
+    )
+    assert name_mismatch["modelIdentityMismatch"] is True
+    assert "UI selected model name differs from backend info model name" in name_mismatch["mismatchSummary"]
+
+    state = _SessionState(
+        activeModelFingerprint="old",
+        llama_status={"old": True},
+        llama_glass_status={"old": True},
+        local_dashboard_trace={"old": True},
+        local_dashboard_trace_meta={"old": True},
+        last_batch_result={"old": True},
+        last_fuzz_result={"old": True},
+        last_behavior_artifact={"run_id": "old"},
+        last_behavior_scores="old",
+        map_selected_prompt="0",
+        map_selected_batch="batch-0",
+        map_selected_token=3,
+        map_annotation_selected_group="L39-N1",
+    )
+    changed = funcs["invalidate_model_dependent_state"](state, "/models/gemma-4-31b.gguf", "gemma-live")
+    assert changed is True
+    assert state["llama_status"] is None
+    assert state["llama_glass_status"] is None
+    assert state["last_behavior_artifact"] is None
+    assert state["last_batch_result"] is None
+    assert state["map_selected_token"] is None
+    assert state["modelArtifactsInvalidated"] is True
+    namespace["st"] = types.SimpleNamespace(session_state=_SessionState(modelArtifactsInvalidated=True))
+    namespace["latest_saved_behavior_artifact"] = lambda: {"run_id": "old_saved_model"}
+    funcs = _load_main_functions({"latest_behavior_artifact"}, namespace)
+    assert funcs["latest_behavior_artifact"]() == {}
+
+    sixty_artifact = _layer_count_fixture_artifact(list(range(60)))
+    sixty_payload = build_activation_map_payload(
+        sixty_artifact,
+        {**summary, "layers": 60},
+        local_model_context={**local_meta, "block_count": 60},
+        backend_info={"layers": 60},
+    )
+    assert len(sixty_payload["layers"]) == 60
+    assert sixty_payload["layers"][-1]["layerId"] == "L59"
+    assert sixty_payload["diagnostics"]["rendererLayerCount"] == 60
+    assert sixty_payload["diagnostics"]["traceReturnedLayerCount"] == 60
+    assert not sixty_payload["diagnostics"]["layerMismatchWarning"]
+
+    partial_artifact = _layer_count_fixture_artifact(list(range(40)))
+    partial_artifact["summary"]["layers"] = list(range(60))
+    partial_payload = build_activation_map_payload(
+        partial_artifact,
+        {**summary, "layers": 60},
+        local_model_context={**local_meta, "block_count": 60},
+        backend_info={"layers": 60},
+    )
+    assert len(partial_payload["layers"]) == 40
+    assert partial_payload["diagnostics"]["traceRequestedLayerCount"] == 60
+    assert partial_payload["diagnostics"]["traceReturnedLayerCount"] == 40
+    assert partial_payload["diagnostics"]["staleCacheSuspected"] is True
+    assert "Trace returned fewer layers than requested" in partial_payload["diagnostics"]["layerMismatchWarning"]
+
+    saved_backend_artifact = _layer_count_fixture_artifact(list(range(60)))
+    saved_backend_artifact["summary"]["backend_info"] = {"layers": 60, "model": {"path": "/models/gemma.gguf"}}
+    saved_backend_diag = trace_layer_diagnostics(
+        saved_backend_artifact,
+        saved_backend_artifact.get("summary", {}),
+        backend_info={},
+        local_model_context={**local_meta, "block_count": 60},
+    )
+    assert saved_backend_diag["backendInfoLayerCount"] == 60
+
+    artifact_summary_precedence = _layer_count_fixture_artifact(list(range(40)))
+    artifact_summary_precedence["summary"]["layers"] = list(range(40))
+    current_summary = {**summary, "layers": 60}
+    current_summary_diag = trace_layer_diagnostics(
+        artifact_summary_precedence,
+        current_summary,
+        backend_info={"layers": 60},
+        local_model_context={**local_meta, "block_count": 60},
+    )
+    assert current_summary_diag["traceRequestedLayerCount"] == 40
+    assert current_summary_diag["traceRequestedMaxLayer"] == 39
+
+    diag = trace_layer_diagnostics(
+        partial_artifact,
+        partial_artifact.get("summary", {}),
+        backend_info={"layers": 60},
+        local_model_context={**local_meta, "block_count": 60},
+    )
+    assert diag["traceRequestedMaxLayer"] == 59
+    assert diag["traceReturnedMaxLayer"] == 39
+    assert diag["rendererMaxLayer"] == 39
 
 
 def _assert_single_trace_failure_preserves_reason() -> None:
@@ -828,7 +990,7 @@ def main() -> None:
     assert 'st.form("chat_prompt_form", clear_on_submit=True)' in main_source
     assert '{"Single message", "Batch run"}' in main_source
     assert "def resolve_trace_layers(" in main_source
-    assert "trace_layers = resolve_trace_layers(" in main_source
+    assert "trace_plan = resolve_trace_plan(" in main_source
     assert "layers=trace_layers" in main_source
     assert "active_recipe = validate_activation_patch_recipe(loaded_recipe)" in main_source
     assert "build_activation_patch_backend_payload(active_recipe" in main_source
@@ -1336,6 +1498,7 @@ def main() -> None:
     assert compare_payload["diagnostics"]["promptColorMode"] == "prompt_palette"
     assert compare_payload["comparePrompts"]["selectedPromptColor"] != compare_payload["comparePrompts"]["comparePromptColor"]
     _assert_main_layer_resolver_and_trace_mock(summary, local_meta)
+    _assert_model_layer_contracts(summary, local_meta)
     _assert_single_trace_failure_preserves_reason()
     _assert_patched_baseline_visible_to_app(rows)
     _assert_activation_patch_recipe_round_trip()

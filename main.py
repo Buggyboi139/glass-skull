@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from glass_skull import ui_theme as ui
-from glass_skull.activation_map import build_activation_map_payload
+from glass_skull.activation_map import build_activation_map_payload, managed_backend_process_model_path
 from glass_skull.activation_map_view import render_activation_map
 from glass_skull.activation_patch import (
     build_activation_patch_backend_payload,
@@ -141,6 +141,8 @@ def init_state() -> None:
         "llama_glass_status": None,
         "llama_model_alias": "local",
         "llama_model_path": str(DEFAULT_GGUF_MODEL_PATH),
+        "activeModelFingerprint": "",
+        "modelArtifactsInvalidated": False,
         "llama_cvector_generator": str(DEFAULT_CVECTOR_GENERATOR),
         "llama_server_bin": str(DEFAULT_LLAMA_SERVER),
         "llama_control_set": "",
@@ -507,7 +509,9 @@ def local_summary(local_context: dict | None) -> dict:
         "model_name": local_context.get("display_name") or active_model_label(),
         "backend": "llama.cpp",
         "device": "local",
-        "layers": int(local_context.get("block_count") or 1),
+        "layers": int(local_context.get("trace_layer_count") or local_context.get("block_count") or 1),
+        "gguf_block_count": int(local_context.get("block_count") or 0),
+        "gguf_trace_layer_count": int(local_context.get("trace_layer_count") or local_context.get("block_count") or 0),
         "heads": int(local_context.get("head_count") or 1),
         "d_model": int(local_context.get("embedding_length") or 0),
         "d_head": int(local_context.get("d_head") or 0),
@@ -547,22 +551,147 @@ def _trace_layer_count_from_glass_info(info: dict | None) -> int | None:
     return None
 
 
-def resolve_trace_layers(base_url: str, model_alias: str | None, summary: dict | None) -> list[int]:
+def model_identity_diagnostics(
+    ui_selected_model_path: str | None,
+    backend_info: dict | None,
+    backend_process_model_path: str | None = None,
+    ui_selected_model_name: str | None = None,
+) -> dict:
+    def normal_path(value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        from pathlib import Path as _Path
+        try:
+            return str(_Path(text).expanduser().resolve(strict=False))
+        except Exception:
+            return text
+
+    def backend_path(info: dict | None) -> str:
+        if not isinstance(info, dict):
+            return ""
+        model = info.get("model") if isinstance(info.get("model"), dict) else {}
+        for source in (model, info):
+            for key in ("path", "model_path", "modelPath"):
+                value = source.get(key)
+                if value:
+                    return str(value)
+        return ""
+
+    def backend_name(info: dict | None) -> str:
+        if not isinstance(info, dict):
+            return ""
+        model = info.get("model") if isinstance(info.get("model"), dict) else {}
+        for source in (model, info):
+            for key in ("id", "name", "model", "model_name", "modelName"):
+                value = source.get(key)
+                if value:
+                    return str(value)
+        return ""
+
+    ui_path = str(ui_selected_model_path or "")
+    ui_name = str(ui_selected_model_name or "").strip()
+    info_path = backend_path(backend_info)
+    info_name = backend_name(backend_info)
+    process_path = str(backend_process_model_path or "")
+    mismatches = []
+    if ui_path and info_path and normal_path(ui_path) != normal_path(info_path):
+        mismatches.append("UI selected model path differs from backend info model path")
+    if ui_path and process_path and normal_path(ui_path) != normal_path(process_path):
+        mismatches.append("UI selected model path differs from backend process model path")
+    if info_path and process_path and normal_path(info_path) != normal_path(process_path):
+        mismatches.append("backend info model path differs from backend process model path")
+    if not info_path and ui_name and info_name and ui_name.lower() != "local" and ui_name != info_name:
+        mismatches.append("UI selected model name differs from backend info model name")
+    return {
+        "uiSelectedModelPath": ui_path,
+        "uiSelectedModelName": ui_name,
+        "backendInfoModelPath": info_path,
+        "backendInfoModelName": info_name,
+        "backendProcessModelPath": process_path,
+        "modelIdentityMismatch": bool(mismatches),
+        "mismatchSummary": "; ".join(mismatches),
+    }
+
+
+def resolve_trace_plan(
+    base_url: str,
+    model_alias: str | None,
+    summary: dict | None,
+    *,
+    ui_model_path: str | None = None,
+    backend_process_model_path: str | None = None,
+    explicit_layers: list[int] | None = None,
+) -> dict:
+    info = None
     count = None
+    info_error = ""
     try:
-        count = _trace_layer_count_from_glass_info(get_glass_info(base_url, model_alias=model_alias))
-    except Exception:
+        info = get_glass_info(base_url, model_alias=model_alias)
+        count = _trace_layer_count_from_glass_info(info)
+    except Exception as exc:
+        info_error = str(exc)
+        info = None
         count = None
 
-    if count is None and isinstance(summary, dict):
-        count = _positive_int(summary.get("layers"))
+    if explicit_layers is not None:
+        layers = sorted({max(0, int(layer)) for layer in explicit_layers})
+        source = "explicit_user_override"
+    else:
+        if count is None and isinstance(summary, dict):
+            count = _positive_int(summary.get("layers"))
+        if count is None:
+            layers = [0]
+            source = "fallback"
+        else:
+            max_layer = count - 1
+            layers = [min(max(layer, 0), max_layer) for layer in range(count)] or [0]
+            source = "backend_info" if info is not None else "gguf_metadata"
 
-    if count is None:
-        return [0]
+    identity = model_identity_diagnostics(
+        ui_model_path,
+        info,
+        backend_process_model_path=backend_process_model_path,
+        ui_selected_model_name=model_alias,
+    )
+    return {
+        "layers": layers,
+        "source": source,
+        "backend_info": info,
+        "backend_info_error": info_error,
+        **identity,
+        "traceRequestedMinLayer": min(layers) if layers else None,
+        "traceRequestedMaxLayer": max(layers) if layers else None,
+        "traceRequestedLayerCount": len(layers),
+    }
 
-    max_layer = count - 1
-    layers = [min(max(layer, 0), max_layer) for layer in range(count)]
-    return layers or [0]
+
+def resolve_trace_layers(base_url: str, model_alias: str | None, summary: dict | None) -> list[int]:
+    return resolve_trace_plan(base_url, model_alias, summary)["layers"]
+
+
+def invalidate_model_dependent_state(state, model_path: str | None, model_alias: str | None) -> bool:
+    fingerprint = f"{str(model_path or '').strip()}|{str(model_alias or '').strip()}"
+    if state.get("activeModelFingerprint") == fingerprint:
+        return False
+    state["activeModelFingerprint"] = fingerprint
+    for key, value in {
+        "llama_status": None,
+        "llama_glass_status": None,
+        "local_dashboard_trace": None,
+        "local_dashboard_trace_meta": {},
+        "last_batch_result": None,
+        "last_fuzz_result": None,
+        "last_behavior_artifact": None,
+        "last_behavior_scores": pd.DataFrame(),
+        "map_selected_prompt": None,
+        "map_selected_batch": None,
+        "map_selected_token": None,
+        "map_annotation_selected_group": "",
+    }.items():
+        state[key] = value
+    state["modelArtifactsInvalidated"] = True
+    return True
 
 
 def set_local_dashboard_trace(trace_payload: dict, prompt: str, backend: str, model_label: str) -> None:
@@ -597,6 +726,13 @@ def single_trace_artifact_from_llama(
     if not trace_rows:
         reason = trace_error or llama_trace_unavailable_reason(trace_payload)
         trace_rows = [trace_unavailable_row(run_id, 0, "single", "llama.cpp", reason)]
+    summary = {}
+    if isinstance(dash_meta.get("backend_info"), dict):
+        summary["backend_info"] = dash_meta.get("backend_info")
+    if isinstance(dash_meta.get("trace_layers"), list):
+        summary["layers"] = list(dash_meta.get("trace_layers") or [])
+    if isinstance(dash_meta.get("trace_plan"), dict):
+        summary["trace_plan"] = dash_meta.get("trace_plan")
     return build_run_artifact(
         run_id=run_id,
         mode="Single message",
@@ -612,7 +748,7 @@ def single_trace_artifact_from_llama(
             "trace_rows": trace_rows,
             "metadata": {"run_id": run_id, "mode": "Single message", "trace_error": trace_error},
         }],
-        summary={"backend_info": dash_meta.get("backend_info")} if isinstance(dash_meta.get("backend_info"), dict) else None,
+        summary=summary or None,
     )
 
 
@@ -621,6 +757,7 @@ def store_behavior_artifact(artifact: dict) -> pd.DataFrame:
     scores = score_run_artifact(artifact, profile=profile)
     st.session_state.last_behavior_artifact = artifact
     st.session_state.last_behavior_scores = scores
+    st.session_state.modelArtifactsInvalidated = False
     history = list(st.session_state.get("behavior_run_history", []))
     run_id = str(artifact.get("run_id") or "")
     history = [item for item in history if str(item.get("run_id") or "") != run_id]
@@ -686,6 +823,8 @@ def artifact_from_option(row: dict) -> dict:
 
 
 def latest_behavior_artifact() -> dict:
+    if st.session_state.get("modelArtifactsInvalidated"):
+        return {}
     artifact = st.session_state.get("last_behavior_artifact")
     if isinstance(artifact, dict) and artifact:
         return artifact
@@ -1022,6 +1161,11 @@ def render_activation_patch_panel(chat_backend: str, max_new_tokens: int, temper
 
 def run_app() -> None:
     init_state()
+    invalidate_model_dependent_state(
+        st.session_state,
+        st.session_state.get("llama_model_path", ""),
+        st.session_state.get("llama_model_alias", ""),
+    )
     active_backend = normalize_chat_backend(st.session_state.get("chat_backend_label", CHAT_BACKEND_NORMAL))
     st.session_state.chat_backend_label = chat_backend_display(active_backend)
     local_context = local_gguf_context(
@@ -1129,10 +1273,23 @@ def run_app() -> None:
             error = None
             trace_error = None
             trace_payload = None
+            trace_plan = None
             trace_url = st.session_state.llama_glass_url if chat_backend == "llama.cpp glass" else st.session_state.llama_url
             if auto_trace:
                 try:
-                    trace_layers = resolve_trace_layers(trace_url, st.session_state.llama_model_alias, summary)
+                    trace_plan = resolve_trace_plan(
+                        trace_url,
+                        st.session_state.llama_model_alias,
+                        summary,
+                        ui_model_path=st.session_state.llama_model_path,
+                        backend_process_model_path=managed_backend_process_model_path(),
+                    )
+                    if trace_plan.get("modelIdentityMismatch"):
+                        raise RuntimeError(
+                            "UI selected model does not match the running llama.cpp backend. "
+                            f"{trace_plan.get('mismatchSummary')}. Restart llama.cpp with the selected GGUF before tracing."
+                        )
+                    trace_layers = trace_plan["layers"]
                     trace_payload = trace_glass_prompt(
                         trace_url,
                         prompt,
@@ -1167,7 +1324,12 @@ def run_app() -> None:
             st.session_state.chat_messages.append({"role": "assistant", "content": output, "ts": datetime.now().strftime("%H:%M:%S")})
             save_chat(st.session_state.chat_messages)
             dash_meta = st.session_state.get("local_dashboard_trace_meta", {}) or {"prompt": prompt, "backend": chat_backend, "trace_model": active_model_label(), "run_id": run_id}
-            dash_meta["backend_info"] = local_glass_info
+            if isinstance(trace_plan, dict):
+                dash_meta["trace_layers"] = trace_plan.get("layers")
+                dash_meta["trace_plan"] = trace_plan
+                dash_meta["backend_info"] = trace_plan.get("backend_info") if isinstance(trace_plan.get("backend_info"), dict) else local_glass_info
+            else:
+                dash_meta["backend_info"] = local_glass_info
             artifact = single_trace_artifact_from_llama(trace_payload or {}, dash_meta, output=output, error=error, trace_error=trace_error)
             store_behavior_artifact(artifact)
             persist_single_run_artifact(artifact)
@@ -1195,7 +1357,19 @@ def run_app() -> None:
 
                 try:
                     trace_url = st.session_state.llama_glass_url if chat_backend == "llama.cpp glass" else st.session_state.llama_url
-                    trace_layers = resolve_trace_layers(trace_url, st.session_state.llama_model_alias, summary) if auto_trace else [0]
+                    trace_plan = resolve_trace_plan(
+                        trace_url,
+                        st.session_state.llama_model_alias,
+                        summary,
+                        ui_model_path=st.session_state.llama_model_path,
+                        backend_process_model_path=managed_backend_process_model_path(),
+                    ) if auto_trace else {"layers": [0], "backend_info": local_glass_info}
+                    if auto_trace and trace_plan.get("modelIdentityMismatch"):
+                        raise RuntimeError(
+                            "UI selected model does not match the running llama.cpp backend. "
+                            f"{trace_plan.get('mismatchSummary')}. Restart llama.cpp with the selected GGUF before tracing."
+                        )
+                    trace_layers = trace_plan["layers"]
                     result = run_fuzz_experiment(
                         name=run_id,
                         prompts=prompt_items,
@@ -1209,7 +1383,7 @@ def run_app() -> None:
                         streams=["resid_pre"],
                         top_k=32,
                         include_vectors=include_trace_vectors,
-                        backend_info=local_glass_info,
+                        backend_info=trace_plan.get("backend_info") if isinstance(trace_plan.get("backend_info"), dict) else local_glass_info,
                         run_id=run_id,
                         mode="Batch run",
                         progress_callback=cb,
@@ -1324,6 +1498,10 @@ def run_app() -> None:
                 summary,
                 local_model_context=local_context,
                 backend_info=local_glass_info,
+                ui_selected_model_path=st.session_state.llama_model_path,
+                ui_selected_model_name=active_model_label(),
+                backend_process_model_path=managed_backend_process_model_path(),
+                active_model_fingerprint=st.session_state.get("activeModelFingerprint", ""),
                 visualization_mode=None if st.session_state.map_visualization_mode == "auto" else st.session_state.map_visualization_mode,
                 selected_prompt=st.session_state.map_selected_prompt,
                 selected_token=int(st.session_state.map_selected_token) if st.session_state.map_selected_token is not None else None,
@@ -1421,8 +1599,14 @@ def run_app() -> None:
     with tabs["Settings"]:
         ui.section_header("Settings", "Local llama.cpp paths and URLs.")
         render_tab_workspace_controls("Settings")
-        st.session_state.llama_model_alias = st.text_input("Model alias", value=st.session_state.llama_model_alias).strip()
-        st.session_state.llama_model_path = st.text_input("GGUF model path", value=st.session_state.llama_model_path)
+        next_model_alias = st.text_input("Model alias", value=st.session_state.llama_model_alias).strip()
+        next_model_path = st.text_input("GGUF model path", value=st.session_state.llama_model_path)
+        if next_model_alias != st.session_state.llama_model_alias or next_model_path != st.session_state.llama_model_path:
+            st.session_state.llama_model_alias = next_model_alias
+            st.session_state.llama_model_path = next_model_path
+            invalidate_model_dependent_state(st.session_state, next_model_path, next_model_alias)
+            st.warning("Model selection changed. Cached backend info and trace artifacts were cleared; restart llama.cpp with this GGUF before tracing.")
+            st.rerun()
         st.session_state.llama_url = st.text_input("Normal server URL", value=st.session_state.llama_url)
         st.session_state.llama_glass_url = st.text_input("Steered/server trace URL", value=st.session_state.llama_glass_url)
         st.session_state.llama_server_bin = st.text_input("llama-server binary", value=st.session_state.llama_server_bin)
