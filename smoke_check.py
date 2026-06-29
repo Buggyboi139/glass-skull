@@ -28,6 +28,7 @@ from glass_skull.config import (
     DEFAULT_GGUF_MODEL_PATH,
     TOOLTIP_DIR,
     ensure_dirs,
+    seed_batch_prompt_default,
     seed_missing_defaults,
 )
 from glass_skull.experiment_store import safe_slug
@@ -1112,13 +1113,28 @@ def main() -> None:
     original_user_batch = dict(user_batch_state)
     seed_missing_defaults(user_batch_state, {"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES})
     assert user_batch_state == original_user_batch
-    cleared_batch_state = {"batch_pasted_prompts": ""}
-    seed_missing_defaults(cleared_batch_state, {"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES})
-    assert cleared_batch_state["batch_pasted_prompts"] == ""
+    stale_empty_batch_state = {"batch_pasted_prompts": ""}
+    seed_missing_defaults(stale_empty_batch_state, {"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES})
+    seed_batch_prompt_default(stale_empty_batch_state)
+    assert stale_empty_batch_state["batch_pasted_prompts"] == DEFAULT_BATCH_MESSAGES
+    user_cleared_batch_state = {"batch_pasted_prompts": "", "batch_pasted_prompts_user_set": True}
+    seed_missing_defaults(user_cleared_batch_state, {"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES})
+    seed_batch_prompt_default(user_cleared_batch_state)
+    assert user_cleared_batch_state["batch_pasted_prompts"] == ""
     saved_batch_state = {"batch_pasted_prompts": "loaded workspace prompt"}
     target_batch_state = {"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES}
     apply_workspace_state(target_batch_state, saved_batch_state)
     assert target_batch_state["batch_pasted_prompts"] == "loaded workspace prompt"
+    loaded_empty_batch_state = {"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES}
+    apply_workspace_state(loaded_empty_batch_state, {"batch_pasted_prompts": ""})
+    seed_batch_prompt_default(loaded_empty_batch_state)
+    assert loaded_empty_batch_state["batch_pasted_prompts"] == ""
+    assert loaded_empty_batch_state["batch_pasted_prompts_user_set"] is True
+    loaded_empty_tab_state = {"batch_pasted_prompts": DEFAULT_BATCH_MESSAGES, "tab_state": {}}
+    apply_tab_state(loaded_empty_tab_state, "Run", {"batch_pasted_prompts": ""})
+    seed_batch_prompt_default(loaded_empty_tab_state)
+    assert loaded_empty_tab_state["batch_pasted_prompts"] == ""
+    assert loaded_empty_tab_state["batch_pasted_prompts_user_set"] is True
     assert dashboard_context("Batch run", "abc") == {"mode": "Batch run", "run_id": "abc"}
     assert new_run_id("unit").startswith("unit_")
     _assert_workspace_round_trip()

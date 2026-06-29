@@ -18,7 +18,7 @@ from glass_skull.activation_patch import (
 from glass_skull.behavior_profiles import get_behavior_profile, list_behavior_profiles
 from glass_skull.behavior_scoring import behavior_timeline_df, score_run_artifact
 from glass_skull.chat_store import list_chats, load_chat, save_chat
-from glass_skull.config import DEFAULT_BATCH_MESSAGES, DEFAULT_GGUF_MODEL_PATH, ensure_dirs, seed_missing_defaults
+from glass_skull.config import DEFAULT_BATCH_MESSAGES, DEFAULT_GGUF_MODEL_PATH, ensure_dirs, seed_batch_prompt_default, seed_missing_defaults
 from glass_skull.experiment_store import (
     create_experiment_dir,
     latest_run_artifacts,
@@ -166,6 +166,7 @@ def init_state() -> None:
         "behavior_run_history": [],
         "behavior_profile": "concise_helpfulness",
         "batch_pasted_prompts": DEFAULT_BATCH_MESSAGES,
+        "batch_pasted_prompts_user_set": False,
         "batch_running": False,
         "batch_status": "",
         "chat_cancel_requested": False,
@@ -191,6 +192,7 @@ def init_state() -> None:
         "map_annotation_status": "",
     }
     seed_missing_defaults(st.session_state, defaults)
+    seed_batch_prompt_default(st.session_state)
 
 
 def plot_if_present(fig, key_hint: str = "plot") -> None:
@@ -374,6 +376,10 @@ def _set_status(result, *, scope: str) -> None:
 def steer_help(control_id: str, tooltips: dict | None = None) -> str | None:
     entries = tooltips if isinstance(tooltips, dict) else ensure_tooltips("steer", STEER_CONTROL_METADATA)
     return tooltip_text(entries.get(control_id))
+
+
+def mark_batch_prompts_user_set() -> None:
+    st.session_state.batch_pasted_prompts_user_set = True
 
 
 def render_global_workspace_controls() -> None:
@@ -1269,7 +1275,7 @@ def run_app() -> None:
             st.warning(steering_error)
 
         if mode == "Batch run":
-            pasted = st.text_area("Pasted prompts", height=120, key="batch_pasted_prompts")
+            pasted = st.text_area("Pasted prompts", height=120, key="batch_pasted_prompts", on_change=mark_batch_prompts_user_set)
             run_batch = st.button("Run batch", type="primary", width="stretch")
             _tab_state("Run")["batch_pasted_prompts"] = st.session_state.batch_pasted_prompts
         else:

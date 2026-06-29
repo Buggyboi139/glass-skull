@@ -46,6 +46,11 @@ def seed_missing_defaults(state: MutableMapping[str, Any], defaults: dict[str, A
             state[key] = value
 
 
+def seed_batch_prompt_default(state: MutableMapping[str, Any]) -> None:
+    if not state.get("batch_pasted_prompts") and not state.get("batch_pasted_prompts_user_set"):
+        state["batch_pasted_prompts"] = DEFAULT_BATCH_MESSAGES
+
+
 def ensure_dirs() -> None:
     for path in [
         DATA_DIR,

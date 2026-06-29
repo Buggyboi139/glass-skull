@@ -26,6 +26,7 @@ GLOBAL_STATE_KEYS = [
     "llama_cvector_generator",
     "behavior_profile",
     "batch_pasted_prompts",
+    "batch_pasted_prompts_user_set",
     "map_visualization_mode",
     "map_selected_prompt",
     "map_selected_batch",
@@ -77,6 +78,7 @@ GLOBAL_CLEAR_DEFAULTS: dict[str, Any] = {
     "behavior_run_history": [],
     "behavior_profile": "concise_helpfulness",
     "batch_pasted_prompts": DEFAULT_BATCH_MESSAGES,
+    "batch_pasted_prompts_user_set": False,
     "batch_running": False,
     "batch_status": "",
     "loaded_activation_patch_recipe": None,
@@ -106,6 +108,7 @@ TAB_STATE_KEYS: dict[str, list[str]] = {
         "active_run_mode",
         "chat_backend_label",
         "batch_pasted_prompts",
+        "batch_pasted_prompts_user_set",
     ],
     "Map": [
         "behavior_profile",
@@ -177,6 +180,7 @@ TAB_CLEAR_DEFAULTS: dict[str, dict[str, Any]] = {
     "Run": {
         "active_run_mode": "Single message",
         "batch_pasted_prompts": DEFAULT_BATCH_MESSAGES,
+        "batch_pasted_prompts_user_set": False,
     },
     "Map": {
         "map_visualization_mode": "",
@@ -369,6 +373,8 @@ def apply_workspace_state(target: MutableMapping[str, Any], state: dict[str, Any
         if key in {"model", "map", "steering"}:
             continue
         target[key] = value
+    if "batch_pasted_prompts" in state:
+        target["batch_pasted_prompts_user_set"] = True
     model = state.get("model") if isinstance(state.get("model"), dict) else {}
     map_state = state.get("map") if isinstance(state.get("map"), dict) else {}
     steering = state.get("steering") if isinstance(state.get("steering"), dict) else {}
@@ -433,6 +439,8 @@ def apply_tab_state(app_state: MutableMapping[str, Any], tab_name: str, state: d
     for key, value in state.items():
         if key in allowed:
             app_state[key] = value
+    if tab_name == "Run" and "batch_pasted_prompts" in state:
+        app_state["batch_pasted_prompts_user_set"] = True
     tabs = app_state.get("tab_state")
     if not isinstance(tabs, dict):
         tabs = {}
