@@ -14,9 +14,6 @@ MANAGED_LLAMA_BUILD_DIR = Path(
     os.environ.get("GLASS_SKULL_LLAMA_BUILD_DIR", MANAGED_LLAMA_CPP_DIR / "build")
 ).expanduser()
 
-DEFAULT_CVECTOR_GENERATOR = Path(
-    os.environ.get("GLASS_SKULL_CVECTOR_GENERATOR", MANAGED_LLAMA_BUILD_DIR / "bin" / "llama-cvector-generator")
-).expanduser()
 DEFAULT_LLAMA_SERVER = Path(
     os.environ.get("GLASS_SKULL_LLAMA_SERVER", MANAGED_LLAMA_BUILD_DIR / "bin" / "llama-server")
 ).expanduser()

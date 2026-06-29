@@ -22,8 +22,6 @@ from glass_skull.behavior_profiles import get_behavior_profile, list_behavior_pr
 from glass_skull.behavior_scoring import behavior_timeline_df, score_behavior_output, score_run_artifact
 from glass_skull.chat_store import load_chat, save_chat
 from glass_skull.config import (
-    CONTROL_SET_DIR,
-    CONTROL_VECTOR_DIR,
     DEFAULT_BATCH_MESSAGES,
     DEFAULT_GGUF_MODEL_PATH,
     TOOLTIP_DIR,
@@ -31,8 +29,14 @@ from glass_skull.config import (
     seed_batch_prompt_default,
     seed_missing_defaults,
 )
+from glass_skull.direct_activation_steering import (
+    build_direct_activation_steering_payload,
+    parse_activation_node_ids,
+    selected_activation_target_from_group,
+)
 from glass_skull.experiment_store import safe_slug
 from glass_skull.fuzzing import run_fuzz_experiment
+from glass_skull.gguf import read_gguf_tensor_index
 from glass_skull import activation_map_view
 from glass_skull.activation_map_view import _legend_panel_html
 from glass_skull.node_annotations import (
@@ -47,22 +51,13 @@ from glass_skull.node_annotations import (
     update_note,
 )
 from glass_skull.llama_client import (
-    build_steering_metadata,
     chat_completion,
+    direct_activation_steering_status,
+    direct_activation_steering_supported,
     normalize_base_url,
-    per_request_steering_supported,
     trace_glass_prompt,
 )
-from glass_skull.llama_control import (
-    DEFAULT_CVECTOR_GENERATOR,
-    DEFAULT_LLAMA_SERVER,
-    build_cvector_command,
-    build_llama_server_command,
-    classify_cvector_failure,
-    preflight_control_vector_run,
-    read_gguf_tensor_index,
-    shell_join,
-)
+from glass_skull.llama_paths import DEFAULT_LLAMA_SERVER
 from glass_skull.path_mapping import rank_activation_paths, recommended_steering_targets
 from glass_skull.prompt_loader import load_jsonl, load_txt
 from glass_skull.run_artifacts import (
@@ -618,9 +613,7 @@ def _assert_patched_baseline_visible_to_app(rows: list[dict[str, Any]]) -> None:
 def _assert_managed_llama_defaults() -> None:
     launcher_source = Path("run_glass_skull.sh").read_text()
     managed_server_ref = 'managed/llama.cpp-glass/build/bin/llama-server'
-    managed_cvector_ref = 'managed/llama.cpp-glass/build/bin/llama-cvector-generator'
     assert DEFAULT_LLAMA_SERVER == Path.cwd() / managed_server_ref
-    assert DEFAULT_CVECTOR_GENERATOR == Path.cwd() / managed_cvector_ref
     assert "/home/dsmason321/llama.cpp" not in launcher_source
     assert "LLAMA_SERVER_BIN override" in launcher_source
     assert "Managed llama.cpp binary:" in launcher_source
@@ -644,8 +637,12 @@ def _assert_workspace_round_trip() -> None:
         "map_top_k": 8,
         "map_background_opacity": 0.24,
         "map_edge_threshold": 0.0,
-        "llama_control_vector": "vec-a",
-        "llama_control_strength": 1.25,
+        "direct_steering_enabled": True,
+        "direct_steering_targets": "L36-N175",
+        "direct_steering_direction": "Toward",
+        "direct_steering_strength": 0.4,
+        "direct_steering_token_scope": "all",
+        "map_steering_selected_target": {"node_id": "L36-N175", "layer": 36, "node": 175},
         "loaded_activation_patch_recipe": {"name": "patch-a"},
         "tab_state": {"Map": {"selected_group": "L0-N1"}, "Run": {"draft": "hello"}},
     }
@@ -658,6 +655,8 @@ def _assert_workspace_round_trip() -> None:
     assert data["state"]["batch_pasted_prompts"] == "edited\nbatch\nprompts"
     assert data["state"]["model"]["alias"] == "local"
     assert data["state"]["map"]["selected_prompt"] == 2
+    assert data["state"]["steering"]["targets"] == "L36-N175"
+    assert data["state"]["steering"]["direction"] == "Toward"
     assert data["state"]["tab_state"]["Map"]["selected_group"] == "L0-N1"
     assert data["state"]["annotations"]["path"].endswith("data/node_annotations/annotations.json")
     assert "annotations" not in data["state"]["annotations"]
@@ -685,6 +684,26 @@ def _assert_workspace_round_trip() -> None:
     assert state["tab_state"] == {}
     assert saved.path.exists()
 
+    legacy_target = {
+        "direct_steering_enabled": True,
+        "direct_steering_targets": "L99-N99",
+        "direct_steering_direction": "Away",
+        "direct_steering_strength": 9.0,
+        "direct_steering_token_scope": "generated",
+        "map_steering_selected_target": {"node_id": "L99-N99"},
+    }
+    apply_workspace_state(
+        legacy_target,
+        {"steering": {"control_vector": "/tmp/legacy.gguf", "strength": 8.0, "patch_recipe": {"name": "kept"}}},
+    )
+    assert legacy_target["direct_steering_enabled"] is False
+    assert legacy_target["direct_steering_targets"] == ""
+    assert legacy_target["direct_steering_direction"] == "Toward"
+    assert legacy_target["direct_steering_strength"] == 0.4
+    assert legacy_target["direct_steering_token_scope"] == "all"
+    assert legacy_target["map_steering_selected_target"] is None
+    assert legacy_target["loaded_activation_patch_recipe"] == {"name": "kept"}
+
     tab_state = {"global_marker": "keep", "tab_state": {"Map": {"selected_group": "old"}, "Run": {"draft": "keep"}}}
     tab_saved = save_tab_state("Map", {"selected_group": "L1-N2", "zoom": 2}, name="smoke_map")
     assert "tabs/Map" in tab_saved.path.as_posix()
@@ -705,34 +724,34 @@ def _assert_workspace_round_trip() -> None:
     assert tab_state["tab_state"]["Run"] == {"draft": "keep"}
 
     app_state = {
-        "llama_control_strength": 0.5,
-        "llama_control_layer_start": 2,
-        "llama_control_layer_end": 6,
-        "llama_control_port": 8099,
-        "llama_control_extra_args": "--jinja",
+        "direct_steering_enabled": True,
+        "direct_steering_targets": "L36-N175",
+        "direct_steering_direction": "Away",
+        "direct_steering_strength": 0.5,
+        "direct_steering_token_scope": "generated",
         "tab_state": {"Steer": {"workspace_name": "old"}},
     }
     steer_state = collect_tab_state("Steer", app_state)
-    assert steer_state["llama_control_strength"] == 0.5
-    apply_tab_state(app_state, "Steer", {"llama_control_strength": 1.75, "llama_control_layer_end": 12})
-    assert app_state["llama_control_strength"] == 1.75
-    assert app_state["llama_control_layer_end"] == 12
+    assert steer_state["direct_steering_targets"] == "L36-N175"
+    apply_tab_state(app_state, "Steer", {"direct_steering_strength": 0.75, "direct_steering_targets": "L40-N18"})
+    assert app_state["direct_steering_strength"] == 0.75
+    assert app_state["direct_steering_targets"] == "L40-N18"
     clear_tab_state(app_state, "Steer")
-    assert app_state["llama_control_strength"] == 1.25
-    assert app_state["llama_control_layer_start"] == 1
+    assert app_state["direct_steering_enabled"] is False
+    assert app_state["direct_steering_targets"] == ""
     assert app_state["tab_state"]["Steer"] == {}
     settings_state = {
         "llama_model_alias": "changed",
         "llama_model_path": "/tmp/changed.gguf",
         "llama_url": "http://127.0.0.1:9999",
         "llama_glass_url": "http://127.0.0.1:9998",
-        "llama_control_strength": 9.0,
+        "direct_steering_strength": 0.9,
         "tab_state": {"Settings": {"workspace_name": "old"}},
     }
     clear_tab_state(settings_state, "Settings")
     assert settings_state["llama_model_alias"] == "local"
     assert settings_state["llama_model_path"] == str(DEFAULT_GGUF_MODEL_PATH)
-    assert settings_state["llama_control_strength"] == 9.0
+    assert settings_state["direct_steering_strength"] == 0.9
     assert settings_state["tab_state"]["Settings"] == {}
     for path in [saved.path, renamed.path, corrupt_path, tab_saved.path, run_tab_saved.path]:
         path.unlink(missing_ok=True)
@@ -765,6 +784,160 @@ def _assert_steer_tooltips() -> None:
     assert "Smoke control" in rendered
     assert "Approved local edit." in rendered
     path.unlink(missing_ok=True)
+
+
+def _assert_direct_activation_steering_model() -> None:
+    single = parse_activation_node_ids("L36-N175")
+    assert single == [{"node_id": "L36-N175", "layer": 36, "node": 175, "node_range": [175, 175]}]
+
+    comma = parse_activation_node_ids("L36-N175,L40-N18")
+    newline = parse_activation_node_ids("L36-N175\nL40-N18")
+    assert [target["node_id"] for target in comma] == ["L36-N175", "L40-N18"]
+    assert comma == newline
+
+    toward = build_direct_activation_steering_payload(
+        enabled=True,
+        targets="L36-N175",
+        direction="Toward",
+        strength=0.4,
+        token_scope="all",
+    )
+    assert toward["enabled"] is True
+    assert toward["targets"][0]["node_id"] == "L36-N175"
+    assert toward["direction"] == "toward"
+    assert toward["strength"] == 0.4
+    assert toward["token_scope"] == "all"
+
+    away = build_direct_activation_steering_payload(
+        enabled=True,
+        targets="L36-N175,L40-N18",
+        direction="Away",
+        strength=0.2,
+        token_scope="generated",
+    )
+    assert away["direction"] == "away"
+    assert away["strength"] == -0.2
+    assert [target["node_id"] for target in away["targets"]] == ["L36-N175", "L40-N18"]
+    assert build_direct_activation_steering_payload(
+        enabled=False,
+        targets="not-a-node",
+        direction="Sideways",
+        strength=0.2,
+        token_scope="middle",
+    ) is None
+
+    selected = selected_activation_target_from_group({
+        "groupId": "L40-N18",
+        "layerId": "L40",
+        "nodeRange": [18, 22],
+        "activationValue": 0.75,
+    })
+    assert selected == {
+        "node_id": "L40-N18",
+        "layer": 40,
+        "node": 18,
+        "channel": 18,
+        "node_range": [18, 22],
+        "activation_value": 0.75,
+    }
+
+    _assert_raises(ValueError, parse_activation_node_ids, "L36:N175")
+    _assert_raises(ValueError, build_direct_activation_steering_payload, True, "", "Toward", 0.4, "all")
+    _assert_raises(ValueError, build_direct_activation_steering_payload, True, "L36-N175", "Sideways", 0.4, "all")
+    _assert_raises(ValueError, build_direct_activation_steering_payload, True, "L36-N175", "Toward", 0.4, "middle")
+
+
+def _assert_direct_activation_capability_detection() -> None:
+    supported_info = {
+        "capabilities": {
+            "direct_activation_steering": {
+                "supported": True,
+                "contract": {
+                    "request": "glass_skull.direct_activation_steering",
+                    "openai_compatible_alternate": "metadata.glass_skull.direct_activation_steering",
+                },
+            }
+        }
+    }
+    assert direct_activation_steering_supported(supported_info) is True
+    assert direct_activation_steering_status(supported_info)["status"] == "supported"
+    missing_contract_status = direct_activation_steering_status({"capabilities": {"direct_activation_steering": {"supported": True}}})
+    assert direct_activation_steering_supported({"capabilities": {"direct_activation_steering": {"supported": True}}}) is False
+    assert missing_contract_status["status"] == "partial"
+
+    legacy_info = {
+        "capabilities": {
+            "steering": {
+                "per_request": {
+                    "supported": True,
+                    "contract": {
+                        "request": "glass_skull.steering",
+                        "control_vector": "path to a llama.cpp GGUF control vector",
+                    },
+                }
+            }
+        }
+    }
+    legacy_status = direct_activation_steering_status(legacy_info)
+    assert direct_activation_steering_supported(legacy_info) is False
+    assert legacy_status["status"] == "partial"
+    assert "legacy steering contract" in legacy_status["message"]
+    assert direct_activation_steering_status({})["status"] == "unsupported"
+
+
+def _assert_direct_activation_request_payloads() -> None:
+    direct_payload = build_direct_activation_steering_payload(
+        enabled=True,
+        targets="L36-N175,L40-N18",
+        direction="Away",
+        strength=0.2,
+        token_scope="generated",
+    )
+    captured: list[dict[str, Any]] = []
+    import glass_skull.llama_client as llama_client
+    original_request_json = llama_client._request_json
+    try:
+        llama_client._request_json = _fake_llama_request(captured)
+        output = chat_completion(
+            "http://local/v1",
+            "hello",
+            model_alias="local",
+            direct_activation_steering=direct_payload,
+            direct_activation_steering_supported=True,
+        )
+        assert output == "local reply"
+        chat_completion("http://local/v1", "hello", model_alias="local")
+    finally:
+        llama_client._request_json = original_request_json
+
+    steered_request = [r for r in captured if r["url"].endswith("/v1/chat/completions")][0]
+    unsteered_request = [r for r in captured if r["url"].endswith("/v1/chat/completions")][-1]
+    steered_glass = steered_request["payload"]["glass_skull"]["direct_activation_steering"]
+    steered_metadata = steered_request["payload"]["metadata"]["glass_skull"]["direct_activation_steering"]
+    assert steered_glass == direct_payload
+    assert steered_metadata == direct_payload
+    assert "steering" not in steered_request["payload"]["glass_skull"]
+    assert "direct_activation_steering" not in unsteered_request["payload"].get("glass_skull", {})
+    assert "metadata" not in unsteered_request["payload"] or "direct_activation_steering" not in unsteered_request["payload"].get("metadata", {}).get("glass_skull", {})
+
+
+def _assert_no_visible_legacy_steering_workflow() -> None:
+    main_source = Path("main.py").read_text()
+    tooltip_source = Path("glass_skull/tooltip_generator.py").read_text()
+    for forbidden in [
+        "Positive prompts",
+        "Negative prompts",
+        "Control set",
+        "Control vector",
+        "Generate vector",
+        "Save control set",
+        "Steered server command",
+    ]:
+        assert forbidden not in main_source
+        assert forbidden not in tooltip_source
+    assert "Enable Direct Steering" in main_source
+    assert "Target Node IDs" in main_source
+    assert "Backend Capability Status" in main_source
 
 
 def _assert_node_annotation_round_trip() -> None:
@@ -1098,6 +1271,7 @@ def main() -> None:
     assert "active_recipe = validate_activation_patch_recipe(loaded_recipe)" in main_source
     assert "build_activation_patch_backend_payload(active_recipe" in main_source
     assert "render_activation_map(payload, key=f\"activation_map_{artifact.get('run_id', 'latest')}\", height=1840)" in main_source
+    _assert_no_visible_legacy_steering_workflow()
     render_source = inspect.getsource(activation_map_view.render_activation_map)
     assert "st.iframe" in render_source
     assert "components.html" not in render_source
@@ -1170,6 +1344,9 @@ def main() -> None:
     assert new_run_id("unit").startswith("unit_")
     _assert_workspace_round_trip()
     _assert_steer_tooltips()
+    _assert_direct_activation_steering_model()
+    _assert_direct_activation_capability_detection()
+    _assert_direct_activation_request_payloads()
     _assert_node_annotation_round_trip()
 
     dummy_backend_patch = {"recipe": {"name": "smoke patch", "target_run_id": "run1", "patches": []}, "source_vectors": []}
@@ -1208,9 +1385,6 @@ def main() -> None:
     assert trace_request["payload"]["capture"]["layer_inputs"] is True
     assert trace_request["payload"]["max_tokens"] == 8
     assert trace_request["payload"]["include_vectors"] is True
-    assert per_request_steering_supported({"capabilities": {"steering": {"per_request": {"supported": True}}}}) is True
-    assert build_steering_metadata("vec.gguf", 1.25, 1, 4)["layer_end"] == 4
-
     rows = normalize_llama_trace(trace, prompt_id=0, label="single", metadata={"run_id": "run1"})
     assert rows[0]["token"] == "hi"
     assert rows[0]["batch_id"] is None
@@ -1719,20 +1893,14 @@ def main() -> None:
     assert behavior_delta_bar_fig(timeline, baseline_run_id="run1", comparison_run_id="run2") is not None
     assert path_rank_bar_fig(pd.DataFrame([{"layer": 0, "stream": "resid_pre", "score": 1.0, "delta": 0.5, "positive_mean": 1, "negative_mean": 0, "positive_count": 1, "negative_count": 1}])) is not None
 
-    fake_gguf = CONTROL_VECTOR_DIR / "smoke_fake.gguf"
-    _write_fake_gguf(fake_gguf)
-    tensors = pd.DataFrame(read_gguf_tensor_index(fake_gguf))
-    assert not tensors.empty
-    assert gguf_tensor_shape_scatter_fig(tensors) is not None
-    preflight = preflight_control_vector_run(fake_gguf, None, None, "/no/generator", "/no/server")
-    assert any(check.name == "GGUF model" and check.status == "ok" for check in preflight.checks)
-    cmd = build_cvector_command(fake_gguf, "pos.txt", "neg.txt", "vec.gguf", "/bin/gen")
-    assert "--positive-file" in cmd and "--negative-file" in cmd
-    server_cmd = build_llama_server_command(fake_gguf, "vec.gguf", 1.25, 1, 2, "/bin/server", port=8088, alias="local")
-    assert "--control-vector-scaled" in server_cmd
-    assert "llama-server" not in shell_join(["/custom/server"])
-    failure = classify_cvector_failure("invalid output tensor count", "")
-    assert failure.cause
+    fake_gguf = Path("/tmp/glass_skull_smoke_fake.gguf")
+    try:
+        _write_fake_gguf(fake_gguf)
+        tensors = pd.DataFrame(read_gguf_tensor_index(fake_gguf))
+        assert not tensors.empty
+        assert gguf_tensor_shape_scatter_fig(tensors) is not None
+    finally:
+        fake_gguf.unlink(missing_ok=True)
 
     save_chat([{"role": "user", "content": "smoke"}], label="smoke")
     assert isinstance(load_chat(), list)

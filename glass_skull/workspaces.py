@@ -8,11 +8,20 @@ from typing import Any, MutableMapping
 
 from .config import DEFAULT_BATCH_MESSAGES, DEFAULT_GGUF_MODEL_PATH, GLOBAL_WORKSPACE_DIR, TAB_WORKSPACE_DIR
 from .experiment_store import safe_slug
-from .llama_paths import DEFAULT_CVECTOR_GENERATOR, DEFAULT_LLAMA_SERVER
+from .llama_paths import DEFAULT_LLAMA_SERVER
 from .node_annotations import annotation_file_metadata
 
 
 DEFAULT_CHAT_BACKEND_LABEL = "Local GGUF normal (llama.cpp)"
+
+DIRECT_STEERING_CLEAR_DEFAULTS: dict[str, Any] = {
+    "direct_steering_enabled": False,
+    "direct_steering_targets": "",
+    "direct_steering_direction": "Toward",
+    "direct_steering_strength": 0.4,
+    "direct_steering_token_scope": "all",
+    "map_steering_selected_target": None,
+}
 
 GLOBAL_STATE_KEYS = [
     "active_run_id",
@@ -23,7 +32,6 @@ GLOBAL_STATE_KEYS = [
     "llama_url",
     "llama_glass_url",
     "llama_server_bin",
-    "llama_cvector_generator",
     "behavior_profile",
     "batch_pasted_prompts",
     "batch_pasted_prompts_user_set",
@@ -37,13 +45,12 @@ GLOBAL_STATE_KEYS = [
     "map_edge_threshold",
     "map_show_aggregate_heatmap",
     "map_show_secondary_branches",
-    "llama_control_set",
-    "llama_control_vector",
-    "llama_control_strength",
-    "llama_control_layer_start",
-    "llama_control_layer_end",
-    "llama_control_port",
-    "llama_control_extra_args",
+    "direct_steering_enabled",
+    "direct_steering_targets",
+    "direct_steering_direction",
+    "direct_steering_strength",
+    "direct_steering_token_scope",
+    "map_steering_selected_target",
     "loaded_activation_patch_recipe",
     "last_activation_patch_comparison",
     "tab_state",
@@ -61,14 +68,7 @@ GLOBAL_CLEAR_DEFAULTS: dict[str, Any] = {
     "llama_url": "http://127.0.0.1:8080",
     "llama_glass_url": "http://127.0.0.1:8088",
     "llama_server_bin": str(DEFAULT_LLAMA_SERVER),
-    "llama_cvector_generator": str(DEFAULT_CVECTOR_GENERATOR),
-    "llama_control_set": "",
-    "llama_control_vector": "",
-    "llama_control_strength": 1.25,
-    "llama_control_layer_start": 1,
-    "llama_control_layer_end": 32,
-    "llama_control_port": 8088,
-    "llama_control_extra_args": "--jinja --flash-attn auto",
+    **DIRECT_STEERING_CLEAR_DEFAULTS,
     "local_dashboard_trace": None,
     "local_dashboard_trace_meta": {},
     "local_dashboard_trace_counter": 0,
@@ -125,15 +125,15 @@ TAB_STATE_KEYS: dict[str, list[str]] = {
         "map_show_aggregate_heatmap",
         "map_show_secondary_branches",
         "map_annotation_selected_group",
+        "map_steering_selected_target",
     ],
     "Steer": [
-        "llama_control_set",
-        "llama_control_vector",
-        "llama_control_strength",
-        "llama_control_layer_start",
-        "llama_control_layer_end",
-        "llama_control_port",
-        "llama_control_extra_args",
+        "direct_steering_enabled",
+        "direct_steering_targets",
+        "direct_steering_direction",
+        "direct_steering_strength",
+        "direct_steering_token_scope",
+        "map_steering_selected_target",
         "loaded_activation_patch_recipe",
         "last_activation_patch_comparison",
         "patch_source_run",
@@ -162,9 +162,6 @@ TAB_STATE_KEYS: dict[str, list[str]] = {
         "llama_url",
         "llama_glass_url",
         "llama_server_bin",
-        "llama_cvector_generator",
-        "llama_control_port",
-        "llama_control_extra_args",
     ],
 }
 
@@ -174,9 +171,6 @@ MODEL_AND_SETTINGS_CLEAR_DEFAULTS: dict[str, Any] = {
     "llama_url": "http://127.0.0.1:8080",
     "llama_glass_url": "http://127.0.0.1:8088",
     "llama_server_bin": str(DEFAULT_LLAMA_SERVER),
-    "llama_cvector_generator": str(DEFAULT_CVECTOR_GENERATOR),
-    "llama_control_port": 8088,
-    "llama_control_extra_args": "--jinja --flash-attn auto",
 }
 
 TAB_CLEAR_DEFAULTS: dict[str, dict[str, Any]] = {
@@ -197,15 +191,15 @@ TAB_CLEAR_DEFAULTS: dict[str, dict[str, Any]] = {
         "map_show_aggregate_heatmap": False,
         "map_show_secondary_branches": True,
         "map_annotation_selected_group": "",
+        "map_steering_selected_target": None,
     },
     "Steer": {
-        "llama_control_set": "",
-        "llama_control_vector": "",
-        "llama_control_strength": 1.25,
-        "llama_control_layer_start": 1,
-        "llama_control_layer_end": 32,
-        "llama_control_port": 8088,
-        "llama_control_extra_args": "--jinja --flash-attn auto",
+        "direct_steering_enabled": False,
+        "direct_steering_targets": "",
+        "direct_steering_direction": "Toward",
+        "direct_steering_strength": 0.4,
+        "direct_steering_token_scope": "all",
+        "map_steering_selected_target": None,
         "loaded_activation_patch_recipe": None,
         "last_activation_patch_comparison": None,
         "patch_source_run": None,
@@ -308,7 +302,6 @@ def collect_workspace_state(state: MutableMapping[str, Any]) -> dict[str, Any]:
         "normal_url": _jsonable(state.get("llama_url", "")),
         "glass_url": _jsonable(state.get("llama_glass_url", "")),
         "server_bin": _jsonable(state.get("llama_server_bin", "")),
-        "cvector_generator": _jsonable(state.get("llama_cvector_generator", "")),
         "backend": _jsonable(state.get("chat_backend_label", "")),
     }
     selected["map"] = {
@@ -321,15 +314,15 @@ def collect_workspace_state(state: MutableMapping[str, Any]) -> dict[str, Any]:
         "edge_threshold": _jsonable(state.get("map_edge_threshold", 0.0)),
         "show_aggregate_heatmap": _jsonable(state.get("map_show_aggregate_heatmap", False)),
         "show_secondary_branches": _jsonable(state.get("map_show_secondary_branches", True)),
+        "steering_selected_target": _jsonable(state.get("map_steering_selected_target")),
     }
     selected["steering"] = {
-        "control_set": _jsonable(state.get("llama_control_set", "")),
-        "control_vector": _jsonable(state.get("llama_control_vector", "")),
-        "strength": _jsonable(state.get("llama_control_strength", 1.25)),
-        "layer_start": _jsonable(state.get("llama_control_layer_start", 1)),
-        "layer_end": _jsonable(state.get("llama_control_layer_end", 32)),
-        "port": _jsonable(state.get("llama_control_port", 8088)),
-        "extra_args": _jsonable(state.get("llama_control_extra_args", "")),
+        "enabled": _jsonable(state.get("direct_steering_enabled", False)),
+        "targets": _jsonable(state.get("direct_steering_targets", "")),
+        "direction": _jsonable(state.get("direct_steering_direction", "Toward")),
+        "strength": _jsonable(state.get("direct_steering_strength", 0.4)),
+        "token_scope": _jsonable(state.get("direct_steering_token_scope", "all")),
+        "selected_target": _jsonable(state.get("map_steering_selected_target")),
         "patch_recipe": _jsonable(state.get("loaded_activation_patch_recipe")),
     }
     selected["annotations"] = annotation_file_metadata()
@@ -373,6 +366,9 @@ def load_workspace(name: str) -> WorkspaceResult:
 
 
 def apply_workspace_state(target: MutableMapping[str, Any], state: dict[str, Any]) -> None:
+    for key, value in DIRECT_STEERING_CLEAR_DEFAULTS.items():
+        target[key] = _jsonable(value)
+
     for key, value in state.items():
         if key in {"model", "map", "steering"}:
             continue
@@ -389,7 +385,6 @@ def apply_workspace_state(target: MutableMapping[str, Any], state: dict[str, Any
         "normal_url": "llama_url",
         "glass_url": "llama_glass_url",
         "server_bin": "llama_server_bin",
-        "cvector_generator": "llama_cvector_generator",
         "backend": "chat_backend_label",
     }
     for source, dest in key_map.items():
@@ -405,21 +400,24 @@ def apply_workspace_state(target: MutableMapping[str, Any], state: dict[str, Any
         "edge_threshold": "map_edge_threshold",
         "show_aggregate_heatmap": "map_show_aggregate_heatmap",
         "show_secondary_branches": "map_show_secondary_branches",
+        "steering_selected_target": "map_steering_selected_target",
     }.items():
         if source in map_state:
             target[dest] = map_state[source]
-    for source, dest in {
-        "control_set": "llama_control_set",
-        "control_vector": "llama_control_vector",
-        "strength": "llama_control_strength",
-        "layer_start": "llama_control_layer_start",
-        "layer_end": "llama_control_layer_end",
-        "port": "llama_control_port",
-        "extra_args": "llama_control_extra_args",
-        "patch_recipe": "loaded_activation_patch_recipe",
-    }.items():
-        if source in steering:
-            target[dest] = steering[source]
+    direct_steering_keys = {"enabled", "targets", "direction", "token_scope", "selected_target"}
+    if direct_steering_keys.intersection(steering):
+        for source, dest in {
+            "enabled": "direct_steering_enabled",
+            "targets": "direct_steering_targets",
+            "direction": "direct_steering_direction",
+            "strength": "direct_steering_strength",
+            "token_scope": "direct_steering_token_scope",
+            "selected_target": "map_steering_selected_target",
+        }.items():
+            if source in steering:
+                target[dest] = steering[source]
+    if "patch_recipe" in steering:
+        target["loaded_activation_patch_recipe"] = steering["patch_recipe"]
 
 
 def clear_workspace(state: MutableMapping[str, Any]) -> None:

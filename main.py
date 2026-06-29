@@ -19,6 +19,11 @@ from glass_skull.behavior_profiles import get_behavior_profile, list_behavior_pr
 from glass_skull.behavior_scoring import behavior_timeline_df, score_run_artifact
 from glass_skull.chat_store import list_chats, load_chat, save_chat
 from glass_skull.config import DEFAULT_BATCH_MESSAGES, DEFAULT_GGUF_MODEL_PATH, ensure_dirs, seed_batch_prompt_default, seed_missing_defaults
+from glass_skull.direct_activation_steering import (
+    build_direct_activation_steering_payload,
+    parse_activation_node_ids,
+    selected_activation_target_from_group,
+)
 from glass_skull.experiment_store import (
     create_experiment_dir,
     latest_run_artifacts,
@@ -32,30 +37,18 @@ from glass_skull.experiment_store import (
 )
 from glass_skull.fuzzing import run_fuzz_experiment
 from glass_skull.llama_client import (
-    build_steering_metadata,
     chat_completion,
     check_server,
     get_glass_info,
     activation_patch_diagnostic,
     activation_patch_supported,
-    per_request_steering_supported,
+    direct_activation_steering_status,
+    direct_activation_steering_supported,
     trace_glass_prompt,
     trace_vectors_supported,
 )
 from glass_skull.node_annotations import add_tag, delete_annotation, delete_note, delete_tag, update_note, upsert_annotation
-from glass_skull.llama_control import (
-    DEFAULT_CVECTOR_GENERATOR,
-    DEFAULT_LLAMA_SERVER,
-    ControlVectorRunError,
-    build_cvector_command,
-    build_llama_server_command,
-    generate_control_vector,
-    list_control_sets,
-    list_control_vectors,
-    preflight_control_vector_run,
-    shell_join,
-    write_control_set,
-)
+from glass_skull.llama_paths import DEFAULT_LLAMA_SERVER
 from glass_skull.logger import log_run, recent_runs
 from glass_skull.model_context import local_gguf_context
 from glass_skull.path_mapping import rank_activation_paths, recommended_steering_targets
@@ -103,7 +96,8 @@ ensure_dirs()
 ui.inject_theme()
 
 CHAT_BACKEND_NORMAL = "Local GGUF normal (llama.cpp)"
-CHAT_BACKEND_STEERED = "Local GGUF steered (llama.cpp)"
+CHAT_BACKEND_STEERED = "Local GGUF Glass server (llama.cpp)"
+LEGACY_CHAT_BACKEND_STEERED = "Local GGUF steered (llama.cpp)"
 CHAT_BACKENDS = [CHAT_BACKEND_NORMAL, CHAT_BACKEND_STEERED]
 DEFAULT_CHAT_INPUT = "hi"
 
@@ -111,7 +105,7 @@ DEFAULT_CHAT_INPUT = "hi"
 def normalize_chat_backend(label: str) -> str:
     if label in {"llama.cpp normal", CHAT_BACKEND_NORMAL}:
         return "llama.cpp normal"
-    if label in {"llama.cpp glass", CHAT_BACKEND_STEERED}:
+    if label in {"llama.cpp glass", CHAT_BACKEND_STEERED, LEGACY_CHAT_BACKEND_STEERED}:
         return "llama.cpp glass"
     return "llama.cpp normal"
 
@@ -145,17 +139,13 @@ def init_state() -> None:
         "llama_model_path": str(DEFAULT_GGUF_MODEL_PATH),
         "activeModelFingerprint": "",
         "modelArtifactsInvalidated": False,
-        "llama_cvector_generator": str(DEFAULT_CVECTOR_GENERATOR),
         "llama_server_bin": str(DEFAULT_LLAMA_SERVER),
-        "llama_control_set": "",
-        "llama_control_vector": "",
-        "llama_control_strength": 1.25,
-        "llama_control_layer_start": 1,
-        "llama_control_layer_end": 32,
-        "llama_control_port": 8088,
-        "llama_control_extra_args": "--jinja --flash-attn auto",
-        "llama_last_preflight": None,
-        "llama_last_cvector_failure": None,
+        "direct_steering_enabled": False,
+        "direct_steering_targets": "",
+        "direct_steering_direction": "Toward",
+        "direct_steering_strength": 0.4,
+        "direct_steering_token_scope": "all",
+        "map_steering_selected_target": None,
         "local_dashboard_trace": None,
         "local_dashboard_trace_meta": {},
         "local_dashboard_trace_counter": 0,
@@ -259,6 +249,16 @@ def render_node_annotation_inspector(payload: dict) -> None:
         st.text_area("Saved note", value=note, height=100, disabled=True, key=f"annotation_saved_note_{selected_group_id}")
     else:
         st.caption("Note: none")
+
+    if st.button("Use For Steering", key="map_use_for_steering", width="stretch"):
+        try:
+            target = selected_activation_target_from_group(group)
+            st.session_state.map_steering_selected_target = target
+            st.session_state.direct_steering_targets = str(target["node_id"])
+            st.session_state.map_annotation_status = f"Selected {target['node_id']} for direct steering."
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not use this node for steering: {exc}")
 
     annotation_id = annotation_ids[0] if annotation_ids else ""
     if annotation_id and match_type == "approximate":
@@ -522,6 +522,7 @@ def apply_known_tab_state(tab_name: str, state: dict | None) -> None:
             "show_aggregate_heatmap": "map_show_aggregate_heatmap",
             "show_secondary_branches": "map_show_secondary_branches",
             "annotation_selected_group": "map_annotation_selected_group",
+            "steering_selected_target": "map_steering_selected_target",
         }
         for source, dest in mapping.items():
             if source in state:
@@ -713,6 +714,7 @@ def clear_model_dependent_state(state) -> None:
         "map_selected_batch": None,
         "map_selected_token": None,
         "map_annotation_selected_group": "",
+        "map_steering_selected_target": None,
     }
     for key, value in clear_values.items():
         state[key] = value() if callable(value) else value
@@ -892,16 +894,16 @@ def latest_behavior_artifact() -> dict:
     return latest_saved_behavior_artifact()
 
 
-def selected_control_vector_payload() -> tuple[dict | None, str | None]:
-    vector_name = str(st.session_state.get("llama_control_vector") or "").strip()
-    if not vector_name:
-        return None, "No control vector is selected."
+def selected_direct_activation_steering_payload() -> tuple[dict | None, str | None]:
+    if not bool(st.session_state.get("direct_steering_enabled", False)):
+        return None, None
     try:
-        return build_steering_metadata(
-            vector_name,
-            float(st.session_state.get("llama_control_strength", 1.25)),
-            int(st.session_state.get("llama_control_layer_start", 1)),
-            int(st.session_state.get("llama_control_layer_end", 32)),
+        return build_direct_activation_steering_payload(
+            enabled=True,
+            targets=str(st.session_state.get("direct_steering_targets") or ""),
+            direction=str(st.session_state.get("direct_steering_direction") or "Toward"),
+            strength=float(st.session_state.get("direct_steering_strength", 0.4)),
+            token_scope=str(st.session_state.get("direct_steering_token_scope") or "all"),
         ), None
     except Exception as exc:
         return None, str(exc)
@@ -941,109 +943,96 @@ def parse_layer_list(raw: str, max_layer: int) -> list[int]:
     return sorted(layers)
 
 
-def render_control_panel(local_context: dict | None, steer_tooltips: dict | None = None) -> None:
-    ui.section_header("Local control vectors", "Generate and launch llama.cpp control-vector runs.")
-    control_sets = list_control_sets()
-    control_vectors = list_control_vectors()
+def render_direct_activation_steering_panel(glass_info: dict | None, steer_tooltips: dict | None = None) -> None:
+    ui.section_header("Direct Activation Steering", "Steer toward or away from Activation Map node IDs.")
+    selected_target = st.session_state.get("map_steering_selected_target")
+    if isinstance(selected_target, dict) and not st.session_state.get("direct_steering_targets"):
+        st.session_state.direct_steering_targets = str(selected_target.get("node_id") or "")
 
-    c1, c2 = st.columns(2)
+    status = direct_activation_steering_status(glass_info)
+    st.subheader("Backend Capability Status")
+    status_text = f"{status['label']}: {status['message']}"
+    if status["status"] == "supported":
+        st.success(status_text)
+    elif status["status"] == "partial":
+        st.warning(status_text)
+    else:
+        st.error(status_text)
+
+    if isinstance(selected_target, dict) and selected_target.get("node_id"):
+        st.caption(
+            "Map selection: "
+            f"{selected_target.get('node_id')} | layer {selected_target.get('layer')} | "
+            f"node {selected_target.get('node')} | activation {float(selected_target.get('activation_value') or 0.0):.3f}"
+        )
+
+    st.session_state.direct_steering_enabled = st.toggle(
+        "Enable Direct Steering",
+        value=bool(st.session_state.get("direct_steering_enabled", False)),
+        help=steer_help("direct_steering_enabled", steer_tooltips),
+    )
+    st.session_state.direct_steering_targets = st.text_area(
+        "Target Node IDs",
+        value=str(st.session_state.get("direct_steering_targets") or ""),
+        height=104,
+        placeholder="L36-N175\nL40-N18",
+        help=steer_help("direct_steering_targets", steer_tooltips),
+    )
+
+    c1, c2, c3 = st.columns(3)
     with c1:
-        control_set_names = [""] + [str(item.get("name", "")) for item in control_sets]
-        current_control_set = st.session_state.get("llama_control_set", "")
-        st.session_state.llama_control_set = st.selectbox(
-            "Control set",
-            control_set_names,
-            index=control_set_names.index(current_control_set) if current_control_set in control_set_names else 0,
-            help=steer_help("control_set", steer_tooltips),
+        direction_options = ["Toward", "Away"]
+        current_direction = str(st.session_state.get("direct_steering_direction") or "Toward")
+        st.session_state.direct_steering_direction = st.selectbox(
+            "Direction",
+            direction_options,
+            index=direction_options.index(current_direction) if current_direction in direction_options else 0,
+            help=steer_help("direct_steering_direction", steer_tooltips),
         )
     with c2:
-        control_vector_names = [""] + [str(item.get("name", "")) for item in control_vectors]
-        current_control_vector = st.session_state.get("llama_control_vector", "")
-        st.session_state.llama_control_vector = st.selectbox(
-            "Control vector",
-            control_vector_names,
-            index=control_vector_names.index(current_control_vector) if current_control_vector in control_vector_names else 0,
-            help=steer_help("control_vector", steer_tooltips),
+        st.session_state.direct_steering_strength = st.slider(
+            "Strength",
+            0.0,
+            2.0,
+            float(st.session_state.get("direct_steering_strength", 0.4)),
+            0.05,
+            help=steer_help("direct_steering_strength", steer_tooltips),
+        )
+    with c3:
+        scope_options = ["all", "prompt", "generated"]
+        scope_labels = {"all": "All tokens", "prompt": "Prompt tokens", "generated": "Generated tokens"}
+        current_scope = str(st.session_state.get("direct_steering_token_scope") or "all")
+        st.session_state.direct_steering_token_scope = st.selectbox(
+            "Token Scope",
+            scope_options,
+            index=scope_options.index(current_scope) if current_scope in scope_options else 0,
+            format_func=lambda value: scope_labels.get(value, value),
+            help=steer_help("direct_steering_token_scope", steer_tooltips),
         )
 
-    with st.expander("Create control set", expanded=False):
-        set_name = st.text_input("Set name", value="local_behavior", help=steer_help("set_name", steer_tooltips))
-        pos = st.text_area("Positive prompts", height=120, help=steer_help("positive_prompts", steer_tooltips))
-        neg = st.text_area("Negative prompts", height=120, help=steer_help("negative_prompts", steer_tooltips))
-        if st.button("Save control set", width="stretch", help=steer_help("save_control_set", steer_tooltips)):
-            positive = [line.strip() for line in pos.splitlines() if line.strip()]
-            negative = [line.strip() for line in neg.splitlines() if line.strip()]
-            if positive and negative:
-                write_control_set(set_name, "\n".join(positive), "\n".join(negative))
-                st.success("Control set saved.")
-                st.rerun()
-            else:
-                st.error("Both positive and negative prompts are required.")
+    st.subheader("Resolved Target Preview")
+    validation_errors: list[str] = []
+    resolved_targets: list[dict] = []
+    try:
+        if str(st.session_state.get("direct_steering_targets") or "").strip():
+            resolved_targets = parse_activation_node_ids(str(st.session_state.direct_steering_targets))
+    except Exception as exc:
+        validation_errors.append(str(exc))
 
-    p1, p2, p3 = st.columns(3)
-    with p1:
-        st.session_state.llama_control_strength = st.number_input("Strength", value=float(st.session_state.llama_control_strength), step=0.25, help=steer_help("strength", steer_tooltips))
-    with p2:
-        st.session_state.llama_control_layer_start = st.number_input("Layer start", min_value=1, value=int(st.session_state.llama_control_layer_start), help=steer_help("layer_start", steer_tooltips))
-    with p3:
-        st.session_state.llama_control_layer_end = st.number_input("Layer end", min_value=1, value=int(st.session_state.llama_control_layer_end), help=steer_help("layer_end", steer_tooltips))
+    if resolved_targets:
+        st.dataframe(pd.DataFrame(resolved_targets), width="stretch", hide_index=True)
+    else:
+        ui.empty_state("No target nodes", "Paste one or more Activation Map node IDs.")
 
-    preflight = preflight_control_vector_run(
-        st.session_state.llama_model_path,
-        None,
-        None,
-        st.session_state.llama_cvector_generator,
-        st.session_state.llama_server_bin,
-    )
-    st.session_state.llama_last_preflight = preflight
-    if preflight.errors:
-        for error in preflight.errors:
+    st.subheader("Validation Errors")
+    if validation_errors:
+        for error in validation_errors:
             st.error(error)
-    if preflight.warnings:
-        for warning in preflight.warnings:
-            st.warning(warning)
+    else:
+        st.caption("No validation errors.")
 
-    if st.session_state.llama_control_set:
-        selected = next((item for item in control_sets if item.get("name") == st.session_state.llama_control_set), None)
-        if selected:
-            vector_name = st.text_input("Vector name", value=selected.name, help=steer_help("vector_name", steer_tooltips))
-            command = build_cvector_command(
-                st.session_state.llama_model_path,
-                selected["positive_path"],
-                selected["negative_path"],
-                f"data/control_vectors/{vector_name}.gguf",
-                st.session_state.llama_cvector_generator,
-            )
-            st.code(shell_join(command), language="bash")
-            if st.button("Generate vector", type="primary", width="stretch", help=steer_help("generate_vector", steer_tooltips)):
-                try:
-                    meta = generate_control_vector(
-                        vector_name,
-                        st.session_state.llama_model_path,
-                        selected["positive_path"],
-                        selected["negative_path"],
-                        st.session_state.llama_cvector_generator,
-                    )
-                    st.success(f"Generated {Path(meta.vector_path).name}")
-                    st.rerun()
-                except ControlVectorRunError as exc:
-                    st.session_state.llama_last_cvector_failure = exc.metadata.failure.__dict__
-                    st.error(str(exc))
-
-    if st.session_state.llama_control_vector:
-        cmd = build_llama_server_command(
-            st.session_state.llama_model_path,
-            st.session_state.llama_control_vector,
-            float(st.session_state.llama_control_strength),
-            int(st.session_state.llama_control_layer_start),
-            int(st.session_state.llama_control_layer_end),
-            st.session_state.llama_server_bin,
-            port=int(st.session_state.llama_control_port),
-            extra_args=st.session_state.llama_control_extra_args,
-            alias=st.session_state.llama_model_alias,
-        )
-        st.caption("Steered server command")
-        st.code(shell_join(cmd), language="bash")
+    if st.session_state.direct_steering_enabled and status["status"] != "supported":
+        st.warning("Direct steering is configured, but the selected backend does not advertise full direct activation steering support.")
 
 
 def render_activation_patch_panel(chat_backend: str, max_new_tokens: int, temperature: float, steer_tooltips: dict | None = None) -> None:
@@ -1241,7 +1230,7 @@ def run_app() -> None:
     trace_active = st.session_state.get("local_dashboard_trace") is not None
     ui.hud(
         title="Operation Glass Skull",
-        subtitle="Local-only llama.cpp cockpit for GGUF chat, control vectors, and activation-path visualization.",
+        subtitle="Local-only llama.cpp cockpit for GGUF chat, direct activation steering, and activation-path visualization.",
         stats=local_context["hud_stats"],
         pills_html="".join([
             ui.pill(f"Model: {active_model_label()}", ui.GREEN),
@@ -1274,14 +1263,13 @@ def run_app() -> None:
             st.session_state.llama_status.glass_info if chat_backend == "llama.cpp normal" and st.session_state.llama_status else
             st.session_state.llama_glass_status.glass_info if st.session_state.llama_glass_status else {}
         )
-        local_steering_supported = per_request_steering_supported(
-            local_glass_info
-        )
+        steering_capability = direct_activation_steering_status(local_glass_info)
+        local_steering_supported = direct_activation_steering_supported(local_glass_info)
         include_trace_vectors = trace_vectors_supported(local_glass_info)
-        startup_steered = chat_backend == "llama.cpp glass"
-        use_steering = False if startup_steered else st.toggle("Use per-request steering", value=False, disabled=not local_steering_supported)
-        steering_payload, steering_error = selected_control_vector_payload() if use_steering else (None, None)
-        if use_steering and steering_error:
+        steering_payload, steering_error = selected_direct_activation_steering_payload()
+        if st.session_state.get("direct_steering_enabled") and not local_steering_supported:
+            st.warning(f"Direct activation steering {steering_capability['label'].lower()}: {steering_capability['message']}")
+        if st.session_state.get("direct_steering_enabled") and steering_error:
             st.warning(steering_error)
 
         if mode == "Batch run":
@@ -1361,7 +1349,7 @@ def run_app() -> None:
                     trace_error = str(exc)
                     st.warning(f"Local trace unavailable: {exc}")
             try:
-                if use_steering and steering_payload is None:
+                if st.session_state.get("direct_steering_enabled") and steering_payload is None:
                     raise ValueError(steering_error or "No steering payload is available.")
                 output = chat_completion(
                     st.session_state.llama_glass_url if chat_backend == "llama.cpp glass" else st.session_state.llama_url,
@@ -1370,8 +1358,8 @@ def run_app() -> None:
                     temperature=temperature,
                     messages=chat_history_for_send(prompt),
                     model_alias=st.session_state.llama_model_alias,
-                    steering=steering_payload,
-                    steering_supported=local_steering_supported,
+                    direct_activation_steering=steering_payload,
+                    direct_activation_steering_supported=local_steering_supported,
                 )
             except Exception as exc:
                 error = str(exc)
@@ -1538,6 +1526,7 @@ def run_app() -> None:
                 "show_aggregate_heatmap": st.session_state.map_show_aggregate_heatmap,
                 "show_secondary_branches": st.session_state.map_show_secondary_branches,
                 "annotation_selected_group": st.session_state.map_annotation_selected_group,
+                "steering_selected_target": st.session_state.get("map_steering_selected_target"),
             })
             artifact_summary = artifact.get("summary", {}) if isinstance(artifact.get("summary"), dict) else {}
             st.caption(
@@ -1609,7 +1598,7 @@ def run_app() -> None:
 
     with tabs["Steer"]:
         render_tab_workspace_controls("Steer")
-        render_control_panel(local_context, steer_tooltips)
+        render_direct_activation_steering_panel(local_glass_info, steer_tooltips)
         st.markdown("---")
         render_activation_patch_panel(chat_backend, max_new_tokens, temperature, steer_tooltips)
 
@@ -1664,11 +1653,8 @@ def run_app() -> None:
             st.warning("Model selection changed. Cached backend info and trace artifacts were cleared; restart llama.cpp with this GGUF before tracing.")
             st.rerun()
         st.session_state.llama_url = st.text_input("Normal server URL", value=st.session_state.llama_url)
-        st.session_state.llama_glass_url = st.text_input("Steered/server trace URL", value=st.session_state.llama_glass_url)
+        st.session_state.llama_glass_url = st.text_input("Glass server URL", value=st.session_state.llama_glass_url)
         st.session_state.llama_server_bin = st.text_input("llama-server binary", value=st.session_state.llama_server_bin)
-        st.session_state.llama_cvector_generator = st.text_input("llama-cvector-generator binary", value=st.session_state.llama_cvector_generator)
-        st.session_state.llama_control_port = st.number_input("Steered server port", min_value=1, max_value=65535, value=int(st.session_state.llama_control_port))
-        st.session_state.llama_control_extra_args = st.text_input("Extra llama-server args", value=st.session_state.llama_control_extra_args)
 
 
 run_app()

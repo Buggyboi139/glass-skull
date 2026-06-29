@@ -5,7 +5,7 @@ from typing import Any
 
 import pandas as pd
 
-from .llama_control import read_gguf_metadata, read_gguf_tensor_index
+from .gguf import read_gguf_metadata, read_gguf_tensor_index
 
 
 def _metadata_value(metadata: dict[str, Any], architecture: str, *suffixes: str) -> Any:

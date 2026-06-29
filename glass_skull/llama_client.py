@@ -19,6 +19,7 @@ class LlamaServerStatus:
     glass_available: bool
     glass_info: dict[str, Any]
     steering_supported: bool = False
+    direct_activation_steering_status: dict[str, str] | None = None
     activation_patch_supported: bool = False
     error: str | None = None
 
@@ -270,6 +271,74 @@ def per_request_steering_supported(glass_info: dict[str, Any] | None) -> bool:
     return isinstance(per_request, dict) and per_request.get("supported") is True
 
 
+def _contract_mentions_direct_activation(section: dict[str, Any]) -> bool:
+    text = json.dumps(section, sort_keys=True).lower()
+    return "glass_skull.direct_activation_steering" in text or "direct_activation_steering" in text
+
+
+def direct_activation_steering_status(glass_info: dict[str, Any] | None) -> dict[str, str]:
+    if not isinstance(glass_info, dict) or not glass_info:
+        return {
+            "status": "unsupported",
+            "label": "Unsupported",
+            "message": "This llama.cpp server does not advertise Glass Skull direct activation steering.",
+        }
+
+    capabilities = glass_info.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return {
+            "status": "unsupported",
+            "label": "Unsupported",
+            "message": "This llama.cpp server exposes Glass Skull info without capability metadata.",
+        }
+
+    candidates: list[tuple[dict[str, Any], bool]] = []
+    for key in ("direct_activation_steering", "activation_steering", "direct_activation"):
+        section = capabilities.get(key)
+        if isinstance(section, dict):
+            candidates.append((section, True))
+
+    steering = capabilities.get("steering")
+    if isinstance(steering, dict):
+        for key in ("direct_activation_steering", "direct_activation", "activation_steering"):
+            section = steering.get(key)
+            if isinstance(section, dict):
+                candidates.append((section, True))
+        per_request = steering.get("per_request")
+        if isinstance(per_request, dict):
+            candidates.append((per_request, False))
+
+    for section, _direct_named in candidates:
+        if section.get("supported") is True and _contract_mentions_direct_activation(section):
+            return {
+                "status": "supported",
+                "label": "Supported",
+                "message": "This llama.cpp server advertises direct activation steering.",
+            }
+
+    for section, direct_named in candidates:
+        if direct_named or _contract_mentions_direct_activation(section):
+            reason = str(section.get("reason") or "Direct activation steering is advertised but not fully supported.")
+            return {"status": "partial", "label": "Partial", "message": reason}
+
+    if per_request_steering_supported(glass_info):
+        return {
+            "status": "partial",
+            "label": "Partial",
+            "message": "This llama.cpp server advertises only the legacy steering contract, not direct activation steering.",
+        }
+
+    return {
+        "status": "unsupported",
+        "label": "Unsupported",
+        "message": "This llama.cpp server does not advertise direct activation steering support.",
+    }
+
+
+def direct_activation_steering_supported(glass_info: dict[str, Any] | None) -> bool:
+    return direct_activation_steering_status(glass_info)["status"] == "supported"
+
+
 def activation_patch_supported(glass_info: dict[str, Any] | None) -> bool:
     if not isinstance(glass_info, dict):
         return False
@@ -319,27 +388,6 @@ def activation_patch_diagnostic(glass_info: dict[str, Any] | None) -> str:
                 reason = per_request.get("reason") or reason
             return str(reason or "Activation patch capability is present but not marked supported.")
     return "This llama.cpp server does not advertise activation patching; recipe save/load and baseline comparison are available only."
-
-def build_steering_metadata(
-    control_vector: str,
-    strength: float,
-    layer_start: int,
-    layer_end: int,
-) -> dict[str, Any]:
-    control_vector = str(control_vector).strip()
-    if not control_vector:
-        raise ValueError("control_vector is required")
-    layer_start = int(layer_start)
-    layer_end = int(layer_end)
-    if layer_start < 1 or layer_end < layer_start:
-        raise ValueError("layer_start and layer_end must be a valid 1-based inclusive range")
-    return {
-        "control_vector": control_vector,
-        "strength": float(strength),
-        "layer_start": layer_start,
-        "layer_end": layer_end,
-    }
-
 
 def _coerce_layers(layers: list[int] | None) -> list[int] | None:
     if layers is None:
@@ -498,6 +546,7 @@ def check_server(base_url: str, timeout: float = 3.0, model_alias: str | None = 
             glass_available=False,
             glass_info={},
             steering_supported=False,
+            direct_activation_steering_status=direct_activation_steering_status({}),
             activation_patch_supported=False,
             error=str(exc),
         )
@@ -517,7 +566,8 @@ def check_server(base_url: str, timeout: float = 3.0, model_alias: str | None = 
         models=models,
         glass_available=glass_available,
         glass_info=glass_info,
-        steering_supported=per_request_steering_supported(glass_info),
+        steering_supported=direct_activation_steering_supported(glass_info),
+        direct_activation_steering_status=direct_activation_steering_status(glass_info),
         activation_patch_supported=activation_patch_supported(glass_info),
         error=None,
     )
@@ -647,16 +697,16 @@ def chat_completion(
     system_prompt: str | None = None,
     messages: list[dict[str, str]] | None = None,
     model_alias: str | None = None,
-    steering: dict[str, Any] | None = None,
-    steering_supported: bool = False,
+    direct_activation_steering: dict[str, Any] | None = None,
+    direct_activation_steering_supported: bool = False,
     activation_patch: dict[str, Any] | None = None,
     activation_patch_supported: bool = False,
     timeout: float = 300.0,
 ) -> str:
     base_url = normalize_base_url(base_url)
 
-    if steering is not None and not steering_supported:
-        raise RuntimeError("This llama.cpp server does not advertise per-request Glass Skull steering support.")
+    if direct_activation_steering is not None and not direct_activation_steering_supported:
+        raise RuntimeError("This llama.cpp server does not advertise direct activation steering support.")
     if activation_patch is not None and not activation_patch_supported:
         raise RuntimeError("This llama.cpp server does not advertise per-request activation patch support.")
 
@@ -685,9 +735,9 @@ def chat_completion(
     model_id = _resolve_model_id(base_url, model_alias)
     if model_id:
         payload["model"] = model_id
-    if steering is not None:
-        payload["glass_skull"] = {"steering": steering}
-        payload["metadata"] = {"glass_skull": {"steering": steering}}
+    if direct_activation_steering is not None:
+        payload.setdefault("glass_skull", {})["direct_activation_steering"] = direct_activation_steering
+        payload.setdefault("metadata", {}).setdefault("glass_skull", {})["direct_activation_steering"] = direct_activation_steering
     if activation_patch is not None:
         payload.setdefault("glass_skull", {})["activation_patch"] = activation_patch
         payload.setdefault("metadata", {}).setdefault("glass_skull", {})["activation_patch"] = activation_patch
@@ -717,8 +767,9 @@ def chat_completion(
         }
         if model_id:
             legacy_payload["model"] = model_id
-        if steering is not None:
-            legacy_payload["glass_skull"] = {"steering": steering}
+        if direct_activation_steering is not None:
+            legacy_payload.setdefault("glass_skull", {})["direct_activation_steering"] = direct_activation_steering
+            legacy_payload.setdefault("metadata", {}).setdefault("glass_skull", {})["direct_activation_steering"] = direct_activation_steering
         if activation_patch is not None:
             legacy_payload.setdefault("glass_skull", {})["activation_patch"] = activation_patch
         legacy_result = _request_json(

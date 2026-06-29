@@ -7,8 +7,8 @@ The app is intentionally local-only:
 - chat goes to a local llama.cpp server
 - model metadata comes from the configured GGUF file
 - trace data comes from `/glass-skull/trace` when the managed llama.cpp patch is present
-- control vectors are generated and launched with local llama.cpp tools
-- run artifacts, chats, logs, and control data stay under `data/`
+- direct activation steering targets Activation Map node IDs when the connected server advertises support
+- run artifacts, chats, logs, and workspace data stay under `data/`
 
 ## Quick Start
 
@@ -51,7 +51,7 @@ managed/llama.cpp-glass/
 The local patch file lives at:
 
 ```text
-patches/llama.cpp-glass/0001-glass-skull-per-request-steering.patch
+patches/llama.cpp-glass/0001-glass-skull-direct-activation-steering.patch
 ```
 
 Use the setup helper when the managed checkout needs to be prepared:
@@ -64,28 +64,25 @@ Expected local binaries:
 
 ```text
 managed/llama.cpp-glass/build/bin/llama-server
-managed/llama.cpp-glass/build/bin/llama-cvector-generator
 ```
 
-The app settings default to these managed binary paths. External local builds can still be used by explicitly setting `LLAMA_SERVER_BIN` or editing the app settings fields.
+The app settings default to this managed server path. External local builds can still be used by explicitly setting `LLAMA_SERVER_BIN` or editing the app settings field.
 
 ## App Workflow
 
 1. Configure the GGUF path, model alias, and llama.cpp URLs in `Settings`.
-2. Use `Model` to inspect GGUF metadata and check the normal and steered servers.
+2. Use `Model` to inspect GGUF metadata and check the normal and Glass servers.
 3. Send a prompt in `Run`.
 4. If the local server exposes `/glass-skull/trace`, Glass Skull stores prompt tokens and layer input summaries.
 5. The app generates a run artifact containing prompt, output, trace rows, behavior scores, and diagnostics.
 6. `Map` renders the activation canvas and supporting tables.
-7. `Steer` creates control sets, generates local control vectors, and shows server launch commands.
+7. `Steer` validates direct activation node targets such as `L36-N175` and shows backend support status.
 8. `Timeline` compares behavior scores across local runs.
 
 ## Data Layout
 
 ```text
 data/chats/              saved local transcripts
-data/control_sets/       positive/negative prompt sets
-data/control_vectors/    generated GGUF control vectors and metadata
 data/experiments/        batch run artifacts and CSV summaries
 data/logs/               SQLite run log and llama.cpp log output
 data/prompt_sets/        tracked sample prompt sets

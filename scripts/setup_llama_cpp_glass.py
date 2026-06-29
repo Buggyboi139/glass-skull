@@ -11,7 +11,7 @@ from glass_skull.llama_paths import DEFAULT_LLAMA_CPP_COMMIT, GLASS_SKULL_ROOT, 
 
 
 PATCH_DIR = GLASS_SKULL_ROOT / "patches" / "llama.cpp-glass"
-BRANCH = "glass-skull/per-request-steering"
+BRANCH = "glass-skull/direct-activation-steering"
 
 
 def run(cmd: list[str | Path], cwd: Path | None = None) -> None:
@@ -111,7 +111,7 @@ def build(repo: Path, build_dir: Path) -> None:
             "-DLLAMA_BUILD_TOOLS=ON",
         ]
     )
-    run(["cmake", "--build", build_dir, "--target", "llama-server", "llama-cvector-generator", "-j"], cwd=repo)
+    run(["cmake", "--build", build_dir, "--target", "llama-server", "-j"], cwd=repo)
 
 
 def main() -> None:
