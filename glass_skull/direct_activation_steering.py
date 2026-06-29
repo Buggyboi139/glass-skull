@@ -55,6 +55,28 @@ def parse_activation_node_ids(raw: str | Iterable[Any]) -> list[dict[str, Any]]:
     return targets
 
 
+def _validate_node_range(target: dict[str, Any], node_range: Any) -> list[int]:
+    if not isinstance(node_range, (list, tuple)) or len(node_range) != 2:
+        raise ValueError("Activation node_range must be [start, end].")
+    try:
+        start, end = int(node_range[0]), int(node_range[1])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Activation node_range must contain integer start and end values.") from exc
+    if start < 0 or end < start:
+        raise ValueError("Activation node_range must satisfy 0 <= start <= end.")
+    if start != target["node"]:
+        raise ValueError("Activation node_range must start at the node_id node.")
+    return [start, end]
+
+
+def _ranges_overlap(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if left["layer"] != right["layer"]:
+        return False
+    left_start, left_end = left["node_range"]
+    right_start, right_end = right["node_range"]
+    return left_start <= right_end and right_start <= left_end
+
+
 def _coerce_targets(targets: str | Iterable[Any]) -> list[dict[str, Any]]:
     if isinstance(targets, str):
         return parse_activation_node_ids(targets)
@@ -66,13 +88,8 @@ def _coerce_targets(targets: str | Iterable[Any]) -> list[dict[str, Any]]:
             base = _parse_node_id(item.get("node_id") or item.get("nodeId") or item.get("groupId"))
             merged = {**base}
             node_range = item.get("node_range", item.get("nodeRange"))
-            if isinstance(node_range, (list, tuple)) and len(node_range) == 2:
-                try:
-                    start, end = int(node_range[0]), int(node_range[1])
-                    if start <= end:
-                        merged["node_range"] = [start, end]
-                except (TypeError, ValueError):
-                    pass
+            if node_range is not None:
+                merged["node_range"] = _validate_node_range(merged, node_range)
             if "activation_value" in item:
                 merged["activation_value"] = item.get("activation_value")
             elif "activationValue" in item:
@@ -81,6 +98,8 @@ def _coerce_targets(targets: str | Iterable[Any]) -> list[dict[str, Any]]:
             merged = _parse_node_id(item)
         if merged["node_id"] in seen:
             raise ValueError(f"Duplicate activation node ID {merged['node_id']!r}.")
+        if any(_ranges_overlap(merged, existing) for existing in resolved):
+            raise ValueError(f"Overlapping activation node ranges are not allowed for {merged['node_id']!r}.")
         seen.add(merged["node_id"])
         resolved.append(merged)
     if not resolved:

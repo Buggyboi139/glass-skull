@@ -1871,10 +1871,10 @@ index 9ed4aeead..41f275c71 100644
      server_http_context::handler_t post_router_models_load;
      server_http_context::handler_t post_router_models_unload;
 diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
-index ed4bda241..8af3985c1 100644
+index ed4bda241..bf9154478 100644
 --- a/tools/server/server-schema.cpp
 +++ b/tools/server/server-schema.cpp
-@@ -2,8 +2,277 @@
+@@ -2,8 +2,300 @@
  
  #include "json-schema-to-grammar.h"
  
@@ -2051,12 +2051,22 @@ index ed4bda241..8af3985c1 100644
 +
 +    task_params::direct_activation_steering_target target = parse_direct_activation_node_id(node_id);
 +
-+    if (item.contains("layer") && item.at("layer").is_number_integer() && item.at("layer").get<int32_t>() != target.layer) {
-+        throw std::invalid_argument("glass_skull.direct_activation_steering target layer does not match node_id");
++    if (item.contains("layer")) {
++        if (!item.at("layer").is_number_integer()) {
++            throw std::invalid_argument("glass_skull.direct_activation_steering target layer must be an integer");
++        }
++        if (item.at("layer").get<int32_t>() != target.layer) {
++            throw std::invalid_argument("glass_skull.direct_activation_steering target layer does not match node_id");
++        }
 +    }
 +
-+    if (item.contains("node") && item.at("node").is_number_integer() && item.at("node").get<int32_t>() != target.node) {
-+        throw std::invalid_argument("glass_skull.direct_activation_steering target node does not match node_id");
++    if (item.contains("node")) {
++        if (!item.at("node").is_number_integer()) {
++            throw std::invalid_argument("glass_skull.direct_activation_steering target node must be an integer");
++        }
++        if (item.at("node").get<int32_t>() != target.node) {
++            throw std::invalid_argument("glass_skull.direct_activation_steering target node does not match node_id");
++        }
 +    }
 +
 +    const json * node_range = nullptr;
@@ -2075,18 +2085,31 @@ index ed4bda241..8af3985c1 100644
 +        if (target.node_start < 0 || target.node_end < target.node_start) {
 +            throw std::invalid_argument("glass_skull.direct_activation_steering target node_range must satisfy 0 <= start <= end");
 +        }
++        if (target.node_start != target.node) {
++            throw std::invalid_argument("glass_skull.direct_activation_steering target node_range must start at the node_id node");
++        }
 +    }
 +
 +    return target;
++}
++
++static bool direct_activation_ranges_overlap(
++        const task_params::direct_activation_steering_target & lhs,
++        const task_params::direct_activation_steering_target & rhs) {
++    return lhs.layer == rhs.layer && lhs.node_start <= rhs.node_end && rhs.node_start <= lhs.node_end;
 +}
 +
 +static void append_direct_activation_target(
 +        std::vector<task_params::direct_activation_steering_target> & targets,
 +        std::set<std::string> & seen,
 +        task_params::direct_activation_steering_target target) {
-+    const std::string key = target.node_id + ":" + std::to_string(target.node_start) + "-" + std::to_string(target.node_end);
-+    if (!seen.insert(key).second) {
++    if (!seen.insert(target.node_id).second) {
 +        throw std::invalid_argument("glass_skull.direct_activation_steering contains duplicate target " + target.node_id);
++    }
++    for (const auto & existing : targets) {
++        if (direct_activation_ranges_overlap(existing, target)) {
++            throw std::invalid_argument("glass_skull.direct_activation_steering contains overlapping target ranges at layer L" + std::to_string(target.layer));
++        }
 +    }
 +    targets.push_back(std::move(target));
 +}
@@ -2152,7 +2175,7 @@ index ed4bda241..8af3985c1 100644
  //
  // llama.cpp-specific completion schema
  //
-@@ -522,8 +791,19 @@ task_params eval_llama_cmpl_schema(
+@@ -522,8 +814,19 @@ task_params eval_llama_cmpl_schema(
          f->eval(ctx, data);
      }
  
@@ -2534,10 +2557,10 @@ index dd4b1c507..b04d8ccdf 100644
      ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
 diff --git a/tools/server/tests/unit/test_glass_skull.py b/tools/server/tests/unit/test_glass_skull.py
 new file mode 100644
-index 000000000..862ccfdfc
+index 000000000..dc4bb0a65
 --- /dev/null
 +++ b/tools/server/tests/unit/test_glass_skull.py
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,338 @@
 +import math
 +
 +import pytest
@@ -2747,6 +2770,41 @@ index 000000000..862ccfdfc
 +    })
 +    assert duplicate.status_code == 400
 +    assert "duplicate" in duplicate.body["error"]["message"].lower()
++
++    mismatched_range = server.make_request("POST", "/completion", data={
++        "prompt": "hello",
++        "n_predict": 0,
++        "glass_skull": {
++            "direct_activation_steering": {
++                "enabled": True,
++                "targets": [{"node_id": "L0-N0", "node_range": [1, 2]}],
++                "direction": "Toward",
++                "strength": 0.4,
++                "token_scope": "all",
++            },
++        },
++    })
++    assert mismatched_range.status_code == 400
++    assert "node_range must start at the node_id node" in mismatched_range.body["error"]["message"]
++
++    overlapping_range = server.make_request("POST", "/completion", data={
++        "prompt": "hello",
++        "n_predict": 0,
++        "glass_skull": {
++            "direct_activation_steering": {
++                "enabled": True,
++                "targets": [
++                    {"node_id": "L0-N0", "node_range": [0, 2]},
++                    {"node_id": "L0-N1", "node_range": [1, 1]},
++                ],
++                "direction": "Toward",
++                "strength": 0.4,
++                "token_scope": "all",
++            },
++        },
++    })
++    assert overlapping_range.status_code == 400
++    assert "overlapping target ranges" in overlapping_range.body["error"]["message"]
 +
 +
 +def _direct_hook_events(response_body):

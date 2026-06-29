@@ -843,6 +843,27 @@ def _assert_direct_activation_steering_model() -> None:
 
     _assert_raises(ValueError, parse_activation_node_ids, "L36:N175")
     _assert_raises(ValueError, parse_activation_node_ids, "L36-N175,L36-N175")
+    _assert_raises(
+        ValueError,
+        build_direct_activation_steering_payload,
+        True,
+        [{"node_id": "L36-N175", "node_range": [176, 178]}],
+        "Toward",
+        0.4,
+        "all",
+    )
+    _assert_raises(
+        ValueError,
+        build_direct_activation_steering_payload,
+        True,
+        [
+            {"node_id": "L36-N175", "node_range": [175, 177]},
+            {"node_id": "L36-N176", "node_range": [176, 176]},
+        ],
+        "Toward",
+        0.4,
+        "all",
+    )
     _assert_raises(ValueError, build_direct_activation_steering_payload, True, "", "Toward", 0.4, "all")
     _assert_raises(ValueError, build_direct_activation_steering_payload, True, "L36-N175", "Sideways", 0.4, "all")
     _assert_raises(ValueError, build_direct_activation_steering_payload, True, "L36-N175", "Toward", 0.4, "middle")
